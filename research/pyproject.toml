@@ -1,0 +1,53 @@
+[project]
+name = "cce-research"
+version = "0.1.0"
+description = "Offline model, dataset, benchmark, and trajectory research for CCE"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.28,<1",
+  "matplotlib>=3.10,<4",
+  "numpy>=2.2,<3",
+  "pydantic>=2.11,<3",
+  "pyyaml>=6.0,<7",
+  "rich>=14,<15",
+  "typer>=0.16,<1",
+]
+
+[project.optional-dependencies]
+models = [
+  "datasets>=4,<5",
+  "sentence-transformers>=5,<6",
+  "torch>=2.8,<3",
+  "transformers>=4.55,<5",
+]
+training = [
+  "accelerate>=1.10,<2",
+  "peft>=0.17,<1",
+]
+
+[project.scripts]
+cce-research = "cce_research.cli:app"
+
+[dependency-groups]
+dev = ["mypy>=1.17,<2", "pytest>=8.4,<9", "ruff>=0.12,<1", "types-pyyaml>=6.0,<7"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cce_research"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,16 @@
+name: cce
+command:
+  - target/release/cce
+  - --json
+  - context
+  - "{repository}"
+  - "{query}"
+  - --intent
+  - "{intent}"
+  - --budget
+  - "{budget}"
+timeout_seconds: 120
+model_identity: none
+model_revision: none
+environment:
+  CCE_DATA_DIR: .cce-benchmark

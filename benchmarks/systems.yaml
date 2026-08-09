@@ -1,0 +1,54 @@
+schema_version: 1
+comparison_policy:
+  same_repository_revision: true
+  same_query_and_gold: true
+  same_token_budget: true
+  report_missing_capabilities: true
+  no_unverified_vendor_scores: true
+systems:
+  - name: CCE
+    source: https://github.com/wibus-wee/CCE
+    license: Apache-2.0
+    adapter: adapters/cce.yaml
+    status: enabled
+  - name: Aider Repo Map
+    source: https://github.com/Aider-AI/aider
+    license: Apache-2.0
+    status: adapter_required
+  - name: Claude Context
+    source: https://github.com/zilliztech/claude-context
+    license: Apache-2.0
+    status: adapter_required
+  - name: CocoIndex real-time codebase indexing
+    source: https://github.com/cocoindex-io/realtime-codebase-indexing
+    license: review_at_pinned_revision
+    status: compliance_review_required
+  - name: GrepAI
+    source: https://github.com/yoanbernabeu/grepai
+    license: MIT
+    status: adapter_required
+  - name: Bloop
+    source: https://github.com/BloopAI/bloop
+    license: Apache-2.0
+    status: adapter_required
+  - name: GitNexus
+    source: https://github.com/abhigyanpatwari/GitNexus
+    license: review_at_pinned_revision
+    status: compliance_review_required
+  - name: Codebase Memory MCP
+    source: https://github.com/DeusData/codebase-memory-mcp
+    license: review_at_pinned_revision
+    status: compliance_review_required
+  - name: CodeSage
+    source: https://github.com/iliaal/codesage
+    license: review_at_pinned_revision
+    status: compliance_review_required
+  - name: Probe
+    source: https://github.com/probelabs/probe
+    license: review_at_pinned_revision
+    status: compliance_review_required
+  - name: DeepWiki Open
+    source: https://github.com/AsyncFuncAI/deepwiki-open
+    license: review_at_pinned_revision
+    status: knowledge_plane_only
+

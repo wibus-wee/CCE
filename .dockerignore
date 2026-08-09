@@ -1,0 +1,9 @@
+.git
+.cce
+target
+node_modules
+apps/web/dist
+research/.venv
+research/.mypy_cache
+research/.pytest_cache
+research/.ruff_cache

@@ -1,0 +1,11 @@
+{
+  "name": "cce-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.16.0",
+  "scripts": {
+    "web:dev": "pnpm --filter @cce/web dev",
+    "web:build": "pnpm --filter @cce/web build",
+    "web:check": "pnpm --filter @cce/web check"
+  }
+}
+
