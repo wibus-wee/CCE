@@ -11,8 +11,8 @@ repository.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
-cce-core = { path = "../cce-core" }
-cce-store = { path = "../cce-store" }
+cce-core = { version = "0.1.0", path = "../cce-core" }
+cce-store = { version = "0.1.0", path = "../cce-store" }
 chrono.workspace = true
 fs4.workspace = true
 gix.workspace = true

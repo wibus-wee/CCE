@@ -9,8 +9,8 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-cce-core = { path = "../../crates/cce-core" }
-cce-engine = { path = "../../crates/cce-engine" }
+cce-core = { version = "0.1.0", path = "../../crates/cce-core" }
+cce-engine = { version = "0.1.0", path = "../../crates/cce-engine" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

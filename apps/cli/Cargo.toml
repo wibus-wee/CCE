@@ -13,8 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-cce-core = { path = "../../crates/cce-core" }
-cce-engine = { path = "../../crates/cce-engine" }
+cce-core = { version = "0.1.0", path = "../../crates/cce-core" }
+cce-engine = { version = "0.1.0", path = "../../crates/cce-engine" }
 chrono.workspace = true
 clap.workspace = true
 serde.workspace = true
