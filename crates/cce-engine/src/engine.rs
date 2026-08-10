@@ -563,17 +563,47 @@ impl CceEngine {
                     ViewState::Ready,
                     vec![Capability {
                         name: "git_commit_messages".to_owned(),
-                        level: "historical_evidence".to_owned(),
-                        reason: Some(format!(
-                            "{} reachable commits indexed with gitoxide",
-                            summary.commit_count
-                        )),
+                        level: if summary.shallow_boundary {
+                            "bounded_historical_evidence".to_owned()
+                        } else {
+                            "historical_evidence".to_owned()
+                        },
+                        reason: Some(if summary.shallow_boundary {
+                            format!(
+                                "{} locally reachable commits indexed with gitoxide; shallow history boundary retained and {} unavailable parent diffs omitted without inference",
+                                summary.commit_count, summary.omitted_parent_diffs
+                            )
+                        } else {
+                            format!(
+                                "{} reachable commits indexed with gitoxide",
+                                summary.commit_count
+                            )
+                        }),
                     }],
                     None,
                 );
                 history_status.artifact_digest = Some(artifact.digest.clone());
                 records.artifacts.push(artifact.clone());
                 for commit in summary.commits {
+                    let mut evidence = Vec::new();
+                    for path in commit.changed_paths.iter().take(16) {
+                        let Some(file) = scanned
+                            .files
+                            .iter()
+                            .find(|file| file.relative_path == *path)
+                        else {
+                            continue;
+                        };
+                        let symbol_id = file_entities.get(path).map(String::as_str);
+                        evidence.push(address(
+                            &scanned.identity.id,
+                            &scanned.snapshot.id,
+                            file,
+                            0,
+                            file.bytes.len(),
+                            symbol_id,
+                        )?);
+                    }
                     let commit_artifact = self
                         .store
                         .artifacts()
@@ -594,7 +624,7 @@ impl CceEngine {
                             address: None,
                             embedding_profile: None,
                             generated_by: Some("cce-gitoxide-history-v2".to_owned()),
-                            evidence: Vec::new(),
+                            evidence,
                             terms: lexical_terms(&commit.body),
                         },
                         path: format!(".git/commits/{}", commit.id),
@@ -642,14 +672,19 @@ impl CceEngine {
                 records.artifacts.push(artifact);
                 records.entities.extend(import.entities);
                 records.relations.extend(import.relations);
-                let complete = import.trusted_snapshot
-                    && import.matched_documents >= parse_candidates
-                    && import.skipped_occurrences == 0
-                    && import.failures.is_empty();
+                let complete = compiler_graph_complete(
+                    import.trusted_snapshot,
+                    import.matched_source_documents,
+                    import.source_documents,
+                    import.skipped_occurrences,
+                );
                 let provider_failures = if import.failures.is_empty() {
                     String::new()
                 } else {
-                    format!("; provider failures: {}", import.failures.join("; "))
+                    format!(
+                        "; non-blocking provider diagnostics: {}",
+                        import.failures.join("; ")
+                    )
                 };
                 let mut graph_status = status(
                     &scanned.snapshot,
@@ -680,10 +715,12 @@ impl CceEngine {
                                 "artifact_unattested".to_owned()
                             },
                             reason: Some(format!(
-                                "{}: {}/{} documents matched, {} definitions, {} references, {} skipped occurrences{}",
+                                "{}: {}/{} SCIP documents matched; compiler coverage {}/{} parsed source files; {} definitions, {} references, {} skipped occurrences{}",
                                 import.tool,
                                 import.matched_documents,
                                 import.documents,
+                                import.matched_source_documents,
+                                import.source_documents,
                                 import.definitions,
                                 import.references,
                                 import.skipped_occurrences,
@@ -692,16 +729,35 @@ impl CceEngine {
                         },
                     ],
                     (!complete).then(|| {
-                        if !import.failures.is_empty() {
-                            format!(
-                                "Some SCIP providers failed while successful compiler graphs were retained: {}",
-                                import.failures.join("; ")
-                            )
-                        } else if import.trusted_snapshot {
-                            format!(
-                                "SCIP precisely covers {} of {} parsed code files; uncovered languages retain syntax-only graph facts",
-                                import.matched_documents, parse_candidates
-                            )
+                        if import.trusted_snapshot {
+                            let mut limitations = Vec::new();
+                            if import.matched_source_documents != import.source_documents {
+                                limitations.push(format!(
+                                    "compiler coverage is {}/{} parsed source files; uncovered languages: {} (syntax-only graph facts remain for those files)",
+                                    import.matched_source_documents,
+                                    import.source_documents,
+                                    format_language_counts(
+                                        &import.uncovered_source_languages,
+                                        "unknown"
+                                    )
+                                ));
+                            }
+                            if import.skipped_occurrences > 0 {
+                                limitations.push(format!(
+                                    "{} SCIP occurrences lacked exact source alignment",
+                                    import.skipped_occurrences
+                                ));
+                            }
+                            if !import.failures.is_empty() {
+                                limitations.push(format!(
+                                    "provider diagnostics: {}",
+                                    import.failures.join("; ")
+                                ));
+                            }
+                            if limitations.is_empty() {
+                                limitations.push("no parsed source files were covered".to_owned());
+                            }
+                            format!("SCIP compiler graph is partial: {}", limitations.join("; "))
                         } else {
                             "Supplied SCIP artifact is digest-verified but was not generated inside this snapshot transaction"
                                 .to_owned()
@@ -765,7 +821,12 @@ impl CceEngine {
                 records.artifacts.push(artifact);
                 records.entities.extend(import.entities);
                 records.relations.extend(import.relations);
-                let complete = import.edges > 0 && import.skipped_edges == 0;
+                let complete = precise_dataflow_complete(
+                    import.edges,
+                    import.skipped_edges,
+                    import.covered_source_files,
+                    import.source_files,
+                );
                 let mut view = status(
                         &scanned.snapshot,
                         if complete {
@@ -776,20 +837,57 @@ impl CceEngine {
                         vec![Capability {
                             name: "precise_static_dataflow".to_owned(),
                             level: if complete {
-                                "authoritative_artifact".to_owned()
+                                "analyzer_generated_exact_alignment".to_owned()
                             } else {
                                 "partial_source_aligned".to_owned()
                             },
                             reason: Some(format!(
-                                "{} supplied {} source-aligned nodes and {} evidence-backed edges; {} relevant edges were skipped because an endpoint lacked exact source alignment",
+                                "{} supplied {} source-aligned nodes and {} evidence-backed edges; analyzer coverage {}/{} parsed source files; {} relevant edges were skipped because an endpoint lacked exact source alignment",
                                 import.generator,
                                 import.nodes,
                                 import.edges,
+                                import.covered_source_files,
+                                import.source_files,
+                                import.skipped_edges
+                            )),
+                        }, Capability {
+                            name: "source_alignment_omissions".to_owned(),
+                            level: if import.skipped_edges == 0 {
+                                "none".to_owned()
+                            } else {
+                                "bounded_recall".to_owned()
+                            },
+                            reason: Some(format!(
+                                "{} Joern IR edges with a source-less or otherwise unalignable endpoint were omitted; every returned dataflow edge retains exact source evidence",
                                 import.skipped_edges
                             )),
                         }],
                         (!complete).then(|| {
-                            "Static analysis completed with incomplete source alignment; precise queries report the partial capability instead of inferring missing edges".to_owned()
+                            let mut limitations = Vec::new();
+                            if import.covered_source_files != import.source_files {
+                                limitations.push(format!(
+                                    "analyzer coverage is {}/{} parsed source files; uncovered languages: {}",
+                                    import.covered_source_files,
+                                    import.source_files,
+                                    format_language_counts(
+                                        &import.uncovered_source_languages,
+                                        "unknown"
+                                    )
+                                ));
+                            }
+                            if import.source_files == 0 {
+                                limitations.push("no parsed source files were in scope".to_owned());
+                            }
+                            if import.edges == 0 {
+                                limitations.push(
+                                    "the analyzer emitted no evidence-backed dataflow edges"
+                                        .to_owned(),
+                                );
+                            }
+                            format!(
+                                "Static analysis is partial: {}. Precise queries report the partial capability instead of inferring missing flows",
+                                limitations.join("; ")
+                            )
                         }),
                     );
                 view.artifact_digest = Some(artifact_digest);
@@ -1144,6 +1242,38 @@ fn source_identity_matches(indexed: &SnapshotIdentity, working: &SnapshotIdentit
     indexed.repository_id == working.repository_id
         && indexed.base_revision == working.base_revision
         && indexed.workspace_overlay_hash == working.workspace_overlay_hash
+}
+
+const fn compiler_graph_complete(
+    trusted_snapshot: bool,
+    matched_source_documents: usize,
+    source_documents: usize,
+    skipped_occurrences: usize,
+) -> bool {
+    trusted_snapshot
+        && source_documents > 0
+        && matched_source_documents == source_documents
+        && skipped_occurrences == 0
+}
+
+const fn precise_dataflow_complete(
+    edges: usize,
+    _skipped_edges: usize,
+    covered_source_files: usize,
+    source_files: usize,
+) -> bool {
+    edges > 0 && source_files > 0 && covered_source_files == source_files
+}
+
+fn format_language_counts(counts: &[(String, usize)], empty: &str) -> String {
+    if counts.is_empty() {
+        return empty.to_owned();
+    }
+    counts
+        .iter()
+        .map(|(language, count)| format!("{language} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1754,5 +1884,34 @@ mod tests {
         assert_eq!(relations.len(), 1);
         assert_eq!(relations[0].confidence, 1.0);
         assert_eq!(relations[0].extractor, "one+two");
+    }
+
+    #[test]
+    fn compiler_graph_ready_requires_complete_source_coverage_not_document_volume() {
+        assert!(compiler_graph_complete(true, 2, 2, 0));
+        // Extra non-source SCIP documents must not hide an uncovered source file.
+        assert!(!compiler_graph_complete(true, 2, 3, 0));
+        assert!(!compiler_graph_complete(false, 3, 3, 0));
+        assert!(!compiler_graph_complete(true, 3, 3, 1));
+        assert!(!compiler_graph_complete(true, 0, 0, 0));
+    }
+
+    #[test]
+    fn precise_dataflow_ready_requires_returned_edges_and_repository_coverage() {
+        assert!(precise_dataflow_complete(10, 0, 3, 3));
+        // Source-less analyzer IR endpoints reduce recall but never weaken the exact
+        // source evidence attached to every edge CCE returns.
+        assert!(precise_dataflow_complete(10, 1, 3, 3));
+        assert!(!precise_dataflow_complete(10, 0, 2, 3));
+        assert!(!precise_dataflow_complete(0, 0, 3, 3));
+    }
+
+    #[test]
+    fn formats_uncovered_languages_deterministically() {
+        assert_eq!(
+            format_language_counts(&[("java".to_owned(), 2), ("python".to_owned(), 1)], "none"),
+            "java (2), python (1)"
+        );
+        assert_eq!(format_language_counts(&[], "none"), "none");
     }
 }

@@ -16,6 +16,8 @@ const RERANK_RRF_WEIGHT: f64 = 2.75;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trajectory_id: Option<String>,
     pub request: SearchRequest,
     pub plan: QueryPlan,
     pub manifest: ViewManifest,
@@ -239,16 +241,13 @@ impl CceEngine {
             if !plan.routes.contains(&route) {
                 continue;
             }
-            let hits = self.store().lexical_search(
+            let hits = self.store().lexical_search_representations(
                 &request.snapshot_id,
                 &request.query,
-                request.limit.saturating_mul(5),
+                accepted,
+                request.limit.saturating_mul(3),
             )?;
-            for (offset, hit) in hits
-                .into_iter()
-                .filter(|hit| accepted.contains(&hit.representation))
-                .enumerate()
-            {
+            for (offset, hit) in hits.into_iter().enumerate() {
                 let rank = offset + 1;
                 let contribution =
                     specialized_route_weight(route, &hit.representation) / (RRF_K + rank as f64);
@@ -352,18 +351,61 @@ impl CceEngine {
             }
         }
 
-        if plan.graph_policy != GraphPolicy::None {
-            let seeds = graph_seeds(&candidates, 8);
-            for (offset, discovery) in self
-                .graph_discoveries(&request.snapshot_id, &seeds, plan.graph_policy)?
+        let pregraph_hits = ranked_candidates(&candidates)
+            .into_iter()
+            .map(|candidate| candidate.hit.clone())
+            .collect::<Vec<_>>();
+        let selectively_abstained =
+            should_selectively_abstain(plan.intent, &request.query, &pregraph_hits);
+
+        if plan.graph_policy != GraphPolicy::None && !selectively_abstained {
+            let seed_limit = match plan.graph_policy {
+                GraphPolicy::ArchitectureBoundary => 4,
+                GraphPolicy::IncomingImpact => 6,
+                GraphPolicy::OutgoingTrace | GraphPolicy::DataflowRequired => 8,
+                GraphPolicy::None => 0,
+            };
+            let seeds = graph_seeds(&candidates, seed_limit);
+            let discoveries =
+                self.graph_discoveries(&request.snapshot_id, &seeds, plan.graph_policy)?;
+            let entity_ids = discoveries
+                .iter()
+                .map(|discovery| discovery.entity_id.clone())
+                .collect::<Vec<_>>();
+            let mut entities = self
+                .store()
+                .entities_by_ids(&request.snapshot_id, &entity_ids)?
                 .into_iter()
-                .enumerate()
-            {
+                .map(|entity| (entity.id.clone(), entity))
+                .collect::<HashMap<_, _>>();
+            let addressed_entities = entities
+                .values()
+                .filter(|entity| {
+                    !(plan.graph_policy == GraphPolicy::ArchitectureBoundary
+                        && entity
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability == "scip_external_symbol"))
+                })
+                .filter_map(|entity| {
+                    entity
+                        .address
+                        .clone()
+                        .map(|address| (entity.id.clone(), address))
+                })
+                .collect::<Vec<_>>();
+            let source_addresses = addressed_entities
+                .iter()
+                .map(|(_, address)| address.clone())
+                .collect::<Vec<_>>();
+            let source_by_entity = addressed_entities
+                .into_iter()
+                .zip(self.store().source_texts(&source_addresses)?)
+                .filter_map(|((entity_id, _), source)| source.map(|source| (entity_id, source)))
+                .collect::<HashMap<_, _>>();
+            for (offset, discovery) in discoveries.into_iter().enumerate() {
                 let rank = offset + 1;
-                let Some(entity) = self
-                    .store()
-                    .entity_by_id(&request.snapshot_id, &discovery.entity_id)?
-                else {
+                let Some(entity) = entities.remove(&discovery.entity_id) else {
                     continue;
                 };
                 if plan.graph_policy == GraphPolicy::ArchitectureBoundary
@@ -374,10 +416,9 @@ impl CceEngine {
                 {
                     continue;
                 }
-                let snippet = entity
-                    .address
-                    .as_ref()
-                    .and_then(|address| self.store().source_text(address).ok())
+                let snippet = source_by_entity
+                    .get(&entity.id)
+                    .cloned()
                     .filter(|source| !source.trim().is_empty())
                     .or_else(|| entity.signature.clone())
                     .or_else(|| entity.qualified_name.clone())
@@ -498,19 +539,34 @@ impl CceEngine {
                 hit
             })
             .collect::<Vec<_>>();
+        if selectively_abstained || should_selectively_abstain(plan.intent, &request.query, &hits) {
+            hits.clear();
+            plan.reasons.push(
+                "selective retrieval abstained because no distinctive query concept had source-backed support in the candidate set"
+                    .to_owned(),
+            );
+        }
         hits.truncate(request.limit);
         for (offset, hit) in hits.iter_mut().enumerate() {
             hit.rank = offset + 1;
             hit.verified_current = verified_current;
         }
-        Ok(SearchResult {
+        let mut result = SearchResult {
+            trajectory_id: None,
             request,
             plan,
             manifest,
             hits,
             missing_capabilities,
             latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-        })
+        };
+        if self.config().capture_learning_data
+            && let Err(error) = self.capture_search_result(&mut result)
+        {
+            tracing::warn!(%error, "failed to capture local CCE learning trajectory");
+            result.trajectory_id = None;
+        }
+        Ok(result)
     }
 
     fn graph_discoveries(
@@ -522,7 +578,7 @@ impl CceEngine {
         let (direction, max_depth, per_node, maximum) = match policy {
             GraphPolicy::OutgoingTrace => (RelationDirection::Outgoing, 3, 24, 160),
             GraphPolicy::IncomingImpact => (RelationDirection::Incoming, 3, 24, 160),
-            GraphPolicy::ArchitectureBoundary => (RelationDirection::Both, 2, 32, 160),
+            GraphPolicy::ArchitectureBoundary => (RelationDirection::Both, 2, 12, 80),
             GraphPolicy::DataflowRequired => (RelationDirection::Outgoing, 4, 24, 200),
             GraphPolicy::None => return Ok(Vec::new()),
         };
@@ -775,7 +831,14 @@ fn lexical_source_weight(intent: QueryIntent, address: Option<&SourceAddress>, q
     let explicitly_requests_tests = ["test", "tests", "spec", "benchmark", "测试", "基准"]
         .iter()
         .any(|term| query.contains(term));
-    let path_role = if explicitly_requests_tests {
+    let explicitly_requests_examples = ["example", "examples", "demo", "sample", "示例"]
+        .iter()
+        .any(|term| query.contains(term));
+    let path_role = if !explicitly_requests_examples
+        && (path.starts_with("examples/") || path.contains("/examples/"))
+    {
+        0.32
+    } else if explicitly_requests_tests {
         1.0
     } else if path.contains("/__tests__/")
         || path.contains("/tests/")
@@ -950,6 +1013,9 @@ fn add_candidate(candidates: &mut HashMap<String, Candidate>, hit: SearchHit, co
             if candidate.hit.address.is_none() {
                 candidate.hit.address.clone_from(&hit.address);
             }
+            if canonical_representation_route(&hit).is_some() {
+                candidate.hit.route = hit.route;
+            }
             candidate.hit.explanation.extend(hit.explanation.clone());
             if replace_snippet {
                 candidate.hit.snippet.clone_from(&hit.snippet);
@@ -959,6 +1025,21 @@ fn add_candidate(candidates: &mut HashMap<String, Candidate>, hit: SearchHit, co
             hit,
             fused_score: contribution,
         });
+}
+
+const fn canonical_representation_route(hit: &SearchHit) -> Option<SearchRoute> {
+    match (hit.route, &hit.representation) {
+        (SearchRoute::History, RetrievalRepresentation::CommitSummary) => {
+            Some(SearchRoute::History)
+        }
+        (
+            SearchRoute::Knowledge,
+            RetrievalRepresentation::KnowledgePage
+            | RetrievalRepresentation::ModuleSummary
+            | RetrievalRepresentation::RoleSummary,
+        ) => Some(SearchRoute::Knowledge),
+        _ => None,
+    }
 }
 
 fn should_replace_snippet(existing: &SearchHit, incoming: &SearchHit) -> bool {
@@ -1090,6 +1171,110 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
     value.chars().take(maximum).collect()
 }
 
+fn should_selectively_abstain(intent: QueryIntent, query: &str, hits: &[SearchHit]) -> bool {
+    if !matches!(
+        intent,
+        QueryIntent::Architecture
+            | QueryIntent::NaturalLanguageBehavior
+            | QueryIntent::IssueLocalization
+            | QueryIntent::Unknown
+    ) || !query.is_ascii()
+        || hits.iter().any(|hit| {
+            hit.contributing_routes
+                .iter()
+                .any(|route| matches!(route, SearchRoute::ExactSymbol | SearchRoute::History))
+        })
+    {
+        return false;
+    }
+    let terms = distinctive_query_terms(query);
+    if terms.len() < 2 || hits.is_empty() {
+        return false;
+    }
+    let sample = hits.iter().take(24).collect::<Vec<_>>();
+    let common_threshold = (sample.len() / 3).max(3);
+    let supported = terms.iter().filter(|term| {
+        let occurrences = sample
+            .iter()
+            .filter(|hit| hit_supports_term(hit, term))
+            .count();
+        occurrences > 0 && occurrences < common_threshold
+    });
+    supported.count() == 0
+}
+
+fn distinctive_query_terms(query: &str) -> Vec<String> {
+    const GENERIC: &[&str] = &[
+        "about",
+        "change",
+        "changed",
+        "code",
+        "configure",
+        "configured",
+        "configuration",
+        "does",
+        "explain",
+        "from",
+        "handling",
+        "implemented",
+        "implementation",
+        "into",
+        "logic",
+        "must",
+        "over",
+        "project",
+        "repository",
+        "source",
+        "through",
+        "toolkit",
+        "turn",
+        "used",
+        "using",
+        "what",
+        "where",
+        "which",
+    ];
+    let mut terms = query
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .map(str::to_ascii_lowercase)
+        .filter(|term| term.len() >= 4 && !GENERIC.contains(&term.as_str()))
+        .map(|term| query_term_stem(&term))
+        .collect::<Vec<_>>();
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn query_term_stem(term: &str) -> String {
+    for suffix in ["ation", "ing", "ied", "ed", "es", "s"] {
+        if term.len() > suffix.len() + 3 && term.ends_with(suffix) {
+            return term[..term.len() - suffix.len()].to_owned();
+        }
+    }
+    term.to_owned()
+}
+
+fn hit_supports_term(hit: &SearchHit, term: &str) -> bool {
+    let mut haystack = hit.snippet.to_ascii_lowercase();
+    if let Some(symbol) = &hit.symbol_name {
+        haystack.push(' ');
+        haystack.push_str(&symbol.to_ascii_lowercase());
+    }
+    if let Some(address) = &hit.address {
+        haystack.push(' ');
+        haystack.push_str(&address.path.to_ascii_lowercase());
+    }
+    haystack
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|token| {
+            if term.len() <= 4 {
+                token == term
+            } else {
+                token.starts_with(term)
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,6 +1325,20 @@ mod tests {
         assert_eq!(
             lexical_source_weight(QueryIntent::Impact, Some(&documentation), "impact"),
             1.0
+        );
+
+        let mut example = source.clone();
+        example.path = "examples/demo/src/retrieval.ts".to_owned();
+        assert!(
+            lexical_source_weight(QueryIntent::Architecture, Some(&source), "architecture")
+                > lexical_source_weight(QueryIntent::Architecture, Some(&example), "architecture")
+        );
+        assert!(
+            lexical_source_weight(
+                QueryIntent::Architecture,
+                Some(&example),
+                "example architecture"
+            ) > lexical_source_weight(QueryIntent::Architecture, Some(&example), "architecture")
         );
 
         let mut test = source.clone();
@@ -1233,5 +1432,105 @@ mod tests {
         );
 
         assert_eq!(candidates["entity: node"].hit.evidence, vec![evidence]);
+    }
+
+    #[test]
+    fn specialized_representation_route_survives_lexical_fusion() {
+        let hit = |route| SearchHit {
+            document_id: "commit".to_owned(),
+            symbol_name: Some("fix history".to_owned()),
+            entity_id: "repository".to_owned(),
+            representation: RetrievalRepresentation::CommitSummary,
+            route,
+            rank: 1,
+            score: 1.0,
+            contributing_routes: vec![route],
+            address: None,
+            evidence: Vec::new(),
+            snippet: "Commit: deadbeef".to_owned(),
+            verified_current: true,
+            explanation: Vec::new(),
+        };
+        let mut candidates = HashMap::new();
+
+        add_candidate(&mut candidates, hit(SearchRoute::Lexical), 1.0);
+        add_candidate(&mut candidates, hit(SearchRoute::History), 1.0);
+
+        let fused = &candidates["commit"].hit;
+        assert_eq!(fused.route, SearchRoute::History);
+        assert_eq!(
+            fused.contributing_routes,
+            vec![SearchRoute::Lexical, SearchRoute::History]
+        );
+    }
+
+    #[test]
+    fn selective_abstention_rejects_unsupported_distinctive_concepts() {
+        let hit = |index: usize| SearchHit {
+            document_id: format!("document-{index}"),
+            symbol_name: Some("configureStore".to_owned()),
+            entity_id: format!("entity-{index}"),
+            representation: RetrievalRepresentation::RawCode,
+            route: SearchRoute::Lexical,
+            rank: index + 1,
+            score: 0.05,
+            contributing_routes: vec![SearchRoute::Lexical],
+            address: None,
+            evidence: Vec::new(),
+            snippet: "Redux quick store configuration".to_owned(),
+            verified_current: true,
+            explanation: Vec::new(),
+        };
+        let hits = (0..12).map(hit).collect::<Vec<_>>();
+
+        assert!(!hit_supports_term(&hits[0], "quic"));
+
+        assert!(should_selectively_abstain(
+            QueryIntent::Architecture,
+            "Where does Redux Toolkit configure lunar cheese replication over QUIC?",
+            &hits
+        ));
+
+        let mut supported = hits;
+        supported[0].snippet = "cache invalidation after a fulfilled endpoint".to_owned();
+        assert!(!should_selectively_abstain(
+            QueryIntent::Architecture,
+            "How are fulfilled endpoint tags turned into cache invalidation?",
+            &supported
+        ));
+    }
+
+    #[test]
+    fn selective_abstention_does_not_override_exact_or_non_ascii_queries() {
+        let hit = SearchHit {
+            document_id: "document".to_owned(),
+            symbol_name: Some("symbol".to_owned()),
+            entity_id: "entity".to_owned(),
+            representation: RetrievalRepresentation::RawCode,
+            route: SearchRoute::ExactSymbol,
+            rank: 1,
+            score: 1.0,
+            contributing_routes: vec![SearchRoute::ExactSymbol],
+            address: None,
+            evidence: Vec::new(),
+            snippet: "symbol".to_owned(),
+            verified_current: true,
+            explanation: Vec::new(),
+        };
+
+        assert!(!should_selectively_abstain(
+            QueryIntent::Architecture,
+            "unknown extraterrestrial protocol",
+            std::slice::from_ref(&hit)
+        ));
+        assert!(!should_selectively_abstain(
+            QueryIntent::Architecture,
+            "月球奶酪复制在哪里？",
+            &[SearchHit {
+                contributing_routes: vec![SearchRoute::Lexical],
+                route: SearchRoute::Lexical,
+                ..hit
+            }]
+        ));
     }
 }

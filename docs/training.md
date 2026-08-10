@@ -4,7 +4,16 @@ CCE trains and serves embeddings without an inference service. Python under `res
 
 ## Dataset construction
 
-`research/corpora/production-repositories.yaml` pins every source repository to an immutable commit and assigns the entire repository to exactly one of train, validation, or test. This prevents project conventions or duplicated code from leaking across splits. The initial manifest includes SQLite, Redis, Django, Tokio, Flask, and ripgrep.
+`research/corpora/production-repositories.yaml` pins every source repository to an immutable commit and assigns the entire repository to exactly one of train, validation, or test. This prevents project conventions or duplicated code from leaking across splits. The manifest stratifies JavaScript, TypeScript, Rust, Python, C, and mixed-language repositories by small, medium, large, and enterprise scale. Training, frozen benchmark, and scale-stress roles are explicit.
+
+The static repository holdout is combined with a temporal rule: feedback after the manifest's
+observation cutoff first enters a rolling future-evaluation window. It must not be used to train
+the challenger evaluated on that window. Only a later dataset revision may advance the cutoff.
+This avoids a superficially improving benchmark that merely memorizes recent user queries.
+
+External evaluation repositories registered in `benchmarks/external-datasets.yaml` are
+evaluation-only. In particular, Agent Retrieval Bench and SWE-Explore queries, gold files, and
+trajectory regions must never be exported into feedback training examples.
 
 The builder clones only pinned revisions, indexes each checkout through the production CCE binary, and uses exactly the runtime document representation:
 
@@ -44,6 +53,56 @@ uv run --project research --extra models --extra training cce-research train-ret
 ```
 
 `--max-train-examples` and `--max-validation-examples` are smoke/debug limits, not production defaults. Do not tune against the test split.
+
+## Local continuous-learning loop
+
+Long-running CLI, daemon, and MCP deployments can retain query trajectories and explicit
+feedback in the same local CCE data root. No query, source text, trace, dataset, model, or
+benchmark result is sent to an inference or telemetry service. Keep the data root on encrypted
+storage and apply the same backup policy as the indexed repositories.
+
+Raw `shown_to_model` and `opened_by_agent` events are retained for funnel analysis only. They
+are position- and exposure-biased, so the exporter never turns them into relevance labels.
+`cited_or_used` and `edited_or_affected` are positive labels; the default high-confidence
+export requires an explicit document-level `rejected` event from the same trajectory for every
+hard negative. A trajectory without both sides remains raw telemetry and is reported as skipped
+in the manifest.
+
+Export one or more local data roots with a fixed observation cutoff:
+
+```bash
+uv run --project research cce-research export-feedback \
+  --data-root /srv/cce/project-a \
+  --data-root /srv/cce/project-b \
+  --output research/output/feedback/train.jsonl \
+  --cutoff 2026-08-10T00:00:00Z \
+  --max-negatives 7
+```
+
+The adjacent manifest records every input database SHA-256, content-addressed trace digest,
+cutoff, event counts, label policy, skipped trajectory count, dataset revision, and final JSONL
+SHA-256. Feedback examples are always assigned to `train`; frozen validation/test repositories
+and future-time evaluation windows must remain separate. Re-exporting with a later cutoff creates
+a new auditable dataset revision rather than mutating an old one.
+
+Train a challenger against the combined pinned corpus and feedback train split, then benchmark
+the champion and challenger on the identical frozen held-out file and hardware. Promotion is a
+separate local operation:
+
+```bash
+uv run --project research cce-research promote-model \
+  --champion-benchmark research/output/champion.json \
+  --challenger-benchmark research/output/challenger.json \
+  --candidate research/output/models/challenger-onnx \
+  --registry /srv/cce/model-registry
+```
+
+The gate rejects aggregate Recall/MRR/nDCG regressions, missing or excessive per-query-kind
+quality, p95 latency or peak-RSS increases above the configured ratios, and throughput below its
+floor. Comparable results must have the same dataset hash and hardware record. Passing bundles
+are copied without symlinks into an immutable content-hashed release and `current.json` is
+replaced atomically; failed decisions leave the current champion untouched. Every pass or failure
+has an audit manifest under `registry/audit/`. Training loss alone can never promote a model.
 
 ## ONNX promotion bundle
 

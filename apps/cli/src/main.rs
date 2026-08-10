@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::Context;
-use cce_core::{QueryIntent, SearchRequest};
+use cce_core::{LearningEventStage, LearningFeedback, QueryIntent, SearchRequest};
 use cce_engine::{
     CceEngine, ContextRequest, DEFAULT_LOCAL_EMBEDDING_MODEL, DEFAULT_LOCAL_RERANKER_MODEL,
     DEFAULT_LOCAL_RERANKER_REVISION, DataflowBackendConfig, DenseBackendConfig, EngineConfig,
@@ -147,6 +147,8 @@ struct Arguments {
         default_value_t = 1_800
     )]
     joern_timeout_seconds: u64,
+    #[arg(long, global = true, env = "CCE_CAPTURE_LEARNING_DATA")]
+    capture_learning_data: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -202,6 +204,38 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         candidates: usize,
     },
+    Feedback {
+        #[arg(default_value = ".")]
+        repository: PathBuf,
+        trajectory_id: String,
+        #[arg(long, value_enum)]
+        stage: FeedbackStage,
+        #[arg(long)]
+        document_id: Option<String>,
+        #[arg(long)]
+        dwell_ms: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum FeedbackStage {
+    Opened,
+    Cited,
+    Edited,
+    Accepted,
+    Rejected,
+}
+
+impl From<FeedbackStage> for LearningEventStage {
+    fn from(value: FeedbackStage) -> Self {
+        match value {
+            FeedbackStage::Opened => Self::OpenedByAgent,
+            FeedbackStage::Cited => Self::CitedOrUsed,
+            FeedbackStage::Edited => Self::EditedOrAffected,
+            FeedbackStage::Accepted => Self::Accepted,
+            FeedbackStage::Rejected => Self::Rejected,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -316,6 +350,23 @@ async fn main() -> anyhow::Result<()> {
                 print_context(&pack);
             }
         }
+        Command::Feedback {
+            repository,
+            trajectory_id,
+            stage,
+            document_id,
+            dwell_ms,
+        } => {
+            let engine = engine(&arguments, repository)?;
+            let receipt = engine.record_learning_feedback(LearningFeedback {
+                trajectory_id: trajectory_id.clone(),
+                stage: (*stage).into(),
+                document_id: document_id.clone(),
+                dwell_ms: *dwell_ms,
+                metadata: BTreeMap::new(),
+            })?;
+            print_value(&receipt)?;
+        }
     }
     Ok(())
 }
@@ -323,6 +374,7 @@ async fn main() -> anyhow::Result<()> {
 fn engine(arguments: &Arguments, repository: &PathBuf) -> anyhow::Result<CceEngine> {
     let mut config = EngineConfig::for_repository(repository);
     config.data_root = data_dir(arguments, repository);
+    config.capture_learning_data = arguments.capture_learning_data;
     config.dense = match arguments.dense {
         DenseMode::Disabled => DenseBackendConfig::Disabled,
         DenseMode::Baseline => DenseBackendConfig::DeterministicBaseline {

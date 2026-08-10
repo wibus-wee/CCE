@@ -1,5 +1,12 @@
-schema_version: 1
-dataset_revision: cce-production-retrieval-v1
+schema_version: 2
+dataset_revision: cce-production-retrieval-v2-2026-08-10
+split_policy:
+  split_unit: repository
+  repository_held_out: true
+  immutable_revisions_required: true
+  observation_cutoff: "2026-08-10T00:00:00Z"
+  future_feedback_evaluation_only: true
+  rolling_evaluation_window_days: 90
 repositories:
   - name: sqlite
     url: https://github.com/sqlite/sqlite.git
@@ -7,6 +14,9 @@ repositories:
     split: train
     license_spdx: blessing
     languages: [c]
+    scale_tier: large
+    corpus_roles: [retriever_training, reranker_training]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
     max_documents: 20000
     history_depth: 256
   - name: redis
@@ -15,6 +25,9 @@ repositories:
     split: train
     license_spdx: RSALv2-or-SSPL-1.0
     languages: [c]
+    scale_tier: large
+    corpus_roles: [retriever_training, reranker_training]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
     max_documents: 20000
     history_depth: 256
   - name: django
@@ -23,14 +36,75 @@ repositories:
     split: train
     license_spdx: BSD-3-Clause
     languages: [python]
+    scale_tier: large
+    corpus_roles: [retriever_training, reranker_training]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
     max_documents: 20000
     history_depth: 256
+  - name: zod
+    url: https://github.com/colinhacks/zod.git
+    revision: ead9fcb310bf65a70427f92ca76545efe954037e
+    split: train
+    license_spdx: MIT
+    languages: [typescript]
+    scale_tier: medium
+    corpus_roles: [retriever_training, reranker_training]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
+    max_documents: 12000
+    history_depth: 256
+  - name: express
+    url: https://github.com/expressjs/express.git
+    revision: a3714473feb3d2908add734d340e7755fd85e0a3
+    split: train
+    license_spdx: MIT
+    languages: [javascript]
+    scale_tier: small
+    corpus_roles: [retriever_training, reranker_training]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
+    max_documents: 6000
+    history_depth: 256
+  - name: serde
+    url: https://github.com/serde-rs/serde.git
+    revision: 747814f7d5fbab872df3b02f070c165b91bde062
+    split: train
+    license_spdx: MIT-or-Apache-2.0
+    languages: [rust]
+    scale_tier: medium
+    corpus_roles: [retriever_training, reranker_training]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
+    max_documents: 12000
+    history_depth: 256
+  - name: redux-toolkit
+    url: https://github.com/reduxjs/redux-toolkit.git
+    revision: 74200d87c27ca2b1c0915b2fbb4c44dd7494c2aa
+    split: validation
+    license_spdx: MIT
+    languages: [javascript, typescript]
+    scale_tier: large
+    corpus_roles: [frozen_benchmark]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
+    max_documents: 18000
+    history_depth: 256
+  - name: axum
+    url: https://github.com/tokio-rs/axum.git
+    revision: c9a911b7999de50e9e5023942ca072e9725ae943
+    split: validation
+    license_spdx: MIT
+    languages: [rust]
+    scale_tier: medium
+    corpus_roles: [frozen_benchmark]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
+    max_documents: 12000
+    history_depth: 192
   - name: tokio
     url: https://github.com/tokio-rs/tokio.git
     revision: 8b13642a1f7346814f189937b2d6e1e80b210db1
     split: validation
     license_spdx: MIT
     languages: [rust]
+    scale_tier: large
+    corpus_roles: [frozen_benchmark]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
     max_documents: 15000
     history_depth: 192
   - name: flask
@@ -39,7 +113,21 @@ repositories:
     split: validation
     license_spdx: BSD-3-Clause
     languages: [python]
+    scale_tier: small
+    corpus_roles: [frozen_benchmark]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
     max_documents: 8000
+    history_depth: 192
+  - name: vue-core
+    url: https://github.com/vuejs/core.git
+    revision: 40423896796ff7438a1aa70ee3cf22fe5b0ac224
+    split: test
+    license_spdx: MIT
+    languages: [javascript, typescript]
+    scale_tier: large
+    corpus_roles: [frozen_benchmark]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
+    max_documents: 18000
     history_depth: 192
   - name: ripgrep
     url: https://github.com/BurntSushi/ripgrep.git
@@ -47,5 +135,30 @@ repositories:
     split: test
     license_spdx: Unlicense-or-MIT
     languages: [rust]
+    scale_tier: medium
+    corpus_roles: [frozen_benchmark]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
     max_documents: 15000
+    history_depth: 192
+  - name: uv
+    url: https://github.com/astral-sh/uv.git
+    revision: 62538397e59a7fd10db51cb3889df9b4d6449e6b
+    split: test
+    license_spdx: MIT-or-Apache-2.0
+    languages: [rust, python]
+    scale_tier: enterprise
+    corpus_roles: [frozen_benchmark, scale_stress]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
+    max_documents: 30000
+    history_depth: 192
+  - name: biome
+    url: https://github.com/biomejs/biome.git
+    revision: db36fb42fd26697adb4a481d42f082b1844cd934
+    split: test
+    license_spdx: MIT-or-Apache-2.0
+    languages: [rust, javascript, typescript, json]
+    scale_tier: enterprise
+    corpus_roles: [frozen_benchmark, scale_stress]
+    benchmark_intents: [exact_entity, architecture, history, impact, precise_dataflow]
+    max_documents: 30000
     history_depth: 192

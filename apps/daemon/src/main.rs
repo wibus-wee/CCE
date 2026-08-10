@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use cce_core::{QueryIntent, SearchRequest};
+use cce_core::{LearningFeedback, QueryIntent, SearchRequest};
 use cce_engine::{
     CceEngine, ContextRequest, DEFAULT_LOCAL_EMBEDDING_MODEL, DEFAULT_LOCAL_RERANKER_MODEL,
     DEFAULT_LOCAL_RERANKER_REVISION, DataflowBackendConfig, DenseBackendConfig, EngineConfig,
@@ -110,6 +110,8 @@ struct Arguments {
     joern_language: Option<String>,
     #[arg(long, env = "CCE_JOERN_TIMEOUT_SECONDS", default_value_t = 1_800)]
     joern_timeout_seconds: u64,
+    #[arg(long, env = "CCE_CAPTURE_LEARNING_DATA")]
+    capture_learning_data: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -300,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
                 DataflowBackendConfig::Supplied { path }
             })
     };
+    config.capture_learning_data = arguments.capture_learning_data;
     tracing::debug!(data_root = %config.data_root.display(), "opening CCE engine");
     let state = Arc::new(CceEngine::open(config)?);
     tracing::debug!("CCE engine opened; building HTTP router");
@@ -310,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/status", get(status))
         .route("/v1/search", post(search))
         .route("/v1/context", post(context))
+        .route("/v1/feedback", post(feedback))
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
         .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
@@ -372,6 +376,13 @@ async fn context(
     request.budget_tokens = request.budget_tokens.clamp(256, 128_000);
     request.max_candidates = request.max_candidates.clamp(1, 500);
     Ok(Json(engine.context(request).await?))
+}
+
+async fn feedback(
+    State(engine): State<Arc<CceEngine>>,
+    Json(feedback): Json<LearningFeedback>,
+) -> Result<Json<cce_core::LearningReceipt>, ApiError> {
+    Ok(Json(engine.record_learning_feedback(feedback)?))
 }
 
 async fn shutdown_signal() {

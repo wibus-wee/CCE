@@ -1,0 +1,113 @@
+schema_version: 1
+frozen_at: "2026-08-10T00:00:00Z"
+policy:
+  evaluation_only: true
+  exclude_repositories_from_training: true
+  require_upstream_checksums: true
+  require_base_commit_checkout: true
+  never_merge_external_gold_into_feedback_training: true
+  # ARB v2 sample-bearing repositories. Additional SWE-Explore and CodeScaleBench exclusions are
+  # loaded from their downloaded, checksum-verified manifests before a training build starts.
+  excluded_training_repositories:
+    - HypothesisWorks/hypothesis
+    - astral-sh/ruff
+    - caddyserver/caddy
+    - clap-rs/clap
+    - eslint/eslint
+    - etcd-io/etcd
+    - fastapi/fastapi
+    - gin-gonic/gin
+    - huggingface/diffusers
+    - huggingface/transformers
+    - ipython/ipython
+    - microsoft/playwright
+    - mockito/mockito
+    - numpy/numpy
+    - pallets/click
+    - pydantic/pydantic
+    - pypa/pip
+    - pytest-dev/pytest
+    - python/mypy
+    - scrapy/scrapy
+    - spring-projects/spring-boot
+    - tokio-rs/tokio
+    - tox-dev/tox
+    - vitejs/vite
+    - vuejs/core
+datasets:
+  - name: Agent Retrieval Bench
+    short_name: arb-v2
+    classification: primary_context_retrieval
+    source: https://github.com/eyuansu62/agent-retrieval-bench
+    source_revision: 07014c986f3deadb1548c62b32c0ffbe6a81465d
+    paper: https://arxiv.org/abs/2607.24882v1
+    releases: [v2_code2test, v2_comment2context, v2_trace2code, v2_edit2ripple, v2_abstention]
+    samples: 427
+    repositories: 25
+    languages: [python, go, rust, typescript, java, javascript]
+    tasks: [code2test, comment2context, trace2code, edit2ripple, abstention]
+    metrics: [mrr, recall_at_20, bcy_at_8k, selective_success_at_20]
+    notes: >-
+      Canonical file-level workflow retrieval and selective-retrieval gate. Run every release
+      against its supplied frozen corpus; do not replace base commits with repository HEAD.
+  - name: SWE-Explore
+    short_name: swe-explore-v1
+    classification: primary_context_retrieval
+    source: https://github.com/Qiushao-E/SWE-Explore-Bench
+    source_revision: 3c12dc5a551937038afcbdb6eb6bbf19f3ddd8c1
+    paper: https://arxiv.org/abs/2606.07297v1
+    samples: 848
+    repositories: 203
+    languages: [python, go, javascript, rust, java, php, typescript, ruby, c, cpp]
+    tasks: [issue_to_ranked_regions]
+    metrics: [file_coverage, region_coverage, ranking, context_efficiency]
+    notes: >-
+      Canonical line-level issue exploration gate. Gold core and optional regions come from
+      multiple successful repair trajectories; preserve their distinction during scoring.
+  - name: Sourcegraph CodeScaleBench
+    short_name: codescalebench-v2
+    classification: downstream_agent_scale
+    source: https://github.com/sourcegraph/CodeScaleBench
+    source_revision: 8d5f3c876c28a5033634facf42c21da9ebc6fcd6
+    release: csb-v2-dual264
+    tasks: [large_repository_agent_tasks, multi_repository_agent_tasks]
+    metrics: [dual_verifier_reward, retrieval_precision, retrieval_recall, latency, cost]
+    notes: >-
+      End-to-end downstream validation for large and multi-repository contexts. Report CCE-on
+      and CCE-off with the same agent, model, task snapshot, and budget.
+  - name: CrossCodeEval
+    short_name: crosscodeeval
+    classification: secondary_completion_proxy
+    source: https://github.com/amazon-science/cceval
+    source_revision: 40c68d2b7ca2a8eae95d901ac80e6a540a84a53d
+    paper: https://openreview.net/forum?id=wgDcbBMSfh
+    languages: [python, java, typescript, csharp]
+    tasks: [cross_file_completion]
+    metrics: [exact_match, edit_similarity, identifier_match]
+    notes: >-
+      Static-analysis-selected cross-file completion proxy. It is not an agent context-retrieval
+      benchmark and must never be reported as architecture, history, impact, or dataflow quality.
+  - name: RepoBench
+    short_name: repobench-v1.1
+    classification: secondary_completion_proxy
+    source: https://github.com/Leolty/repobench
+    source_revision: e0cfd34c9e7cd8f057efd32b9280b9719ae12a91
+    paper: https://arxiv.org/abs/2306.03091
+    languages: [python, java]
+    tasks: [cross_file_retrieval, next_line_completion, retrieval_completion_pipeline]
+    metrics: [exact_match, edit_similarity, codebleu]
+    notes: >-
+      Repository-level completion proxy. Completion similarity is not evidence that an agent was
+      given the correct architectural or causal context.
+  - name: CodeSearchNet
+    short_name: codesearchnet-v2
+    classification: secondary_semantic_search
+    source: https://github.com/github/CodeSearchNet
+    source_revision: 106e827405c968597da938f6b373d30183918869
+    paper: https://arxiv.org/abs/1909.09436
+    languages: [python, javascript, ruby, go, java, php]
+    tasks: [docstring_to_function]
+    metrics: [ndcg]
+    notes: >-
+      Function-level semantic search diagnostic and optional pretraining source only. Its
+      repository-held-out split is useful, but it does not measure workflow context acquisition.

@@ -15,7 +15,7 @@ use scip::types::{
     TextEncoding, ToolInfo, occurrence, symbol_information,
 };
 
-use crate::{ScannedFile, ScannedRepository, ScipBackendConfig};
+use crate::{ScannedFile, ScannedRepository, ScipBackendConfig, SourceParser};
 
 const MAX_SCIP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_EVIDENCE_PER_EDGE: usize = 32;
@@ -28,6 +28,9 @@ pub(crate) struct ScipImport {
     pub relations: Vec<Relation>,
     pub documents: usize,
     pub matched_documents: usize,
+    pub source_documents: usize,
+    pub matched_source_documents: usize,
+    pub uncovered_source_languages: Vec<(String, usize)>,
     pub definitions: usize,
     pub references: usize,
     pub skipped_occurrences: usize,
@@ -56,9 +59,7 @@ pub(crate) async fn build(
     let index = scip::types::Index::parse_from_bytes(&bytes)
         .map_err(|error| CceError::ArtifactCorrupt(format!("invalid SCIP protobuf: {error}")))?;
     let metadata = index.metadata.as_ref();
-    let legacy_position_encoding = metadata
-        .and_then(|value| value.text_document_encoding.enum_value().ok())
-        .and_then(legacy_position_encoding);
+    let legacy_position_encoding = legacy_position_encoding(metadata);
     let tool = metadata
         .and_then(|value| value.tool_info.as_ref())
         .map_or_else(
@@ -76,6 +77,7 @@ pub(crate) async fn build(
     let mut symbol_entities = HashMap::<String, String>::new();
     let mut new_entities = Vec::new();
     let mut matched_documents = 0_usize;
+    let mut matched_source_paths = HashSet::new();
     let mut definitions = 0_usize;
     let mut skipped_occurrences = 0_usize;
 
@@ -85,6 +87,9 @@ pub(crate) async fn build(
             continue;
         };
         matched_documents += 1;
+        if file.language.as_deref().is_some_and(SourceParser::supports) {
+            matched_source_paths.insert(file.relative_path.as_str());
+        }
         for occurrence in &document.occurrences {
             if occurrence.symbol.is_empty() || !has_role(occurrence, SymbolRole::Definition) {
                 continue;
@@ -236,6 +241,12 @@ pub(crate) async fn build(
         }
     }
 
+    let source_documents = scanned
+        .files
+        .iter()
+        .filter(|file| file.language.as_deref().is_some_and(SourceParser::supports))
+        .count();
+    let uncovered_source_languages = uncovered_source_languages(scanned, &matched_source_paths);
     Ok(Some(ScipImport {
         bytes,
         trusted_snapshot,
@@ -243,12 +254,37 @@ pub(crate) async fn build(
         relations: edges.into_values().collect(),
         documents: index.documents.len(),
         matched_documents,
+        source_documents,
+        matched_source_documents: matched_source_paths.len(),
+        uncovered_source_languages,
         definitions,
         references,
         skipped_occurrences,
         tool,
         failures: loaded.failures,
     }))
+}
+
+fn uncovered_source_languages(
+    scanned: &ScannedRepository,
+    matched_paths: &HashSet<&str>,
+) -> Vec<(String, usize)> {
+    let mut counts = HashMap::<String, usize>::new();
+    for file in &scanned.files {
+        let Some(language) = file
+            .language
+            .as_deref()
+            .filter(|value| SourceParser::supports(value))
+        else {
+            continue;
+        };
+        if !matched_paths.contains(file.relative_path.as_str()) {
+            *counts.entry(language.to_owned()).or_default() += 1;
+        }
+    }
+    let mut counts = counts.into_iter().collect::<Vec<_>>();
+    counts.sort_by(|left, right| left.0.cmp(&right.0));
+    counts
 }
 
 async fn load_index(
@@ -718,11 +754,7 @@ fn retain_richer_document(documents: &mut HashMap<String, Document>, candidate: 
 }
 
 fn apply_legacy_encoding(index: &mut Index) -> Result<()> {
-    let fallback = index
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.text_document_encoding.enum_value().ok())
-        .and_then(legacy_position_encoding);
+    let fallback = legacy_position_encoding(index.metadata.as_ref());
     for document in &mut index.documents {
         let encoding = document.position_encoding.enum_value().map_err(|value| {
             CceError::ArtifactCorrupt(format!("unknown SCIP position encoding {value}"))
@@ -991,11 +1023,23 @@ fn occurrence_address(
     ))
 }
 
-fn legacy_position_encoding(value: TextEncoding) -> Option<PositionEncoding> {
-    match value {
-        TextEncoding::UTF8 => Some(PositionEncoding::UTF8CodeUnitOffsetFromLineStart),
-        TextEncoding::UTF16 => Some(PositionEncoding::UTF16CodeUnitOffsetFromLineStart),
-        TextEncoding::UnspecifiedTextEncoding => None,
+fn legacy_position_encoding(metadata: Option<&Metadata>) -> Option<PositionEncoding> {
+    let tool = metadata?
+        .tool_info
+        .as_ref()
+        .map(|tool| tool.name.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match tool.as_str() {
+        // Legacy scip-typescript indexes use TypeScript's UTF-16 string offsets while
+        // Metadata.text_document_encoding correctly describes the UTF-8 files on disk.
+        // That metadata field is not a range encoding and must not be used as one.
+        "scip-typescript" | "scip-java" | "scip-dotnet" => {
+            Some(PositionEncoding::UTF16CodeUnitOffsetFromLineStart)
+        }
+        "scip-python" => Some(PositionEncoding::UTF32CodeUnitOffsetFromLineStart),
+        // The original SCIP range representation used UTF-8 byte offsets. New producers
+        // should always set Document.position_encoding explicitly.
+        _ => Some(PositionEncoding::UTF8CodeUnitOffsetFromLineStart),
     }
 }
 
@@ -1179,6 +1223,8 @@ fn truncate_utf8(bytes: &[u8], maximum: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cce_core::{RepositoryIdentity, SnapshotIdentity};
+    use chrono::Utc;
 
     #[test]
     fn converts_all_scip_position_encodings() {
@@ -1238,6 +1284,28 @@ mod tests {
     fn upgrades_legacy_metadata_encoding_per_document() {
         let mut metadata = Metadata::new();
         metadata.text_document_encoding = EnumOrUnknown::new(TextEncoding::UTF8);
+        let mut tool = ToolInfo::new();
+        tool.name = "scip-typescript".to_owned();
+        metadata.tool_info = MessageField::some(tool);
+        let mut index = Index::new();
+        index.metadata = MessageField::some(metadata);
+        index.documents.push(Document::new());
+
+        apply_legacy_encoding(&mut index).expect("upgrade encoding");
+
+        assert_eq!(
+            index.documents[0]
+                .position_encoding
+                .enum_value()
+                .expect("known encoding"),
+            PositionEncoding::UTF16CodeUnitOffsetFromLineStart
+        );
+    }
+
+    #[test]
+    fn legacy_text_encoding_is_not_mistaken_for_range_encoding() {
+        let mut metadata = Metadata::new();
+        metadata.text_document_encoding = EnumOrUnknown::new(TextEncoding::UTF16);
         let mut index = Index::new();
         index.metadata = MessageField::some(metadata);
         index.documents.push(Document::new());
@@ -1250,6 +1318,49 @@ mod tests {
                 .enum_value()
                 .expect("known encoding"),
             PositionEncoding::UTF8CodeUnitOffsetFromLineStart
+        );
+    }
+
+    #[test]
+    fn source_coverage_ignores_non_code_documents_and_reports_uncovered_languages() {
+        let file = |path: &str, language: Option<&str>| ScannedFile {
+            relative_path: path.to_owned(),
+            absolute_path: PathBuf::from("/repo").join(path),
+            language: language.map(str::to_owned),
+            bytes: b"source\n".to_vec(),
+            content_hash: path.to_owned(),
+            line_count: 1,
+        };
+        let scanned = ScannedRepository {
+            identity: RepositoryIdentity {
+                id: "repo_test".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            },
+            snapshot: SnapshotIdentity {
+                id: "snapshot".to_owned(),
+                repository_id: "repo_test".to_owned(),
+                base_revision: None,
+                workspace_overlay_hash: "overlay".to_owned(),
+                index_profile_hash: "profile".to_owned(),
+                created_at: Utc::now(),
+                file_count: 4,
+                source_bytes: 28,
+            },
+            files: vec![
+                file("src/index.ts", Some("typescript")),
+                file("src/view.tsx", Some("tsx")),
+                file("android/Main.java", Some("java")),
+                file("package.json", None),
+            ],
+            skipped_large_files: Vec::new(),
+            skipped_binary_files: Vec::new(),
+        };
+        let matched = HashSet::from(["src/index.ts", "package.json"]);
+
+        assert_eq!(
+            uncovered_source_languages(&scanned, &matched),
+            vec![("java".to_owned(), 1), ("tsx".to_owned(), 1)]
         );
     }
 

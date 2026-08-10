@@ -17,6 +17,17 @@ Intent = Literal[
     "precise_dataflow",
 ]
 DatasetSplit = Literal["train", "validation", "test"]
+ScaleTier = Literal["small", "medium", "large", "enterprise"]
+CorpusRole = Literal[
+    "retriever_training",
+    "reranker_training",
+    "frozen_benchmark",
+    "scale_stress",
+]
+
+
+def default_corpus_roles() -> list[CorpusRole]:
+    return ["retriever_training", "reranker_training"]
 
 
 class LineRange(BaseModel):
@@ -125,8 +136,24 @@ class CorpusRepository(BaseModel):
     split: DatasetSplit
     license_spdx: str
     languages: list[str] = Field(default_factory=list)
+    scale_tier: ScaleTier = "medium"
+    corpus_roles: list[CorpusRole] = Field(default_factory=default_corpus_roles)
+    benchmark_intents: list[Intent] = Field(default_factory=list)
     max_documents: int = Field(default=20_000, ge=1, le=2_000_000)
     history_depth: int = Field(default=128, ge=1, le=10_000)
+
+
+class CorpusSplitPolicy(BaseModel):
+    """Leakage controls applied before any examples or feedback enter training."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    split_unit: Literal["repository"] = "repository"
+    repository_held_out: bool = True
+    immutable_revisions_required: bool = True
+    observation_cutoff: str
+    future_feedback_evaluation_only: bool = True
+    rolling_evaluation_window_days: int = Field(default=90, ge=1, le=3660)
 
 
 class CorpusManifest(BaseModel):
@@ -134,6 +161,7 @@ class CorpusManifest(BaseModel):
 
     schema_version: int = 1
     dataset_revision: str
+    split_policy: CorpusSplitPolicy
     repositories: list[CorpusRepository]
 
     @model_validator(mode="after")
@@ -144,6 +172,11 @@ class CorpusManifest(BaseModel):
         identities = [(repository.url, repository.revision) for repository in self.repositories]
         if len(identities) != len(set(identities)):
             raise ValueError("a pinned repository may appear in only one split")
+        if not self.split_policy.repository_held_out:
+            raise ValueError("production corpora require repository-held-out splits")
+        represented_splits = {repository.split for repository in self.repositories}
+        if represented_splits != {"train", "validation", "test"}:
+            raise ValueError("production corpora require train, validation, and test repositories")
         return self
 
 
@@ -168,6 +201,18 @@ class TrainingDocument(BaseModel):
         return self
 
 
+class LearningExampleProvenance(BaseModel):
+    """Auditable local feedback labels used to construct one training example."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    trajectory_id: str
+    snapshot_id: str
+    observed_at: str
+    positive_stage: Literal["cited_or_used", "edited_or_affected"]
+    negative_stage: Literal["rejected"] = "rejected"
+
+
 class TrainingExample(BaseModel):
     """One repository-local contrastive example with explicit hard negatives."""
 
@@ -180,6 +225,7 @@ class TrainingExample(BaseModel):
     query_kind: Literal["documentation", "symbol_navigation", "change_localization"]
     positive: TrainingDocument
     negatives: list[TrainingDocument] = Field(min_length=1, max_length=64)
+    learning_provenance: LearningExampleProvenance | None = None
 
     @model_validator(mode="after")
     def repository_local_and_unique(self) -> TrainingExample:

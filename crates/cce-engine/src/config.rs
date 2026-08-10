@@ -415,6 +415,7 @@ pub struct EngineConfig {
     pub reranker: RerankerBackendConfig,
     pub scip: ScipBackendConfig,
     pub dataflow: DataflowBackendConfig,
+    pub capture_learning_data: bool,
 }
 
 impl EngineConfig {
@@ -432,6 +433,12 @@ impl EngineConfig {
             reranker: RerankerBackendConfig::Disabled,
             scip: ScipBackendConfig::Disabled,
             dataflow: DataflowBackendConfig::Disabled,
+            capture_learning_data: std::env::var("CCE_CAPTURE_LEARNING_DATA").is_ok_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "all"
+                )
+            }),
         }
     }
 

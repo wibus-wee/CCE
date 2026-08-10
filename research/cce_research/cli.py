@@ -8,12 +8,18 @@ import sys
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from .adapters import Adapter
+from .continuous_learning import (
+    PromotionPolicy,
+    export_feedback_dataset,
+    promote_if_benchmark_passes,
+)
 from .metrics import evaluate
 from .model_benchmark import benchmark_models
 from .reranker_benchmark import benchmark_rerankers
@@ -301,6 +307,58 @@ def benchmark_rerankers_command(
             f"{measurement.query_p95_ms:.1f}",
         )
     console.print(table)
+
+
+@app.command("export-feedback")
+def export_feedback_command(
+    data_root: Annotated[list[Path], typer.Option("--data-root")],
+    output: Annotated[Path, typer.Option("--output")],
+    cutoff: Annotated[str | None, typer.Option("--cutoff")] = None,
+    max_negatives: Annotated[int, typer.Option("--max-negatives", min=1, max=64)] = 7,
+) -> None:
+    """Export high-confidence local feedback labels as training JSONL."""
+    summary = export_feedback_dataset(
+        data_root,
+        output,
+        cutoff=cutoff,
+        max_negatives=max_negatives,
+    )
+    console.print_json(json.dumps(asdict(summary)))
+
+
+@app.command("promote-model")
+def promote_model_command(
+    champion_benchmark: Annotated[Path, typer.Option("--champion-benchmark")],
+    challenger_benchmark: Annotated[Path, typer.Option("--challenger-benchmark")],
+    candidate: Annotated[Path, typer.Option("--candidate")],
+    registry: Annotated[Path, typer.Option("--registry")],
+    champion_model: Annotated[str | None, typer.Option("--champion-model")] = None,
+    challenger_model: Annotated[str | None, typer.Option("--challenger-model")] = None,
+    quality_max_regression: Annotated[float, typer.Option(min=0)] = 0.0,
+    per_kind_max_regression: Annotated[float, typer.Option(min=0)] = 0.02,
+    latency_max_ratio: Annotated[float, typer.Option(min=1)] = 1.10,
+    memory_max_ratio: Annotated[float, typer.Option(min=1)] = 1.10,
+    throughput_min_ratio: Annotated[float, typer.Option(min=0, max=1)] = 0.90,
+) -> None:
+    """Atomically promote a local model after champion/challenger regression gates."""
+    summary = promote_if_benchmark_passes(
+        champion_benchmark,
+        challenger_benchmark,
+        candidate,
+        registry,
+        champion_model=champion_model,
+        challenger_model=challenger_model,
+        policy=PromotionPolicy(
+            quality_max_regression=quality_max_regression,
+            per_kind_max_regression=per_kind_max_regression,
+            latency_max_ratio=latency_max_ratio,
+            memory_max_ratio=memory_max_ratio,
+            throughput_min_ratio=throughput_min_ratio,
+        ),
+    )
+    console.print_json(json.dumps(asdict(summary)))
+    if not summary.promoted:
+        raise typer.Exit(code=2)
 
 
 def sha256(path: Path) -> str:

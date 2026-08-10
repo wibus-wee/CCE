@@ -8,6 +8,7 @@ mod dataflow;
 mod dense;
 mod engine;
 mod history;
+mod learning;
 mod lock;
 mod parser;
 mod planner;

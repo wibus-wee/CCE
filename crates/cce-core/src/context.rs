@@ -55,6 +55,8 @@ pub struct Uncertainty {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextPack {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trajectory_id: Option<String>,
     pub repository_id: String,
     pub snapshot_id: String,
     pub query: String,

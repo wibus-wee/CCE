@@ -4,6 +4,7 @@ mod address;
 mod context;
 mod entity;
 mod error;
+mod learning;
 mod manifest;
 mod relation;
 mod retrieval;
@@ -13,6 +14,7 @@ pub use address::SourceAddress;
 pub use context::{ContextItem, ContextItemKind, ContextPack, ContextProvenance, Uncertainty};
 pub use entity::{CodeEntity, EntityKind};
 pub use error::{CceError, Result};
+pub use learning::{LearningEventStage, LearningFeedback, LearningReceipt};
 pub use manifest::{Capability, ViewKind, ViewManifest, ViewState, ViewStatus};
 pub use relation::{Relation, RelationKind, RelationOrigin};
 pub use retrieval::{

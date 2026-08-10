@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
     process::Stdio,
     time::Duration,
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{process::Command, time::timeout};
 use walkdir::WalkDir;
 
-use crate::{DataflowBackendConfig, ScannedFile, ScannedRepository};
+use crate::{DataflowBackendConfig, ScannedFile, ScannedRepository, SourceParser};
 
 const MAX_DATAFLOW_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_DATAFLOW_NODES: usize = 5_000_000;
@@ -27,6 +27,9 @@ pub(crate) struct DataflowImport {
     pub edges: usize,
     pub skipped_edges: usize,
     pub generator: String,
+    pub source_files: usize,
+    pub covered_source_files: usize,
+    pub uncovered_source_languages: Vec<(String, usize)>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -163,6 +166,23 @@ pub(crate) async fn build(
         .map(|file| (file.relative_path.as_str(), file))
         .collect::<HashMap<_, _>>();
     let declared_files = validate_files(&artifact.files, &files)?;
+    let source_files = scanned
+        .files
+        .iter()
+        .filter(|file| file.language.as_deref().is_some_and(SourceParser::supports))
+        .count();
+    let covered_source_files = scanned
+        .files
+        .iter()
+        .filter(|file| {
+            file.language.as_deref().is_some_and(SourceParser::supports)
+                && declared_files.contains_key(file.relative_path.as_str())
+        })
+        .count();
+    let uncovered_source_languages = uncovered_source_languages(
+        scanned,
+        &declared_files.keys().copied().collect::<HashSet<_>>(),
+    );
     let artifact_digest = blake3::hash(&bytes).to_hex().to_string();
     let entities_by_path = existing_entities_by_path(existing_entities);
     let mut node_ids = HashMap::new();
@@ -275,6 +295,9 @@ pub(crate) async fn build(
         edges: artifact.edges.len(),
         skipped_edges,
         generator: format!("{}@{}", artifact.generator.name, artifact.generator.version),
+        source_files,
+        covered_source_files,
+        uncovered_source_languages,
     }))
 }
 
@@ -307,6 +330,8 @@ async fn generate_with_joern(
     scanned: &ScannedRepository,
     configured_language: Option<&str>,
 ) -> Result<(Vec<u8>, usize)> {
+    let analysis_root = std::fs::canonicalize(repository_root)
+        .map_err(|error| CceError::io(repository_root, error))?;
     let temporary_root = data_root.join("tmp");
     std::fs::create_dir_all(&temporary_root)
         .map_err(|error| CceError::io(&temporary_root, error))?;
@@ -314,21 +339,24 @@ async fn generate_with_joern(
         .prefix("joern-dataflow-")
         .tempdir_in(&temporary_root)
         .map_err(|error| CceError::io(&temporary_root, error))?;
-    let inferred_javascript = configured_language.is_none()
-        && scanned.files.iter().any(|file| {
-            matches!(
-                file.language.as_deref(),
-                Some("javascript" | "typescript" | "tsx")
-            )
-        })
-        && !scanned.files.iter().any(|file| {
-            matches!(
-                file.language.as_deref(),
-                Some("rust" | "c" | "cpp" | "python" | "go" | "java" | "csharp")
-            )
-        });
+    let inferred_javascript = configured_language.is_none() && should_infer_javascript(scanned);
     let language = configured_language.or(inferred_javascript.then_some("JAVASCRIPT"));
-    let mut parse_arguments = vec![repository_root.as_os_str()];
+    let analyzed_source_paths = language
+        .and_then(joern_language_scope)
+        .map(|languages| {
+            scanned
+                .files
+                .iter()
+                .filter(|file| {
+                    file.language
+                        .as_deref()
+                        .is_some_and(|language| languages.contains(&language))
+                })
+                .map(|file| file.relative_path.clone())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut parse_arguments = vec![analysis_root.as_os_str()];
     if let Some(language) = language {
         parse_arguments.push(std::ffi::OsStr::new("--language"));
         parse_arguments.push(std::ffi::OsStr::new(language));
@@ -403,7 +431,72 @@ async fn generate_with_joern(
         graph_nodes.append(&mut nodes);
         graph_edges.append(&mut edges);
     }
-    joern_artifact(version, repository_root, scanned, graph_nodes, graph_edges)
+    joern_artifact(
+        version,
+        &analysis_root,
+        scanned,
+        &analyzed_source_paths,
+        graph_nodes,
+        graph_edges,
+    )
+}
+
+fn joern_language_scope(language: &str) -> Option<&'static [&'static str]> {
+    match language.trim().to_ascii_uppercase().as_str() {
+        "JAVASCRIPT" | "JSSRC2CPG" => Some(&["javascript", "typescript", "tsx"]),
+        "C" | "C2CPG" | "CXX" | "CPP" => Some(&["c", "cpp"]),
+        "CSHARP" | "CSHARPSRC2CPG" => Some(&["csharp"]),
+        "GO" | "GOSRC2CPG" => Some(&["go"]),
+        "JAVA" | "JAVASRC2CPG" => Some(&["java"]),
+        "PYTHON" | "PYTHONSRC2CPG" => Some(&["python"]),
+        _ => None,
+    }
+}
+
+fn should_infer_javascript(scanned: &ScannedRepository) -> bool {
+    let javascript_files = scanned
+        .files
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.language.as_deref(),
+                Some("javascript" | "typescript" | "tsx")
+            )
+        })
+        .count();
+    let other_joern_files = scanned
+        .files
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.language.as_deref(),
+                Some("rust" | "c" | "cpp" | "python" | "go" | "java" | "csharp")
+            )
+        })
+        .count();
+    javascript_files > 0 && javascript_files >= other_joern_files
+}
+
+fn uncovered_source_languages(
+    scanned: &ScannedRepository,
+    covered_paths: &HashSet<&str>,
+) -> Vec<(String, usize)> {
+    let mut counts = HashMap::<String, usize>::new();
+    for file in &scanned.files {
+        let Some(language) = file
+            .language
+            .as_deref()
+            .filter(|value| SourceParser::supports(value))
+        else {
+            continue;
+        };
+        if !covered_paths.contains(file.relative_path.as_str()) {
+            *counts.entry(language.to_owned()).or_default() += 1;
+        }
+    }
+    let mut counts = counts.into_iter().collect::<Vec<_>>();
+    counts.sort_by(|left, right| left.0.cmp(&right.0));
+    counts
 }
 
 async fn run_local_analysis_command(
@@ -730,6 +823,7 @@ fn joern_artifact(
     version: &str,
     repository_root: &Path,
     scanned: &ScannedRepository,
+    analyzed_source_paths: &HashSet<String>,
     graph_nodes: Vec<GraphNode>,
     graph_edges: Vec<GraphEdge>,
 ) -> Result<(Vec<u8>, usize)> {
@@ -794,15 +888,16 @@ fn joern_artifact(
     edges.sort_by(|left, right| left.id.cmp(&right.id));
     let mut used_paths = artifact_nodes
         .iter()
-        .map(|node| node.address.path.as_str())
+        .map(|node| node.address.path.clone())
+        .chain(analyzed_source_paths.iter().cloned())
         .collect::<Vec<_>>();
     used_paths.sort_unstable();
     used_paths.dedup();
     let files = used_paths
         .into_iter()
         .filter_map(|path| {
-            current_files.get(path).map(|file| ArtifactFile {
-                path: path.to_owned(),
+            current_files.get(path.as_str()).map(|file| ArtifactFile {
+                path,
                 content_hash: file.content_hash.clone(),
             })
         })
@@ -1263,9 +1358,15 @@ mod tests {
         let (nodes, edges) = parse_graphml(graphml).expect("parse GraphML");
         assert_eq!(nodes.len(), 2);
         assert_eq!(edges.len(), 3);
-        let (bytes, skipped) =
-            joern_artifact("joern-test", Path::new("/repo"), &scanned, nodes, edges)
-                .expect("convert Joern");
+        let (bytes, skipped) = joern_artifact(
+            "joern-test",
+            Path::new("/repo"),
+            &scanned,
+            &HashSet::from(["main.c".to_owned()]),
+            nodes,
+            edges,
+        )
+        .expect("convert Joern");
         assert_eq!(skipped, 1);
         let artifact: DataflowArtifact = serde_json::from_slice(&bytes).expect("artifact JSON");
         validate_header(&artifact, &scanned).expect("header");
@@ -1285,6 +1386,54 @@ mod tests {
             nodes[0].properties.get("CODE").map(String::as_str),
             Some("a < b && b > 0")
         );
+    }
+
+    #[test]
+    fn joern_artifact_declares_analyzed_files_even_when_they_have_no_pdg_edges() {
+        let source = b"export const value = 1;\n".to_vec();
+        let scanned = ScannedRepository {
+            identity: RepositoryIdentity {
+                id: "repo_test".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            },
+            snapshot: SnapshotIdentity {
+                id: "snapshot".to_owned(),
+                repository_id: "repo_test".to_owned(),
+                base_revision: None,
+                workspace_overlay_hash: "overlay".to_owned(),
+                index_profile_hash: "profile".to_owned(),
+                created_at: Utc::now(),
+                file_count: 1,
+                source_bytes: source.len() as u64,
+            },
+            files: vec![ScannedFile {
+                relative_path: "src/constants.ts".to_owned(),
+                absolute_path: PathBuf::from("/repo/src/constants.ts"),
+                language: Some("typescript".to_owned()),
+                content_hash: blake3::hash(&source).to_hex().to_string(),
+                bytes: source,
+                line_count: 1,
+            }],
+            skipped_large_files: Vec::new(),
+            skipped_binary_files: Vec::new(),
+        };
+
+        let (bytes, skipped) = joern_artifact(
+            "joern-test",
+            Path::new("/repo"),
+            &scanned,
+            &HashSet::from(["src/constants.ts".to_owned()]),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("convert Joern");
+        let artifact: DataflowArtifact = serde_json::from_slice(&bytes).expect("artifact JSON");
+
+        assert_eq!(skipped, 0);
+        assert_eq!(artifact.files.len(), 1);
+        assert_eq!(artifact.files[0].path, "src/constants.ts");
+        assert!(artifact.edges.is_empty());
     }
 
     #[test]
@@ -1328,6 +1477,52 @@ mod tests {
         assert_eq!(
             paths.get("identifier").map(String::as_str),
             Some("src/main.ts")
+        );
+    }
+
+    #[test]
+    fn infers_javascript_for_a_js_ts_dominant_polyglot_repository() {
+        let file = |path: &str, language: &str| ScannedFile {
+            relative_path: path.to_owned(),
+            absolute_path: PathBuf::from("/repo").join(path),
+            language: Some(language.to_owned()),
+            bytes: b"source\n".to_vec(),
+            content_hash: path.to_owned(),
+            line_count: 1,
+        };
+        let scanned = ScannedRepository {
+            identity: RepositoryIdentity {
+                id: "repo_test".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            },
+            snapshot: SnapshotIdentity {
+                id: "snapshot".to_owned(),
+                repository_id: "repo_test".to_owned(),
+                base_revision: None,
+                workspace_overlay_hash: "overlay".to_owned(),
+                index_profile_hash: "profile".to_owned(),
+                created_at: Utc::now(),
+                file_count: 3,
+                source_bytes: 21,
+            },
+            files: vec![
+                file("src/a.ts", "typescript"),
+                file("src/b.tsx", "tsx"),
+                file("android/Main.java", "java"),
+            ],
+            skipped_large_files: Vec::new(),
+            skipped_binary_files: Vec::new(),
+        };
+
+        assert!(should_infer_javascript(&scanned));
+        assert_eq!(
+            joern_language_scope("JAVASCRIPT"),
+            Some(&["javascript", "typescript", "tsx"][..])
+        );
+        assert_eq!(
+            uncovered_source_languages(&scanned, &HashSet::from(["src/a.ts", "src/b.tsx"])),
+            vec![("java".to_owned(), 1)]
         );
     }
 }

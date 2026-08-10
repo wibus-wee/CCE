@@ -5,9 +5,9 @@ use std::{
 };
 
 use cce_core::{
-    CceError, CodeEntity, Relation, RepositoryIdentity, Result, RetrievalDocument,
-    RetrievalRepresentation, SnapshotIdentity, SourceAddress, ViewKind, ViewManifest, ViewState,
-    ViewStatus,
+    CceError, CodeEntity, LearningEventStage, LearningFeedback, LearningReceipt, QueryIntent,
+    Relation, RepositoryIdentity, Result, RetrievalDocument, RetrievalRepresentation,
+    SnapshotIdentity, SourceAddress, ViewKind, ViewManifest, ViewState, ViewStatus,
 };
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -132,10 +132,10 @@ impl MetadataStore {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(storage_error)?;
-        if version > 2 {
+        if version > 3 {
             return Err(CceError::UnsupportedFormat {
                 found: version,
-                supported: 2,
+                supported: 3,
             });
         }
         if version == 0 {
@@ -147,6 +147,11 @@ impl MetadataStore {
             connection
                 .execute_batch(include_str!("migrations/0002_parse_cache.sql"))
                 .map_err(|error| CceError::Storage(format!("migration 2 failed: {error}")))?;
+        }
+        if version < 3 {
+            connection
+                .execute_batch(include_str!("migrations/0003_learning_events.sql"))
+                .map_err(|error| CceError::Storage(format!("migration 3 failed: {error}")))?;
         }
         let artifacts = ArtifactStore::open(data_root)?;
         Ok(Self {
@@ -235,6 +240,116 @@ impl MetadataStore {
                 ],
             )
             .map_err(storage_error)?;
+        Ok(())
+    }
+
+    pub fn record_trajectory(
+        &self,
+        id: &str,
+        repository_id: &str,
+        snapshot_id: &str,
+        query: &str,
+        intent: QueryIntent,
+        artifact: &ArtifactRecord,
+    ) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO artifacts(digest, kind, size_bytes, relative_path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    artifact.digest,
+                    artifact.kind.to_string(),
+                    u64_to_i64(artifact.size_bytes)?,
+                    artifact.relative_path,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(storage_error)?;
+        transaction
+            .execute(
+                "INSERT INTO trajectories(id, repository_id, snapshot_id, query, intent,
+                 artifact_digest, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    repository_id,
+                    snapshot_id,
+                    query,
+                    json(&intent)?,
+                    artifact.digest,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(())
+    }
+
+    pub fn trajectory_bytes(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        let digest = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT artifact_digest FROM trajectories WHERE id = ?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        digest
+            .map(|digest| self.artifacts.read(&digest))
+            .transpose()
+    }
+
+    pub fn record_learning_feedback(
+        &self,
+        feedback: &LearningFeedback,
+        receipt: &LearningReceipt,
+    ) -> Result<()> {
+        self.connection
+            .lock()
+            .execute(
+                "INSERT INTO learning_events(id, trajectory_id, stage, document_id, dwell_ms,
+                 metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    receipt.event_id,
+                    feedback.trajectory_id,
+                    json(&feedback.stage)?,
+                    feedback.document_id,
+                    feedback.dwell_ms.map(u64_to_i64).transpose()?,
+                    json(&feedback.metadata)?,
+                    receipt.recorded_at,
+                ],
+            )
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
+    pub fn record_shown_documents(
+        &self,
+        trajectory_id: &str,
+        document_ids: &[String],
+    ) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        let now = Utc::now().to_rfc3339();
+        for document_id in document_ids {
+            transaction
+                .execute(
+                    "INSERT INTO learning_events(id, trajectory_id, stage, document_id, dwell_ms,
+                     metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, NULL, '{}', ?5)",
+                    params![
+                        uuid::Uuid::now_v7().to_string(),
+                        trajectory_id,
+                        json(&LearningEventStage::ShownToModel)?,
+                        document_id,
+                        now,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        transaction.commit().map_err(storage_error)?;
         Ok(())
     }
 
@@ -610,7 +725,21 @@ impl MetadataStore {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        self.lexical_search_fts(snapshot_id, &query, limit)
+        self.lexical_search_fts(snapshot_id, &query, &[], limit)
+    }
+
+    pub fn lexical_search_representations(
+        &self,
+        snapshot_id: &str,
+        query: &str,
+        representations: &[RetrievalRepresentation],
+        limit: usize,
+    ) -> Result<Vec<LexicalHit>> {
+        let query = fts_query(query);
+        if query.is_empty() || representations.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.lexical_search_fts(snapshot_id, &query, representations, limit)
     }
 
     pub fn lexical_path_search(
@@ -623,33 +752,51 @@ impl MetadataStore {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        self.lexical_search_fts(snapshot_id, &format!("path : ({query})"), limit)
+        self.lexical_search_fts(snapshot_id, &format!("path : ({query})"), &[], limit)
     }
 
     fn lexical_search_fts(
         &self,
         snapshot_id: &str,
         query: &str,
+        representations: &[RetrievalRepresentation],
         limit: usize,
     ) -> Result<Vec<LexicalHit>> {
         let connection = self.connection.lock();
-        let mut statement = connection
-            .prepare(
-                "SELECT f.document_id, f.entity_id,
-                 CASE d.representation WHEN '\"commit_summary\"' THEN f.name ELSE e.name END,
-                 d.representation, d.address_json,
-                 d.evidence_json,
-                 bm25(documents_fts, 0.0, 0.0, 0.0, 3.0, 5.0, 2.0, 1.0) AS rank,
-                 snippet(documents_fts, 6, '<mark>', '</mark>', ' … ', 24)
-                 FROM documents_fts f JOIN retrieval_documents d
-                 ON d.snapshot_id=f.snapshot_id AND d.id=f.document_id
-                 JOIN entities e ON e.snapshot_id=f.snapshot_id AND e.id=f.entity_id
-                 WHERE documents_fts MATCH ?1 AND f.snapshot_id=?2
-                 ORDER BY rank LIMIT ?3",
+        let representation_filter = if representations.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " AND d.representation IN ({})",
+                std::iter::repeat_n("?", representations.len())
+                    .collect::<Vec<_>>()
+                    .join(",")
             )
-            .map_err(storage_error)?;
+        };
+        let limit_parameter = representations.len() + 3;
+        let sql = format!(
+            "SELECT f.document_id, f.entity_id,
+             CASE d.representation WHEN '\"commit_summary\"' THEN f.name ELSE e.name END,
+             d.representation, d.address_json,
+             d.evidence_json,
+             bm25(documents_fts, 0.0, 0.0, 0.0, 3.0, 5.0, 2.0, 1.0) AS rank,
+             snippet(documents_fts, 6, '<mark>', '</mark>', ' … ', 24)
+             FROM documents_fts f JOIN retrieval_documents d
+             ON d.snapshot_id=f.snapshot_id AND d.id=f.document_id
+             JOIN entities e ON e.snapshot_id=f.snapshot_id AND e.id=f.entity_id
+             WHERE documents_fts MATCH ?1 AND f.snapshot_id=?2{representation_filter}
+             ORDER BY rank LIMIT ?{limit_parameter}"
+        );
+        let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+        let mut parameters = Vec::with_capacity(representations.len() + 3);
+        parameters.push(Value::Text(query.to_owned()));
+        parameters.push(Value::Text(snapshot_id.to_owned()));
+        for representation in representations {
+            parameters.push(Value::Text(json(representation)?));
+        }
+        parameters.push(Value::Integer(usize_to_i64(limit)?));
         let rows = statement
-            .query_map(params![query, snapshot_id, usize_to_i64(limit)?], |row| {
+            .query_map(params_from_iter(parameters.iter()), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -797,6 +944,77 @@ impl MetadataStore {
         .transpose()
     }
 
+    pub fn entities_by_ids(
+        &self,
+        snapshot_id: &str,
+        entity_ids: &[String],
+    ) -> Result<Vec<CodeEntity>> {
+        const IDS_PER_QUERY: usize = 400;
+        let mut entities = Vec::with_capacity(entity_ids.len());
+        for chunk in entity_ids.chunks(IDS_PER_QUERY) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, kind, name, qualified_name, signature, language, address_json,
+                 capabilities_json, attributes_json FROM entities
+                 WHERE snapshot_id=? AND id IN ({placeholders})"
+            );
+            let mut parameters = Vec::with_capacity(chunk.len() + 1);
+            parameters.push(Value::Text(snapshot_id.to_owned()));
+            parameters.extend(chunk.iter().cloned().map(Value::Text));
+            let rows = {
+                let connection = self.connection.lock();
+                let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+                statement
+                    .query_map(params_from_iter(parameters.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
+                        ))
+                    })
+                    .map_err(storage_error)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(storage_error)?
+            };
+            for (
+                id,
+                kind,
+                name,
+                qualified_name,
+                signature,
+                language,
+                address,
+                capabilities,
+                attributes,
+            ) in rows
+            {
+                entities.push(CodeEntity {
+                    id,
+                    kind: parse_json(&kind)?,
+                    name,
+                    qualified_name,
+                    signature,
+                    language,
+                    address: address.as_deref().map(parse_json).transpose()?,
+                    capabilities: parse_json(&capabilities)?,
+                    attributes: parse_json(&attributes)?,
+                });
+            }
+        }
+        Ok(entities)
+    }
+
     pub fn relations_for_entity(
         &self,
         snapshot_id: &str,
@@ -932,6 +1150,77 @@ impl MetadataStore {
             .get(start..end)
             .ok_or_else(|| CceError::ArtifactCorrupt(digest.clone()))?;
         String::from_utf8(slice.to_vec()).map_err(|_| CceError::ArtifactCorrupt(digest))
+    }
+
+    pub fn source_texts(&self, addresses: &[SourceAddress]) -> Result<Vec<Option<String>>> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let snapshot_id = &addresses[0].snapshot_id;
+        if addresses
+            .iter()
+            .any(|address| address.snapshot_id != *snapshot_id)
+        {
+            return Err(CceError::Configuration(
+                "batched source addresses must belong to one snapshot".to_owned(),
+            ));
+        }
+        let mut paths = addresses
+            .iter()
+            .map(|address| address.path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        let mut digests_by_path = std::collections::HashMap::<String, String>::new();
+        for chunk in paths.chunks(400) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT path, artifact_digest FROM source_files
+                 WHERE snapshot_id=? AND path IN ({placeholders})"
+            );
+            let mut parameters = Vec::with_capacity(chunk.len() + 1);
+            parameters.push(Value::Text(snapshot_id.clone()));
+            parameters.extend(chunk.iter().cloned().map(Value::Text));
+            let rows = {
+                let connection = self.connection.lock();
+                let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+                statement
+                    .query_map(params_from_iter(parameters.iter()), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(storage_error)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(storage_error)?
+            };
+            digests_by_path.extend(rows);
+        }
+        let mut bytes_by_digest = std::collections::HashMap::<String, Vec<u8>>::new();
+        for digest in digests_by_path.values() {
+            if !bytes_by_digest.contains_key(digest) {
+                bytes_by_digest.insert(digest.clone(), self.artifacts.read(digest)?);
+            }
+        }
+        addresses
+            .iter()
+            .map(|address| {
+                let Some(digest) = digests_by_path.get(&address.path) else {
+                    return Ok(None);
+                };
+                let bytes = &bytes_by_digest[digest];
+                let start = usize::try_from(address.start_byte)
+                    .map_err(|_| CceError::ArtifactCorrupt(digest.clone()))?;
+                let end = usize::try_from(address.end_byte)
+                    .map_err(|_| CceError::ArtifactCorrupt(digest.clone()))?;
+                let slice = bytes
+                    .get(start..end)
+                    .ok_or_else(|| CceError::ArtifactCorrupt(digest.clone()))?;
+                String::from_utf8(slice.to_vec())
+                    .map(Some)
+                    .map_err(|_| CceError::ArtifactCorrupt(digest.clone()))
+            })
+            .collect()
     }
 
     pub fn documents_for_snapshot(&self, snapshot_id: &str) -> Result<Vec<DocumentContent>> {
@@ -1167,12 +1456,90 @@ fn is_query_stopword(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ArtifactKind;
 
     #[test]
     fn opens_and_migrates_database() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        MetadataStore::open(directory.path()).expect("metadata store");
+        let store = MetadataStore::open(directory.path()).expect("metadata store");
         assert!(directory.path().join("metadata.sqlite").is_file());
+        let version: u32 = store
+            .connection
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("schema version");
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn records_content_addressed_learning_trajectory_and_feedback() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("metadata store");
+        let repository = RepositoryIdentity {
+            id: "repo".to_owned(),
+            canonical_root: "/repo".to_owned(),
+            remote: None,
+        };
+        store
+            .register_repository(&repository)
+            .expect("register repository");
+        let snapshot = SnapshotIdentity {
+            id: "snapshot".to_owned(),
+            repository_id: repository.id.clone(),
+            base_revision: Some("revision".to_owned()),
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        store.begin_snapshot(&snapshot).expect("begin snapshot");
+        store
+            .commit_snapshot(&snapshot, &SnapshotRecords::default())
+            .expect("commit snapshot");
+        let artifact = store
+            .artifacts()
+            .put_bytes(ArtifactKind::Trace, br#"{"hits":[]}"#)
+            .expect("trace artifact");
+        store
+            .record_trajectory(
+                "trajectory",
+                &repository.id,
+                &snapshot.id,
+                "find the implementation",
+                QueryIntent::Architecture,
+                &artifact,
+            )
+            .expect("trajectory");
+        let feedback = LearningFeedback {
+            trajectory_id: "trajectory".to_owned(),
+            stage: LearningEventStage::Accepted,
+            document_id: None,
+            dwell_ms: Some(12),
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let receipt = LearningReceipt {
+            event_id: "event".to_owned(),
+            trajectory_id: "trajectory".to_owned(),
+            recorded_at: Utc::now().to_rfc3339(),
+        };
+        store
+            .record_learning_feedback(&feedback, &receipt)
+            .expect("feedback");
+
+        assert_eq!(
+            store
+                .trajectory_bytes("trajectory")
+                .expect("trajectory bytes")
+                .expect("trajectory exists"),
+            br#"{"hits":[]}"#
+        );
+        let count: u64 = store
+            .connection
+            .lock()
+            .query_row("SELECT COUNT(*) FROM learning_events", [], |row| row.get(0))
+            .expect("event count");
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -1226,6 +1593,196 @@ mod tests {
         assert_eq!(
             fts_query("Where is the snapshot freshness decided?"),
             "\"snapshot\" OR \"snapshot\"* OR \"freshness\" OR \"freshness\"* OR \"decided\" OR \"decided\"*"
+        );
+    }
+
+    #[test]
+    fn lexical_representation_filter_has_an_independent_candidate_pool() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("metadata store");
+        let repository = RepositoryIdentity {
+            id: "repo".to_owned(),
+            canonical_root: "/repo".to_owned(),
+            remote: None,
+        };
+        store
+            .register_repository(&repository)
+            .expect("register repository");
+        let snapshot = SnapshotIdentity {
+            id: "snapshot".to_owned(),
+            repository_id: repository.id.clone(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        store.begin_snapshot(&snapshot).expect("begin snapshot");
+        let entity = CodeEntity {
+            id: "repository-entity".to_owned(),
+            kind: cce_core::EntityKind::Repository,
+            name: "repo".to_owned(),
+            qualified_name: None,
+            signature: None,
+            language: None,
+            address: None,
+            capabilities: Vec::new(),
+            attributes: serde_json::Map::new(),
+        };
+        let mut records = SnapshotRecords::default();
+        records.entities.push(entity);
+        for (id, representation, body) in [
+            (
+                "source-document",
+                RetrievalRepresentation::RawCode,
+                "cache invalidation cache invalidation implementation",
+            ),
+            (
+                "history-document",
+                RetrievalRepresentation::CommitSummary,
+                "cache invalidation fix",
+            ),
+        ] {
+            let artifact = store
+                .artifacts()
+                .put_bytes(ArtifactKind::Knowledge, body.as_bytes())
+                .expect("document artifact");
+            records.artifacts.push(artifact.clone());
+            records.documents.push(IndexedDocument {
+                document: RetrievalDocument {
+                    id: id.to_owned(),
+                    entity_id: "repository-entity".to_owned(),
+                    snapshot_id: snapshot.id.clone(),
+                    representation,
+                    body_artifact_digest: artifact.digest,
+                    address: None,
+                    embedding_profile: None,
+                    generated_by: None,
+                    evidence: Vec::new(),
+                    terms: vec!["cache".to_owned(), "invalidation".to_owned()],
+                },
+                path: id.to_owned(),
+                name: id.to_owned(),
+                body: body.to_owned(),
+            });
+        }
+        store
+            .commit_snapshot(&snapshot, &records)
+            .expect("commit snapshot");
+
+        let generic = store
+            .lexical_search(&snapshot.id, "cache invalidation", 1)
+            .expect("generic search");
+        assert_eq!(generic[0].representation, RetrievalRepresentation::RawCode);
+        let history = store
+            .lexical_search_representations(
+                &snapshot.id,
+                "cache invalidation",
+                &[RetrievalRepresentation::CommitSummary],
+                1,
+            )
+            .expect("history search");
+        assert_eq!(history[0].document_id, "history-document");
+    }
+
+    #[test]
+    fn batches_entities_and_reuses_source_artifacts_for_ranges() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("metadata store");
+        let repository = RepositoryIdentity {
+            id: "repo".to_owned(),
+            canonical_root: "/repo".to_owned(),
+            remote: None,
+        };
+        store
+            .register_repository(&repository)
+            .expect("register repository");
+        let source = b"alpha beta gamma\n";
+        let snapshot = SnapshotIdentity {
+            id: "snapshot".to_owned(),
+            repository_id: repository.id.clone(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 1,
+            source_bytes: source.len() as u64,
+        };
+        store.begin_snapshot(&snapshot).expect("begin snapshot");
+        let artifact = store
+            .artifacts()
+            .put_bytes(ArtifactKind::Source, source)
+            .expect("source artifact");
+        let address = |id: &str, start: u64, end: u64| {
+            SourceAddress::new(
+                &repository.id,
+                &snapshot.id,
+                "src/lib.rs",
+                start..end,
+                1..=1,
+            )
+            .expect("source address")
+            .with_symbol(id)
+        };
+        let entities = [
+            ("alpha", address("alpha", 0, 5)),
+            ("beta", address("beta", 6, 10)),
+        ]
+        .into_iter()
+        .map(|(id, address)| CodeEntity {
+            id: id.to_owned(),
+            kind: cce_core::EntityKind::Function,
+            name: id.to_owned(),
+            qualified_name: None,
+            signature: None,
+            language: Some("rust".to_owned()),
+            address: Some(address),
+            capabilities: Vec::new(),
+            attributes: serde_json::Map::new(),
+        })
+        .collect::<Vec<_>>();
+        let records = SnapshotRecords {
+            artifacts: vec![artifact.clone()],
+            files: vec![SourceFileRecord {
+                path: "src/lib.rs".to_owned(),
+                language: Some("rust".to_owned()),
+                content_hash: blake3::hash(source).to_hex().to_string(),
+                artifact,
+                byte_count: source.len() as u64,
+                line_count: 1,
+                analysis_artifact_digest: None,
+            }],
+            entities: entities.clone(),
+            relations: Vec::new(),
+            documents: Vec::new(),
+        };
+        store
+            .commit_snapshot(&snapshot, &records)
+            .expect("commit snapshot");
+
+        let mut loaded = store
+            .entities_by_ids(&snapshot.id, &["beta".to_owned(), "alpha".to_owned()])
+            .expect("batched entities");
+        loaded.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|entity| entity.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        let texts = store
+            .source_texts(
+                &loaded
+                    .iter()
+                    .filter_map(|entity| entity.address.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("batched source ranges");
+        assert_eq!(
+            texts,
+            vec![Some("alpha".to_owned()), Some("beta".to_owned())]
         );
     }
 
@@ -1284,5 +1841,16 @@ mod tests {
         assert_eq!(grouped["d"][0].id, "r3");
         assert_eq!(grouped["a"].len(), 1);
         assert_eq!(grouped["d"].len(), 1);
+
+        let both = store
+            .relations_for_entities("snapshot", &["a".to_owned()], RelationDirection::Both, 3)
+            .expect("bidirectional indexed relations");
+        assert_eq!(
+            both["a"]
+                .iter()
+                .map(|relation| relation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r1", "r2", "r3"]
+        );
     }
 }

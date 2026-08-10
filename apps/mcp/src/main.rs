@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use cce_core::{QueryIntent, SearchRequest};
+use cce_core::{LearningFeedback, QueryIntent, SearchRequest};
 use cce_engine::{
     CceEngine, ContextRequest, DEFAULT_LOCAL_EMBEDDING_MODEL, DEFAULT_LOCAL_RERANKER_MODEL,
     DEFAULT_LOCAL_RERANKER_REVISION, DataflowBackendConfig, DenseBackendConfig, EngineConfig,
@@ -97,6 +97,8 @@ struct Arguments {
     joern_language: Option<String>,
     #[arg(long, env = "CCE_JOERN_TIMEOUT_SECONDS", default_value_t = 1_800)]
     joern_timeout_seconds: u64,
+    #[arg(long, env = "CCE_CAPTURE_LEARNING_DATA")]
+    capture_learning_data: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -255,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
                 DataflowBackendConfig::Supplied { path }
             })
     };
+    config.capture_learning_data = arguments.capture_learning_data;
     serve(Arc::new(CceEngine::open(config)?)).await
 }
 
@@ -384,6 +387,15 @@ async fn call_tool(engine: &CceEngine, params: &Value) -> Result<Value, (i32, St
             )
             .map_err(|error| (-32603, error.to_string()))?
         }
+        "cce_feedback" => serde_json::to_value(
+            engine
+                .record_learning_feedback(
+                    serde_json::from_value::<LearningFeedback>(arguments)
+                        .map_err(|error| (-32602, format!("invalid feedback: {error}")))?,
+                )
+                .map_err(tool_error)?,
+        )
+        .map_err(|error| (-32603, error.to_string()))?,
         _ => return Err((-32602, format!("unknown tool: {name}"))),
     };
     let text = serde_json::to_string_pretty(&value).map_err(|error| (-32603, error.to_string()))?;
@@ -433,6 +445,22 @@ fn tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {"name": {"type": "string", "minLength": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}},
                 "required": ["name"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "cce_feedback",
+            "Record local-only downstream feedback for a captured retrieval trajectory",
+            json!({
+                "type": "object",
+                "properties": {
+                    "trajectoryId": {"type": "string", "minLength": 1},
+                    "stage": {"type": "string", "enum": ["opened_by_agent", "cited_or_used", "edited_or_affected", "accepted", "rejected"]},
+                    "documentId": {"type": "string"},
+                    "dwellMs": {"type": "integer", "minimum": 0, "maximum": 86400000},
+                    "metadata": {"type": "object"}
+                },
+                "required": ["trajectoryId", "stage"],
                 "additionalProperties": false
             }),
         ),
