@@ -15,12 +15,17 @@ SQLite is the canonical metadata store, not a dumping ground. Large vectors, gen
 
 CCE ships repository/worktree snapshotting, SQLite FTS5, Tree-sitter symbols for Rust, C/C++, TypeScript/TSX/JavaScript, Python, Go, Java, and C#, content-addressed parse caches, transaction-aligned SCIP ingestion, a typed multi-hop evidence graph, strict static-analysis dataflow import and local Joern PDG generation, deterministic hierarchical knowledge pages, per-commit Git history with changed paths, pinned local ONNX embeddings and cross-encoder reranking, intent-aware routing, reciprocal-rank fusion, bounded context packs, CLI/HTTP/MCP adapters, a Web dashboard, and a stage-separated benchmark harness.
 
-Capabilities are never inferred from the mere presence of an index. `cce status` reports each view as ready, partial, stale, unavailable, or failed. `--scip-auto` can generate Rust compiler-resolved references locally; other languages remain partial until their SCIP indexes are supplied. Precise dataflow becomes ready only after a source-hash-aligned artifact conforming to `schemas/dataflow-v1.schema.json` is supplied or locally generated with `--dataflow-joern`.
+Capabilities are never inferred from the mere presence of an index. `cce status` reports each view as ready, partial, stale, unavailable, or failed. `--scip-auto` generates compiler-resolved references locally for Rust and JavaScript/TypeScript. The JS/TS provider discovers configured npm, pnpm, and Yarn projects, merges their SCIP documents, and covers remaining JS/JSX/MJS/CJS/TS/TSX files through a temporary external project without writing a `tsconfig.json` into the repository. Other languages remain partial until their SCIP indexes are supplied. Precise dataflow becomes ready only after a source-hash-aligned artifact conforming to `schemas/dataflow-v1.schema.json` is supplied or locally generated with `--dataflow-joern`.
 
 With a pinned local Joern installation on `PATH`, CCE can build program-dependence edges without a remote service:
 
 ```bash
-cce --dataflow-joern --joern-timeout-seconds 3600 index .
+cce --scip-auto \
+  --scip-typescript /opt/scip-typescript/bin/scip-typescript \
+  --dataflow-joern \
+  --joern-language JAVASCRIPT \
+  --joern-timeout-seconds 3600 \
+  index .
 ```
 
 CCE runs `joern-parse` and `joern-export --repr all --format graphml` in an isolated local directory, accepts only Joern `REACHING_DEF` and `CDG` edges, maps both endpoints back to current source bytes, and then applies the same repository/revision/file-hash/range validation as a supplied artifact. Set `CCE_JOERN_PARSE` and `CCE_JOERN_EXPORT` for a version-pinned installation. Missing or unaligned endpoints make the view partial rather than guessed.
@@ -48,7 +53,7 @@ cargo run --release -p cce-cli -- \
 
 After the model is cached, omit `--embedding-allow-download` for network-free operation. The built-in model presets keep the model, immutable revision, and training prefixes together: `quality` (default, Jina code), `balanced` (multilingual E5 small), and `fast` (quantized BGE small). For example, select the multilingual preset with `--embedding-model balanced`.
 
-Local inference defaults to batch size 4 and 512 tokens. Configurations whose estimated attention allocation exceeds the safe limit are rejected unless `--embedding-allow-high-memory` is explicitly supplied. Long-running daemon and MCP processes keep the model resident; one-shot CLI commands include model-load latency.
+Local inference defaults to batch size 4, 512 tokens, and one ONNX session. Configurations whose estimated attention allocation exceeds the safe limit are rejected unless `--embedding-allow-high-memory` is explicitly supplied. Long-running daemon and MCP processes keep the model resident; one-shot CLI commands include model-load latency. `--embedding-sessions N` creates a bounded 1–16 session round-robin pool for concurrent serving and multiplies model memory, so size it from measured throughput and RSS.
 
 Fine-tuned models can be exported as a self-contained, hash-bound bundle and loaded without a registry or service:
 

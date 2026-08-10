@@ -45,6 +45,8 @@ struct Arguments {
     embedding_threads: Option<usize>,
     #[arg(long, default_value_t = 4)]
     embedding_batch_size: usize,
+    #[arg(long, env = "CCE_EMBEDDING_SESSIONS", default_value_t = 1)]
+    embedding_sessions: usize,
     #[arg(long)]
     embedding_query_prefix: Option<String>,
     #[arg(long)]
@@ -77,6 +79,8 @@ struct Arguments {
     scip_index: Option<PathBuf>,
     #[arg(long, env = "CCE_RUST_ANALYZER", default_value = "rust-analyzer")]
     rust_analyzer: PathBuf,
+    #[arg(long, env = "CCE_SCIP_TYPESCRIPT", default_value = "scip-typescript")]
+    scip_typescript: PathBuf,
     #[arg(long)]
     scip_threads: Option<usize>,
     #[arg(long, default_value_t = 900)]
@@ -89,6 +93,8 @@ struct Arguments {
     joern_parse: PathBuf,
     #[arg(long, env = "CCE_JOERN_EXPORT", default_value = "joern-export")]
     joern_export: PathBuf,
+    #[arg(long, env = "CCE_JOERN_LANGUAGE")]
+    joern_language: Option<String>,
     #[arg(long, env = "CCE_JOERN_TIMEOUT_SECONDS", default_value_t = 1_800)]
     joern_timeout_seconds: u64,
 }
@@ -177,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
                 max_length: arguments.embedding_max_length,
                 threads: arguments.embedding_threads,
                 batch_size: arguments.embedding_batch_size,
+                sessions: arguments.embedding_sessions,
                 query_prefix: arguments.embedding_query_prefix.unwrap_or_else(|| {
                     preset.map_or_else(String::new, |value| value.query_prefix.to_owned())
                 }),
@@ -223,8 +230,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     config.scip = if arguments.scip_auto {
-        ScipBackendConfig::rust_analyzer(
+        ScipBackendConfig::auto(
             arguments.rust_analyzer,
+            arguments.scip_typescript,
             arguments.scip_threads,
             arguments.scip_timeout_seconds,
         )?
@@ -234,10 +242,11 @@ async fn main() -> anyhow::Result<()> {
         ScipBackendConfig::Disabled
     };
     config.dataflow = if arguments.dataflow_joern {
-        DataflowBackendConfig::joern(
+        DataflowBackendConfig::joern_with_language(
             &arguments.joern_parse,
             &arguments.joern_export,
             arguments.joern_timeout_seconds,
+            arguments.joern_language.as_deref(),
         )?
     } else {
         arguments

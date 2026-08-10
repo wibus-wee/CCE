@@ -34,6 +34,22 @@ uv run --project research cce-research evaluate benchmarks/datasets/cce-self.jso
 
 Published bundles must replace `WORKTREE` with an immutable commit and record CPU, memory, operating system, model/bundle revision, cold versus warm cache state, and lockfile digests.
 
+The metadata-only JS/TS production regression set pins Vue core and combines exact symbol navigation with multi-file architecture questions:
+
+```bash
+git clone https://github.com/vuejs/core.git /tmp/vue-core
+git -C /tmp/vue-core checkout 40423896796ff7438a1aa70ee3cf22fe5b0ac224
+CCE_DATA_DIR=/tmp/vue-core-cce target/release/cce \
+  --scip-auto --scip-typescript /opt/scip-typescript/bin/scip-typescript index /tmp/vue-core
+CCE_DATA_DIR=/tmp/vue-core-cce uv run --project research cce-research run \
+  benchmarks/datasets/vue-core-js-ts.jsonl benchmarks/adapters/cce.yaml \
+  /tmp/vue-core 40423896796ff7438a1aa70ee3cf22fe5b0ac224 \
+  research/output/vue-core-js-ts.jsonl
+uv run --project research cce-research evaluate \
+  benchmarks/datasets/vue-core-js-ts.jsonl research/output/vue-core-js-ts.jsonl \
+  --output research/output/vue-core-js-ts-metrics.json
+```
+
 Embedding benchmarks use repository-isolated splits and run each model in a clean process so peak RSS is not contaminated by a previously loaded model. They report overall and per-query-kind Recall@1/5/10/20, MRR, nDCG@10, indexing throughput, single-query p50/p95, and peak RSS. Run the pinned base suite with:
 
 ```bash

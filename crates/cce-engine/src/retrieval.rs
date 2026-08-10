@@ -1,8 +1,9 @@
 use std::{collections::HashMap, time::Instant};
 
 use cce_core::{
-    QueryIntent, Relation, RelationKind, RelationOrigin, Result, RetrievalRepresentation,
-    SearchHit, SearchRequest, SearchRoute, SourceAddress, ViewKind, ViewManifest, ViewState,
+    CodeEntity, EntityKind, QueryIntent, Relation, RelationKind, RelationOrigin, Result,
+    RetrievalRepresentation, SearchHit, SearchRequest, SearchRoute, SourceAddress, ViewKind,
+    ViewManifest, ViewState,
 };
 use cce_store::RelationDirection;
 use serde::{Deserialize, Serialize};
@@ -55,10 +56,18 @@ impl CceEngine {
         if plan.routes.contains(&SearchRoute::ExactSymbol) {
             let mut rank = 1_usize;
             for token in entity_tokens(&request.query) {
-                for entity in
-                    self.store()
-                        .entity_by_name(&request.snapshot_id, &token, request.limit)?
-                {
+                let mut entities = self.store().entity_by_name(
+                    &request.snapshot_id,
+                    &token,
+                    request.limit.saturating_mul(8).clamp(32, 512),
+                )?;
+                entities.sort_by(|left, right| {
+                    exact_entity_priority(right, plan.intent)
+                        .cmp(&exact_entity_priority(left, plan.intent))
+                        .then_with(|| exact_entity_span(right).cmp(&exact_entity_span(left)))
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                for entity in entities.into_iter().take(request.limit) {
                     let snippet = if let Some(address) = &entity.address {
                         self.store().source_text(address).unwrap_or_else(|_| {
                             entity
@@ -97,19 +106,49 @@ impl CceEngine {
         }
 
         if plan.routes.contains(&SearchRoute::Lexical) {
-            for (offset, hit) in self
-                .store()
-                .lexical_search(
-                    &request.snapshot_id,
-                    &request.query,
-                    request.limit.saturating_mul(3),
-                )?
+            let lexical_limit = request.limit.saturating_mul(3);
+            let lexical_pool = self.store().lexical_search(
+                &request.snapshot_id,
+                &request.query,
+                lexical_limit.saturating_mul(4),
+            )?;
+            let mut lexical_pool = lexical_pool.into_iter().enumerate().collect::<Vec<_>>();
+            lexical_pool.sort_by(|(left_rank, left), (right_rank, right)| {
+                architecture_lexical_priority(plan.intent, right, &request.query, *right_rank)
+                    .total_cmp(&architecture_lexical_priority(
+                        plan.intent,
+                        left,
+                        &request.query,
+                        *left_rank,
+                    ))
+                    .then_with(|| left_rank.cmp(right_rank))
+            });
+            let mut hits_per_path = HashMap::<String, usize>::new();
+            let maximum_hits_per_path = if plan.intent == QueryIntent::Architecture {
+                2
+            } else {
+                4
+            };
+            let lexical_hits = lexical_pool
                 .into_iter()
-                .enumerate()
-            {
+                .map(|(_, hit)| hit)
+                .filter(|hit| {
+                    let Some(path) = hit.address.as_ref().map(|address| &address.path) else {
+                        return true;
+                    };
+                    let count = hits_per_path.entry(path.clone()).or_default();
+                    if *count >= maximum_hits_per_path {
+                        return false;
+                    }
+                    *count += 1;
+                    true
+                })
+                .take(lexical_limit);
+            for (offset, hit) in lexical_hits.enumerate() {
                 let rank = offset + 1;
                 let contribution = lexical_route_weight(plan.intent, &hit.representation)
-                    * lexical_source_weight(plan.intent, hit.address.as_ref())
+                    * lexical_source_weight(plan.intent, hit.address.as_ref(), &request.query)
+                    * lexical_path_affinity(plan.intent, hit.address.as_ref(), &request.query)
                     / (RRF_K + rank as f64);
                 add_candidate(
                     &mut candidates,
@@ -130,6 +169,56 @@ impl CceEngine {
                     },
                     contribution,
                 );
+            }
+
+            if plan.intent == QueryIntent::Architecture {
+                let mut seen_paths = std::collections::HashSet::new();
+                let path_hits = self.store().lexical_path_search(
+                    &request.snapshot_id,
+                    &request.query,
+                    request.limit.saturating_mul(32).clamp(128, 4_096),
+                )?;
+                for (offset, hit) in path_hits
+                    .into_iter()
+                    .filter(|hit| {
+                        lexical_path_affinity(plan.intent, hit.address.as_ref(), &request.query)
+                            > 1.0
+                    })
+                    .filter(|hit| {
+                        hit.address
+                            .as_ref()
+                            .is_none_or(|address| seen_paths.insert(address.path.clone()))
+                    })
+                    .take(request.limit)
+                    .enumerate()
+                {
+                    let rank = offset + 1;
+                    let contribution = 1.15
+                        * lexical_source_weight(plan.intent, hit.address.as_ref(), &request.query)
+                        * lexical_path_affinity(plan.intent, hit.address.as_ref(), &request.query)
+                        / (RRF_K + rank as f64);
+                    add_candidate(
+                        &mut candidates,
+                        SearchHit {
+                            document_id: hit.document_id,
+                            entity_id: hit.entity_id,
+                            symbol_name: Some(hit.symbol_name),
+                            representation: hit.representation,
+                            route: SearchRoute::Lexical,
+                            rank,
+                            score: hit.score,
+                            contributing_routes: vec![SearchRoute::Lexical],
+                            address: hit.address,
+                            evidence: hit.evidence,
+                            snippet: hit.snippet,
+                            verified_current: true,
+                            explanation: vec![
+                                "SQLite FTS5 query-to-path morphology match".to_owned(),
+                            ],
+                        },
+                        contribution,
+                    );
+                }
             }
         }
 
@@ -243,7 +332,18 @@ impl CceEngine {
                                         embedder.profile()
                                     )],
                                 },
-                                representation_weight(&document.representation)
+                                dense_route_weight(plan.intent)
+                                    * representation_weight(&document.representation)
+                                    * lexical_source_weight(
+                                        plan.intent,
+                                        document.address.as_ref(),
+                                        &request.query,
+                                    )
+                                    * lexical_path_affinity(
+                                        plan.intent,
+                                        document.address.as_ref(),
+                                        &request.query,
+                                    )
                                     / (RRF_K + rank as f64),
                             );
                         }
@@ -275,8 +375,11 @@ impl CceEngine {
                     continue;
                 }
                 let snippet = entity
-                    .signature
-                    .clone()
+                    .address
+                    .as_ref()
+                    .and_then(|address| self.store().source_text(address).ok())
+                    .filter(|source| !source.trim().is_empty())
+                    .or_else(|| entity.signature.clone())
                     .or_else(|| entity.qualified_name.clone())
                     .unwrap_or_else(|| entity.name.clone());
                 add_candidate(
@@ -307,16 +410,18 @@ impl CceEngine {
             }
         }
 
-        if plan.graph_policy == GraphPolicy::DataflowRequired
-            && !manifest
-                .views
-                .get(&ViewKind::Dataflow)
-                .is_some_and(|view| view.state == ViewState::Ready)
-        {
-            missing_capabilities.push(
-                "precise dataflow is unavailable; CCE refuses to infer a source-to-sink path from embeddings"
-                    .to_owned(),
-            );
+        if plan.graph_policy == GraphPolicy::DataflowRequired {
+            match manifest.views.get(&ViewKind::Dataflow).map(|view| view.state) {
+                Some(ViewState::Ready) => {}
+                Some(ViewState::Partial) => missing_capabilities.push(
+                    "precise dataflow is partially source-aligned; returned static-analysis paths are evidence-backed, but unmatched endpoints may omit valid paths"
+                        .to_owned(),
+                ),
+                _ => missing_capabilities.push(
+                    "precise dataflow is unavailable; CCE refuses to infer a source-to-sink path from embeddings"
+                        .to_owned(),
+                ),
+            }
         }
 
         if plan.rerank {
@@ -524,6 +629,56 @@ impl CceEngine {
     }
 }
 
+fn exact_entity_priority(entity: &CodeEntity, intent: QueryIntent) -> i32 {
+    let mut priority = 0_i32;
+    if entity
+        .capabilities
+        .iter()
+        .any(|capability| capability == "scip_definition")
+    {
+        priority += 100;
+    }
+    if entity
+        .capabilities
+        .iter()
+        .any(|capability| capability == "syntax_fact")
+    {
+        priority += 80;
+    }
+    if entity
+        .capabilities
+        .iter()
+        .any(|capability| capability == "precise_dataflow_node")
+    {
+        priority += if intent == QueryIntent::PreciseDataflow {
+            60
+        } else {
+            5
+        };
+    }
+    if matches!(
+        entity.kind,
+        EntityKind::Function
+            | EntityKind::Method
+            | EntityKind::Class
+            | EntityKind::Interface
+            | EntityKind::Trait
+            | EntityKind::Struct
+            | EntityKind::Enum
+            | EntityKind::Module
+            | EntityKind::Namespace
+    ) {
+        priority += 30;
+    }
+    priority
+}
+
+fn exact_entity_span(entity: &CodeEntity) -> u64 {
+    entity.address.as_ref().map_or(0, |address| {
+        address.end_byte.saturating_sub(address.start_byte)
+    })
+}
+
 #[derive(Debug, Clone)]
 struct GraphDiscovery {
     entity_id: String,
@@ -609,23 +764,94 @@ fn lexical_route_weight(intent: QueryIntent, representation: &RetrievalRepresent
     }
 }
 
-fn lexical_source_weight(intent: QueryIntent, address: Option<&SourceAddress>) -> f64 {
+fn lexical_source_weight(intent: QueryIntent, address: Option<&SourceAddress>, query: &str) -> f64 {
     if intent != QueryIntent::Architecture {
         return 1.0;
     }
     let Some(path) = address.map(|address| address.path.to_ascii_lowercase()) else {
         return 0.8;
     };
+    let query = query.to_ascii_lowercase();
+    let explicitly_requests_tests = ["test", "tests", "spec", "benchmark", "测试", "基准"]
+        .iter()
+        .any(|term| query.contains(term));
+    let path_role = if explicitly_requests_tests {
+        1.0
+    } else if path.contains("/__tests__/")
+        || path.contains("/tests/")
+        || path.contains("/test/")
+        || path.contains("/__benchmarks__/")
+        || path.contains("/benchmarks/")
+        || path.contains(".spec.")
+        || path.contains(".test.")
+        || path.contains(".bench.")
+    {
+        0.38
+    } else if path.contains("/src/") {
+        1.18
+    } else {
+        0.88
+    };
     let extension = path.rsplit_once('.').map(|(_, extension)| extension);
-    match extension {
-        Some(
-            "rs" | "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "go" | "java" | "kt" | "kts"
-            | "py" | "pyi" | "js" | "jsx" | "ts" | "tsx" | "cs" | "fs" | "fsx" | "rb" | "php"
-            | "swift" | "scala" | "sh" | "bash" | "zsh" | "fish",
-        ) => 1.35,
-        Some("md" | "mdx" | "rst" | "txt" | "adoc") => 0.45,
-        _ => 0.82,
+    path_role
+        * match extension {
+            Some(
+                "rs" | "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "go" | "java" | "kt"
+                | "kts" | "py" | "pyi" | "js" | "jsx" | "ts" | "tsx" | "cs" | "fs" | "fsx" | "rb"
+                | "php" | "swift" | "scala" | "sh" | "bash" | "zsh" | "fish",
+            ) => 1.35,
+            Some("md" | "mdx" | "rst" | "txt" | "adoc") => 0.45,
+            _ => 0.82,
+        }
+}
+
+fn lexical_path_affinity(intent: QueryIntent, address: Option<&SourceAddress>, query: &str) -> f64 {
+    if intent != QueryIntent::Architecture {
+        return 1.0;
     }
+    let Some(path) = address.map(|address| address.path.to_ascii_lowercase()) else {
+        return 1.0;
+    };
+    let Some(file_stem) = std::path::Path::new(&path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+    else {
+        return 1.0;
+    };
+    let tokens = query
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| token.chars().count() >= 4)
+        .collect::<Vec<_>>();
+    if tokens.iter().any(|token| {
+        let common = token
+            .chars()
+            .zip(file_stem.chars())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let shorter = token.chars().count().min(file_stem.chars().count());
+        common >= 4 && common.saturating_add(2) >= shorter
+    }) {
+        1.9
+    } else if path
+        .split(['/', '.', '-', '_'])
+        .any(|part| tokens.iter().any(|token| token == part))
+    {
+        1.35
+    } else {
+        1.0
+    }
+}
+
+fn architecture_lexical_priority(
+    intent: QueryIntent,
+    hit: &cce_store::LexicalHit,
+    query: &str,
+    original_rank: usize,
+) -> f64 {
+    lexical_source_weight(intent, hit.address.as_ref(), query)
+        * lexical_path_affinity(intent, hit.address.as_ref(), query)
+        / (RRF_K + original_rank.saturating_add(1) as f64)
 }
 
 fn specialized_route_weight(route: SearchRoute, representation: &RetrievalRepresentation) -> f64 {
@@ -716,6 +942,14 @@ fn add_candidate(candidates: &mut HashMap<String, Candidate>, hit: SearchHit, co
                     candidate.hit.contributing_routes.push(*route);
                 }
             }
+            for address in &hit.evidence {
+                if !candidate.hit.evidence.contains(address) {
+                    candidate.hit.evidence.push(address.clone());
+                }
+            }
+            if candidate.hit.address.is_none() {
+                candidate.hit.address.clone_from(&hit.address);
+            }
             candidate.hit.explanation.extend(hit.explanation.clone());
             if replace_snippet {
                 candidate.hit.snippet.clone_from(&hit.snippet);
@@ -754,6 +988,14 @@ fn representation_weight(representation: &RetrievalRepresentation) -> f64 {
         | RetrievalRepresentation::ModuleSummary
         | RetrievalRepresentation::FlowSummary => 1.15,
         RetrievalRepresentation::TestBehavior => 1.1,
+        _ => 1.0,
+    }
+}
+
+const fn dense_route_weight(intent: QueryIntent) -> f64 {
+    match intent {
+        QueryIntent::Architecture => 0.65,
+        QueryIntent::Impact | QueryIntent::History => 0.82,
         _ => 1.0,
     }
 }
@@ -888,12 +1130,42 @@ mod tests {
         let mut documentation = source.clone();
         documentation.path = "docs/architecture.md".to_owned();
         assert!(
-            lexical_source_weight(QueryIntent::Architecture, Some(&source))
-                > lexical_source_weight(QueryIntent::Architecture, Some(&documentation))
+            lexical_source_weight(QueryIntent::Architecture, Some(&source), "architecture")
+                > lexical_source_weight(
+                    QueryIntent::Architecture,
+                    Some(&documentation),
+                    "architecture"
+                )
         );
         assert_eq!(
-            lexical_source_weight(QueryIntent::Impact, Some(&documentation)),
+            lexical_source_weight(QueryIntent::Impact, Some(&documentation), "impact"),
             1.0
+        );
+
+        let mut test = source.clone();
+        test.path = "src/__tests__/retrieval.spec.ts".to_owned();
+        assert!(
+            lexical_source_weight(QueryIntent::Architecture, Some(&source), "architecture")
+                > lexical_source_weight(QueryIntent::Architecture, Some(&test), "architecture")
+        );
+        assert_eq!(
+            lexical_source_weight(
+                QueryIntent::Architecture,
+                Some(&source),
+                "test architecture"
+            ),
+            lexical_source_weight(QueryIntent::Architecture, Some(&test), "test architecture")
+        );
+
+        let mut parser = source.clone();
+        parser.path = "packages/compiler-core/src/parser.ts".to_owned();
+        assert!(
+            lexical_path_affinity(QueryIntent::Architecture, Some(&parser), "parse templates")
+                > lexical_path_affinity(
+                    QueryIntent::Architecture,
+                    Some(&source),
+                    "parse templates"
+                )
         );
     }
 
@@ -918,5 +1190,48 @@ mod tests {
         let dense = hit(SearchRoute::DenseRaw, &"function prefix ".repeat(100));
         assert!(!should_replace_snippet(&lexical, &dense));
         assert!(should_replace_snippet(&dense, &lexical));
+    }
+
+    #[test]
+    fn fused_routes_retain_static_analysis_evidence() {
+        let evidence = SourceAddress {
+            repository_id: "repo".to_owned(),
+            snapshot_id: "snapshot".to_owned(),
+            path: "src/flow.ts".to_owned(),
+            start_byte: 10,
+            end_byte: 20,
+            start_line: 2,
+            end_line: 2,
+            symbol_id: None,
+        };
+        let hit = |route, evidence: Vec<SourceAddress>| SearchHit {
+            document_id: "entity: node".to_owned(),
+            symbol_name: Some("node".to_owned()),
+            entity_id: "node".to_owned(),
+            representation: RetrievalRepresentation::Signature,
+            route,
+            rank: 1,
+            score: 1.0,
+            contributing_routes: vec![route],
+            address: None,
+            evidence,
+            snippet: "node".to_owned(),
+            verified_current: true,
+            explanation: Vec::new(),
+        };
+        let mut candidates = HashMap::new();
+
+        add_candidate(
+            &mut candidates,
+            hit(SearchRoute::ExactSymbol, Vec::new()),
+            1.0,
+        );
+        add_candidate(
+            &mut candidates,
+            hit(SearchRoute::Structural, vec![evidence.clone()]),
+            1.0,
+        );
+
+        assert_eq!(candidates["entity: node"].hit.evidence, vec![evidence]);
     }
 }

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    io::Write,
+    path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
@@ -8,10 +9,10 @@ use std::{
 use cce_core::{
     CceError, CodeEntity, EntityKind, Relation, RelationKind, RelationOrigin, Result, SourceAddress,
 };
-use protobuf::{Enum, Message};
+use protobuf::{Enum, EnumOrUnknown, Message, MessageField};
 use scip::types::{
-    Document, Occurrence, PositionEncoding, SymbolInformation, SymbolRole, occurrence,
-    symbol_information,
+    Document, Index, Metadata, Occurrence, PositionEncoding, SymbolInformation, SymbolRole,
+    TextEncoding, ToolInfo, occurrence, symbol_information,
 };
 
 use crate::{ScannedFile, ScannedRepository, ScipBackendConfig};
@@ -31,6 +32,13 @@ pub(crate) struct ScipImport {
     pub references: usize,
     pub skipped_occurrences: usize,
     pub tool: String,
+    pub failures: Vec<String>,
+}
+
+struct LoadedScipIndex {
+    bytes: Vec<u8>,
+    trusted_snapshot: bool,
+    failures: Vec<String>,
 }
 
 pub(crate) async fn build(
@@ -40,13 +48,17 @@ pub(crate) async fn build(
     scanned: &ScannedRepository,
     existing_entities: &[CodeEntity],
 ) -> Result<Option<ScipImport>> {
-    let Some((bytes, trusted_snapshot)) = load_index(config, repository_root, data_root).await?
-    else {
+    let Some(loaded) = load_index(config, repository_root, data_root, scanned).await? else {
         return Ok(None);
     };
+    let bytes = loaded.bytes;
+    let trusted_snapshot = loaded.trusted_snapshot;
     let index = scip::types::Index::parse_from_bytes(&bytes)
         .map_err(|error| CceError::ArtifactCorrupt(format!("invalid SCIP protobuf: {error}")))?;
     let metadata = index.metadata.as_ref();
+    let legacy_position_encoding = metadata
+        .and_then(|value| value.text_document_encoding.enum_value().ok())
+        .and_then(legacy_position_encoding);
     let tool = metadata
         .and_then(|value| value.tool_info.as_ref())
         .map_or_else(
@@ -77,16 +89,33 @@ pub(crate) async fn build(
             if occurrence.symbol.is_empty() || !has_role(occurrence, SymbolRole::Definition) {
                 continue;
             }
-            let Some(address) = occurrence_address(scanned, file, document, occurrence)? else {
+            let Some(address) = occurrence_address(
+                scanned,
+                file,
+                document,
+                occurrence,
+                legacy_position_encoding,
+            )?
+            else {
                 skipped_occurrences += 1;
                 continue;
             };
             definitions += 1;
             let key = symbol_key(&document.relative_path, &occurrence.symbol);
+            if symbol_entities.contains_key(&key) {
+                continue;
+            }
+            let information = symbol_information.get(&key);
+            let definition_name = information
+                .filter(|value| !value.display_name.is_empty())
+                .map_or_else(
+                    || symbol_display_name(&occurrence.symbol),
+                    |value| value.display_name.clone(),
+                );
             let entity_id = enclosing_entity(&entities_by_path, &address)
+                .filter(|entity| entity.name == definition_name)
                 .map(|entity| entity.id.clone())
                 .unwrap_or_else(|| {
-                    let information = symbol_information.get(&key);
                     let id = digest_id(
                         "entity",
                         &[&scanned.identity.id, "scip", &key, &artifact_digest],
@@ -96,18 +125,13 @@ pub(crate) async fn build(
                         kind: information.map_or(EntityKind::Unknown, |value| {
                             entity_kind(value.kind.enum_value().ok())
                         }),
-                        name: information
-                            .and_then(|value| (!value.display_name.is_empty()).then_some(value))
-                            .map_or_else(
-                                || symbol_display_name(&occurrence.symbol),
-                                |value| value.display_name.clone(),
-                            ),
+                        name: definition_name.clone(),
                         qualified_name: Some(occurrence.symbol.clone()),
                         signature: information
                             .and_then(|value| value.signature_documentation.as_ref())
                             .map(|value| value.text.clone())
                             .filter(|value| !value.is_empty()),
-                        language: Some(document.language.clone()),
+                        language: document_language(document, file.language.as_deref()),
                         address: Some(address.clone().with_symbol(id.clone())),
                         capabilities: vec!["scip_definition".to_owned()],
                         attributes: serde_json::Map::from_iter([
@@ -135,7 +159,14 @@ pub(crate) async fn build(
             if occurrence.symbol.is_empty() || has_role(occurrence, SymbolRole::Definition) {
                 continue;
             }
-            let Some(evidence) = occurrence_address(scanned, file, document, occurrence)? else {
+            let Some(evidence) = occurrence_address(
+                scanned,
+                file,
+                document,
+                occurrence,
+                legacy_position_encoding,
+            )?
+            else {
                 skipped_occurrences += 1;
                 continue;
             };
@@ -149,6 +180,7 @@ pub(crate) async fn build(
                 &key,
                 &occurrence.symbol,
                 document,
+                file.language.as_deref(),
                 &artifact_digest,
                 &symbol_information,
                 &mut symbol_entities,
@@ -184,11 +216,15 @@ pub(crate) async fn build(
     }
 
     for document in &index.documents {
+        let fallback_language = files
+            .get(document.relative_path.as_str())
+            .and_then(|file| file.language.as_deref());
         for information in &document.symbols {
             add_symbol_relationships(
                 scanned,
                 document,
                 information,
+                fallback_language,
                 &tool,
                 &artifact_digest,
                 &symbol_information,
@@ -211,6 +247,7 @@ pub(crate) async fn build(
         references,
         skipped_occurrences,
         tool,
+        failures: loaded.failures,
     }))
 }
 
@@ -218,60 +255,485 @@ async fn load_index(
     config: &ScipBackendConfig,
     repository_root: &Path,
     data_root: &Path,
-) -> Result<Option<(Vec<u8>, bool)>> {
+    scanned: &ScannedRepository,
+) -> Result<Option<LoadedScipIndex>> {
     match config {
         ScipBackendConfig::Disabled => Ok(None),
-        ScipBackendConfig::Supplied { path } => Ok(Some((read_bounded(path)?, false))),
+        ScipBackendConfig::Supplied { path } => Ok(Some(LoadedScipIndex {
+            bytes: read_bounded(path)?,
+            trusted_snapshot: false,
+            failures: Vec::new(),
+        })),
         ScipBackendConfig::RustAnalyzer {
             executable,
             threads,
             timeout_seconds,
             ..
+        } => Ok(Some(LoadedScipIndex {
+            bytes: generate_rust_index(
+                executable,
+                *threads,
+                *timeout_seconds,
+                repository_root,
+                data_root,
+            )
+            .await?,
+            trusted_snapshot: true,
+            failures: Vec::new(),
+        })),
+        ScipBackendConfig::Auto {
+            rust_analyzer,
+            typescript_indexer,
+            threads,
+            timeout_seconds,
         } => {
-            let temporary_dir = data_root.join("tmp");
-            std::fs::create_dir_all(&temporary_dir)
-                .map_err(|error| CceError::io(&temporary_dir, error))?;
-            let output = tempfile::Builder::new()
-                .prefix("cce-rust-analyzer-")
-                .suffix(".scip")
-                .tempfile_in(&temporary_dir)
-                .map_err(|error| CceError::io(&temporary_dir, error))?;
-            let mut command = tokio::process::Command::new(executable);
-            command
-                .arg("scip")
-                .arg(repository_root)
-                .arg("--output")
-                .arg(output.path())
-                .arg("--exclude-vendored-libraries")
-                .current_dir(repository_root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            if let Some(threads) = threads {
-                command.arg("--num-threads").arg(threads.to_string());
+            let has_rust = scanned
+                .files
+                .iter()
+                .any(|file| file.language.as_deref() == Some("rust"));
+            let has_typescript = scanned.files.iter().any(|file| {
+                matches!(
+                    file.language.as_deref(),
+                    Some("typescript" | "tsx" | "javascript")
+                )
+            });
+            if !has_rust && !has_typescript {
+                return Ok(None);
             }
-            let result =
-                tokio::time::timeout(Duration::from_secs(*timeout_seconds), command.output())
-                    .await
-                    .map_err(|_| {
-                        CceError::Provider(format!(
-                            "rust-analyzer SCIP generation exceeded {timeout_seconds} seconds"
-                        ))
-                    })?
-                    .map_err(|error| {
-                        CceError::Provider(format!("failed to run rust-analyzer SCIP: {error}"))
-                    })?;
-            if !result.status.success() {
-                return Err(CceError::Provider(format!(
-                    "rust-analyzer SCIP exited with {}: {}",
-                    result.status,
-                    truncate_utf8(&result.stderr, 8_192)
-                )));
+            let mut indexes = Vec::new();
+            let mut failures = Vec::new();
+            if has_rust {
+                match resolve_runtime_executable(rust_analyzer)
+                    .map(|executable| (executable, *threads, *timeout_seconds))
+                {
+                    Ok((executable, threads, timeout_seconds)) => {
+                        match generate_rust_index(
+                            &executable,
+                            threads,
+                            timeout_seconds,
+                            repository_root,
+                            data_root,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => indexes.push(bytes),
+                            Err(error) => failures.push(format!("rust-analyzer: {error}")),
+                        }
+                    }
+                    Err(error) => failures.push(format!("rust-analyzer: {error}")),
+                }
             }
-            Ok(Some((read_bounded(output.path())?, true)))
+            if has_typescript {
+                match resolve_runtime_executable(typescript_indexer) {
+                    Ok(executable) => {
+                        match generate_typescript_indexes(
+                            &executable,
+                            *timeout_seconds,
+                            repository_root,
+                            data_root,
+                            scanned,
+                        )
+                        .await
+                        {
+                            Ok((generated, provider_failures)) => {
+                                indexes.extend(generated);
+                                failures.extend(
+                                    provider_failures
+                                        .into_iter()
+                                        .map(|failure| format!("scip-typescript: {failure}")),
+                                );
+                            }
+                            Err(error) => failures.push(format!("scip-typescript: {error}")),
+                        }
+                    }
+                    Err(error) => failures.push(format!("scip-typescript: {error}")),
+                }
+            }
+            if indexes.is_empty() {
+                return Err(CceError::Provider(failures.join("; ")));
+            }
+            Ok(Some(LoadedScipIndex {
+                bytes: merge_scip_indexes(indexes)?,
+                trusted_snapshot: true,
+                failures,
+            }))
         }
     }
+}
+
+async fn generate_rust_index(
+    executable: &Path,
+    threads: Option<usize>,
+    timeout_seconds: u64,
+    repository_root: &Path,
+    data_root: &Path,
+) -> Result<Vec<u8>> {
+    let output = temporary_scip_file(data_root, "cce-rust-analyzer-")?;
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("scip")
+        .arg(repository_root)
+        .arg("--output")
+        .arg(output.path())
+        .arg("--exclude-vendored-libraries");
+    if let Some(threads) = threads {
+        command.arg("--num-threads").arg(threads.to_string());
+    }
+    run_scip_command(command, repository_root, timeout_seconds, "rust-analyzer").await?;
+    read_bounded(output.path())
+}
+
+async fn generate_typescript_indexes(
+    executable: &Path,
+    timeout_seconds: u64,
+    repository_root: &Path,
+    data_root: &Path,
+    scanned: &ScannedRepository,
+) -> Result<(Vec<Vec<u8>>, Vec<String>)> {
+    let configured_projects = scanned
+        .files
+        .iter()
+        .filter(|file| {
+            Path::new(&file.relative_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.starts_with("tsconfig") && value.ends_with(".json"))
+        })
+        .map(|file| repository_root.join(&file.relative_path))
+        .collect::<Vec<_>>();
+    let mut indexes = Vec::new();
+    let mut failures = Vec::new();
+
+    if !configured_projects.is_empty() {
+        match generate_typescript_project_index(
+            executable,
+            timeout_seconds,
+            repository_root,
+            data_root,
+            &configured_projects,
+            None,
+            "configured projects",
+        )
+        .await
+        {
+            Ok(bytes) => indexes.push(bytes),
+            Err(error) => failures.push(format!("configured projects: {error}")),
+        }
+    }
+
+    let workspace_flag = if scanned
+        .files
+        .iter()
+        .any(|file| file.relative_path == "pnpm-workspace.yaml")
+    {
+        Some("--pnpm-workspaces")
+    } else if has_yarn_workspaces(scanned) {
+        Some("--yarn-workspaces")
+    } else {
+        None
+    };
+    if let Some(workspace_flag) = workspace_flag {
+        match generate_typescript_project_index(
+            executable,
+            timeout_seconds,
+            repository_root,
+            data_root,
+            &[],
+            Some(workspace_flag),
+            "workspace projects",
+        )
+        .await
+        {
+            Ok(bytes) => indexes.push(bytes),
+            Err(error) => failures.push(format!("workspace projects: {error}")),
+        }
+    }
+
+    let covered_paths = scip_document_paths(&indexes)?;
+    let supplemental_files = scanned
+        .files
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.language.as_deref(),
+                Some("javascript" | "typescript" | "tsx")
+            ) && !covered_paths.contains(&file.relative_path)
+        })
+        .map(|file| repository_root.join(&file.relative_path))
+        .collect::<Vec<_>>();
+    if !supplemental_files.is_empty() {
+        let temporary_dir = data_root.join("tmp");
+        std::fs::create_dir_all(&temporary_dir)
+            .map_err(|error| CceError::io(&temporary_dir, error))?;
+        let mut config = tempfile::Builder::new()
+            .prefix("cce-scip-unconfigured-")
+            .suffix(".json")
+            .tempfile_in(&temporary_dir)
+            .map_err(|error| CceError::io(&temporary_dir, error))?;
+        let files = supplemental_files
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let config_json = serde_json::json!({
+            "compilerOptions": {
+                "allowJs": true,
+                "checkJs": true,
+                "noEmit": true,
+                "target": "ES2022",
+                "module": "NodeNext",
+                "moduleResolution": "NodeNext",
+                "jsx": "react-jsx",
+                "allowSyntheticDefaultImports": true,
+                "skipLibCheck": true
+            },
+            "files": files
+        });
+        serde_json::to_writer(config.as_file_mut(), &config_json)
+            .map_err(|error| CceError::ArtifactCorrupt(error.to_string()))?;
+        config
+            .as_file_mut()
+            .flush()
+            .map_err(|error| CceError::io(config.path(), error))?;
+        let supplemental_project = config.path().to_path_buf();
+        match generate_typescript_project_index(
+            executable,
+            timeout_seconds,
+            repository_root,
+            data_root,
+            std::slice::from_ref(&supplemental_project),
+            None,
+            "unconfigured JS/TS supplement",
+        )
+        .await
+        {
+            Ok(bytes) => indexes.push(bytes),
+            Err(error) => failures.push(format!("unconfigured JS/TS supplement: {error}")),
+        }
+    }
+
+    if indexes.is_empty() {
+        return Err(CceError::Provider(failures.join("; ")));
+    }
+    Ok((indexes, failures))
+}
+
+fn scip_document_paths(indexes: &[Vec<u8>]) -> Result<HashSet<String>> {
+    let mut paths = HashSet::new();
+    for bytes in indexes {
+        let index = Index::parse_from_bytes(bytes).map_err(|error| {
+            CceError::ArtifactCorrupt(format!("invalid generated SCIP protobuf: {error}"))
+        })?;
+        paths.extend(
+            index
+                .documents
+                .into_iter()
+                .map(|document| document.relative_path.replace('\\', "/")),
+        );
+    }
+    Ok(paths)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn generate_typescript_project_index(
+    executable: &Path,
+    timeout_seconds: u64,
+    repository_root: &Path,
+    data_root: &Path,
+    projects: &[PathBuf],
+    workspace_flag: Option<&str>,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let output = temporary_scip_file(data_root, "cce-scip-typescript-")?;
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("index")
+        .arg("--cwd")
+        .arg(repository_root)
+        .arg("--output")
+        .arg(output.path())
+        .arg("--no-progress-bar");
+    if let Some(workspace_flag) = workspace_flag {
+        command.arg(workspace_flag);
+    }
+    for project in projects {
+        command.arg(project);
+    }
+    run_scip_command(command, repository_root, timeout_seconds, label).await?;
+    read_bounded(output.path())
+}
+
+fn has_yarn_workspaces(scanned: &ScannedRepository) -> bool {
+    let has_yarn_lock = scanned
+        .files
+        .iter()
+        .any(|file| file.relative_path == "yarn.lock");
+    let has_workspaces = scanned
+        .files
+        .iter()
+        .find(|file| file.relative_path == "package.json")
+        .and_then(|file| serde_json::from_slice::<serde_json::Value>(&file.bytes).ok())
+        .is_some_and(|value| value.get("workspaces").is_some());
+    has_yarn_lock && has_workspaces
+}
+
+fn temporary_scip_file(data_root: &Path, prefix: &str) -> Result<tempfile::NamedTempFile> {
+    let temporary_dir = data_root.join("tmp");
+    std::fs::create_dir_all(&temporary_dir).map_err(|error| CceError::io(&temporary_dir, error))?;
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(".scip")
+        .tempfile_in(&temporary_dir)
+        .map_err(|error| CceError::io(&temporary_dir, error))
+}
+
+async fn run_scip_command(
+    mut command: tokio::process::Command,
+    repository_root: &Path,
+    timeout_seconds: u64,
+    name: &str,
+) -> Result<()> {
+    command
+        .current_dir(repository_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let result = tokio::time::timeout(Duration::from_secs(timeout_seconds), command.output())
+        .await
+        .map_err(|_| {
+            CceError::Provider(format!(
+                "{name} SCIP generation exceeded {timeout_seconds} seconds"
+            ))
+        })?
+        .map_err(|error| CceError::Provider(format!("failed to run {name}: {error}")))?;
+    if !result.status.success() {
+        return Err(CceError::Provider(format!(
+            "{name} exited with {}: stdout={} stderr={}",
+            result.status,
+            truncate_utf8(&result.stdout, 8_192),
+            truncate_utf8(&result.stderr, 8_192)
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_runtime_executable(path: &Path) -> Result<PathBuf> {
+    if path.components().count() == 1 {
+        if let Some(resolved) = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+            .map(|directory| directory.join(path))
+            .find(|candidate| candidate.is_file())
+        {
+            return Ok(resolved);
+        }
+    } else if path.is_file() {
+        return std::path::absolute(path).map_err(|error| CceError::io(path, error));
+    }
+    Err(CceError::Configuration(format!(
+        "SCIP indexer {} was not found",
+        path.display()
+    )))
+}
+
+fn merge_scip_indexes(indexes: Vec<Vec<u8>>) -> Result<Vec<u8>> {
+    let mut parsed = indexes
+        .into_iter()
+        .map(|bytes| {
+            Index::parse_from_bytes(&bytes).map_err(|error| {
+                CceError::ArtifactCorrupt(format!("invalid generated SCIP protobuf: {error}"))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if parsed.len() == 1 {
+        return parsed
+            .pop()
+            .expect("one parsed index")
+            .write_to_bytes()
+            .map_err(|error| CceError::ArtifactCorrupt(error.to_string()));
+    }
+    let tools = parsed
+        .iter()
+        .filter_map(|index| index.metadata.as_ref())
+        .filter_map(|metadata| metadata.tool_info.as_ref())
+        .map(|tool| format!("{}@{}", tool.name, tool.version))
+        .collect::<Vec<_>>();
+    for index in &mut parsed {
+        apply_legacy_encoding(index)?;
+    }
+    let mut merged = parsed.remove(0);
+    let mut documents = HashMap::<String, Document>::new();
+    for document in std::mem::take(&mut merged.documents) {
+        retain_richer_document(&mut documents, document);
+    }
+    for mut index in parsed {
+        for document in std::mem::take(&mut index.documents) {
+            retain_richer_document(&mut documents, document);
+        }
+        merged.external_symbols.append(&mut index.external_symbols);
+    }
+    merged.documents = documents.into_values().collect();
+    merged
+        .documents
+        .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let mut seen_symbols = HashSet::new();
+    merged
+        .external_symbols
+        .retain(|symbol| seen_symbols.insert(symbol.symbol.clone()));
+    let mut tool = ToolInfo::new();
+    tool.name = "cce-scip-auto".to_owned();
+    tool.version = tools.join("+");
+    let metadata = merged
+        .metadata
+        .0
+        .get_or_insert_with(|| Box::new(Metadata::new()));
+    metadata.tool_info = MessageField::some(tool);
+    metadata.text_document_encoding = EnumOrUnknown::new(TextEncoding::UnspecifiedTextEncoding);
+    let bytes = merged
+        .write_to_bytes()
+        .map_err(|error| CceError::ArtifactCorrupt(error.to_string()))?;
+    if bytes.len() as u64 > MAX_SCIP_BYTES {
+        return Err(CceError::Configuration(
+            "merged SCIP artifact exceeds the 2 GiB safety limit".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn retain_richer_document(documents: &mut HashMap<String, Document>, candidate: Document) {
+    let candidate_quality = candidate.occurrences.len().saturating_mul(2) + candidate.symbols.len();
+    match documents.entry(candidate.relative_path.clone()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(candidate);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let existing = entry.get();
+            let existing_quality =
+                existing.occurrences.len().saturating_mul(2) + existing.symbols.len();
+            if candidate_quality > existing_quality {
+                entry.insert(candidate);
+            }
+        }
+    }
+}
+
+fn apply_legacy_encoding(index: &mut Index) -> Result<()> {
+    let fallback = index
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.text_document_encoding.enum_value().ok())
+        .and_then(legacy_position_encoding);
+    for document in &mut index.documents {
+        let encoding = document.position_encoding.enum_value().map_err(|value| {
+            CceError::ArtifactCorrupt(format!("unknown SCIP position encoding {value}"))
+        })?;
+        if encoding == PositionEncoding::UnspecifiedPositionEncoding
+            && let Some(fallback) = fallback
+        {
+            document.position_encoding = EnumOrUnknown::new(fallback);
+        }
+    }
+    Ok(())
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
@@ -340,6 +802,7 @@ fn ensure_symbol_entity(
     key: &str,
     symbol: &str,
     document: &Document,
+    fallback_language: Option<&str>,
     artifact_digest: &str,
     information: &HashMap<String, &SymbolInformation>,
     symbol_entities: &mut HashMap<String, String>,
@@ -368,7 +831,7 @@ fn ensure_symbol_entity(
                 .and_then(|value| value.signature_documentation.as_ref())
                 .map(|value| value.text.clone())
                 .filter(|value| !value.is_empty()),
-            language: Some(document.language.clone()),
+            language: document_language(document, fallback_language),
             address: None,
             capabilities: vec!["scip_external_symbol".to_owned()],
             attributes: serde_json::Map::from_iter([
@@ -389,6 +852,7 @@ fn add_symbol_relationships(
     scanned: &ScannedRepository,
     document: &Document,
     information: &SymbolInformation,
+    fallback_language: Option<&str>,
     tool: &str,
     artifact_digest: &str,
     all_information: &HashMap<String, &SymbolInformation>,
@@ -408,6 +872,7 @@ fn add_symbol_relationships(
             &target_key,
             &relationship.symbol,
             document,
+            fallback_language,
             artifact_digest,
             all_information,
             symbol_entities,
@@ -488,20 +953,26 @@ fn occurrence_address(
     file: &ScannedFile,
     document: &Document,
     occurrence: &Occurrence,
+    legacy_encoding: Option<PositionEncoding>,
 ) -> Result<Option<SourceAddress>> {
     let Some((start_line, start_character, end_line, end_character)) = occurrence_range(occurrence)
     else {
         return Ok(None);
     };
-    let encoding = document.position_encoding.enum_value().map_err(|value| {
+    let document_encoding = document.position_encoding.enum_value().map_err(|value| {
         CceError::ArtifactCorrupt(format!(
             "unknown SCIP position encoding {value} in {}",
             document.relative_path
         ))
     })?;
-    if encoding == PositionEncoding::UnspecifiedPositionEncoding {
+    let encoding = if document_encoding == PositionEncoding::UnspecifiedPositionEncoding {
+        legacy_encoding
+    } else {
+        Some(document_encoding)
+    };
+    let Some(encoding) = encoding else {
         return Ok(None);
-    }
+    };
     let text = file.text()?;
     let start = position_to_byte(text, start_line, start_character, encoding)?;
     let end = position_to_byte(text, end_line, end_character, encoding)?;
@@ -518,6 +989,20 @@ fn occurrence_address(
         )?
         .with_symbol(&occurrence.symbol),
     ))
+}
+
+fn legacy_position_encoding(value: TextEncoding) -> Option<PositionEncoding> {
+    match value {
+        TextEncoding::UTF8 => Some(PositionEncoding::UTF8CodeUnitOffsetFromLineStart),
+        TextEncoding::UTF16 => Some(PositionEncoding::UTF16CodeUnitOffsetFromLineStart),
+        TextEncoding::UnspecifiedTextEncoding => None,
+    }
+}
+
+fn document_language(document: &Document, fallback: Option<&str>) -> Option<String> {
+    (!document.language.is_empty())
+        .then(|| document.language.clone())
+        .or_else(|| fallback.map(str::to_owned))
 }
 
 fn occurrence_range(occurrence: &Occurrence) -> Option<(usize, usize, usize, usize)> {
@@ -648,11 +1133,32 @@ fn entity_kind(kind: Option<symbol_information::Kind>) -> EntityKind {
         Some(symbol_information::Kind::Struct) => EntityKind::Struct,
         Some(symbol_information::Kind::Enum) => EntityKind::Enum,
         Some(symbol_information::Kind::Function) => EntityKind::Function,
-        Some(symbol_information::Kind::Method) => EntityKind::Method,
-        Some(symbol_information::Kind::Field) => EntityKind::Field,
-        Some(symbol_information::Kind::Constant) => EntityKind::Constant,
+        Some(
+            symbol_information::Kind::Method
+            | symbol_information::Kind::Constructor
+            | symbol_information::Kind::AbstractMethod
+            | symbol_information::Kind::StaticMethod
+            | symbol_information::Kind::Getter
+            | symbol_information::Kind::Setter,
+        ) => EntityKind::Method,
+        Some(
+            symbol_information::Kind::Field
+            | symbol_information::Kind::Property
+            | symbol_information::Kind::StaticField
+            | symbol_information::Kind::StaticProperty
+            | symbol_information::Kind::Parameter,
+        ) => EntityKind::Field,
+        Some(
+            symbol_information::Kind::Constant
+            | symbol_information::Kind::Variable
+            | symbol_information::Kind::StaticVariable
+            | symbol_information::Kind::Value,
+        ) => EntityKind::Constant,
         Some(symbol_information::Kind::Module) => EntityKind::Module,
         Some(symbol_information::Kind::Namespace) => EntityKind::Namespace,
+        Some(symbol_information::Kind::Type | symbol_information::Kind::TypeAlias) => {
+            EntityKind::Schema
+        }
         _ => EntityKind::Unknown,
     }
 }
@@ -725,6 +1231,72 @@ mod tests {
         assert_eq!(
             symbol_key("a.rs", "rust cargo pkg 1 Foo#"),
             "rust cargo pkg 1 Foo#"
+        );
+    }
+
+    #[test]
+    fn upgrades_legacy_metadata_encoding_per_document() {
+        let mut metadata = Metadata::new();
+        metadata.text_document_encoding = EnumOrUnknown::new(TextEncoding::UTF8);
+        let mut index = Index::new();
+        index.metadata = MessageField::some(metadata);
+        index.documents.push(Document::new());
+
+        apply_legacy_encoding(&mut index).expect("upgrade encoding");
+
+        assert_eq!(
+            index.documents[0]
+                .position_encoding
+                .enum_value()
+                .expect("known encoding"),
+            PositionEncoding::UTF8CodeUnitOffsetFromLineStart
+        );
+    }
+
+    #[test]
+    fn merged_scip_indexes_retain_one_richest_document_per_path() {
+        let mut sparse_document = Document::new();
+        sparse_document.relative_path = "src/index.js".to_owned();
+        sparse_document.position_encoding =
+            EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart);
+        sparse_document.occurrences.push(Occurrence::new());
+        let mut sparse = Index::new();
+        sparse.documents.push(sparse_document);
+
+        let mut rich_document = Document::new();
+        rich_document.relative_path = "src/index.js".to_owned();
+        rich_document.position_encoding =
+            EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart);
+        rich_document.occurrences.push(Occurrence::new());
+        rich_document.occurrences.push(Occurrence::new());
+        let mut rich = Index::new();
+        rich.documents.push(rich_document);
+
+        let bytes = merge_scip_indexes(vec![
+            sparse.write_to_bytes().expect("serialize sparse"),
+            rich.write_to_bytes().expect("serialize rich"),
+        ])
+        .expect("merge indexes");
+        let merged = Index::parse_from_bytes(&bytes).expect("parse merged");
+
+        assert_eq!(merged.documents.len(), 1);
+        assert_eq!(merged.documents[0].occurrences.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_executable_preserves_multicall_symlink_name() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("rustup");
+        std::fs::write(&target, b"launcher").expect("launcher");
+        let symlink = directory.path().join("rust-analyzer");
+        std::os::unix::fs::symlink(&target, &symlink).expect("symlink");
+
+        let resolved = resolve_runtime_executable(&symlink).expect("resolved executable");
+
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("rust-analyzer")
         );
     }
 }

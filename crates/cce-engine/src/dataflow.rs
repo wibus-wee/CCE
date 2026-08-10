@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::Path,
+    process::Stdio,
+    time::Duration,
+};
 
 use cce_core::{
     CceError, CodeEntity, EntityKind, Relation, RelationKind, RelationOrigin, Result, SourceAddress,
@@ -124,15 +129,19 @@ pub(crate) async fn build(
             export_executable,
             version,
             timeout_seconds,
+            language,
         } => {
             generate_with_joern(
-                parse_executable,
-                export_executable,
+                JoernExecutables {
+                    parse: parse_executable,
+                    export: export_executable,
+                },
                 version,
                 *timeout_seconds,
                 repository_root,
                 data_root,
                 scanned,
+                language.as_deref(),
             )
             .await?
         }
@@ -269,6 +278,12 @@ pub(crate) async fn build(
     }))
 }
 
+#[derive(Clone, Copy)]
+struct JoernExecutables<'a> {
+    parse: &'a Path,
+    export: &'a Path,
+}
+
 #[derive(Debug, Default)]
 struct GraphNode {
     id: String,
@@ -284,13 +299,13 @@ struct GraphEdge {
 }
 
 async fn generate_with_joern(
-    parse_executable: &Path,
-    export_executable: &Path,
+    executables: JoernExecutables<'_>,
     version: &str,
     timeout_seconds: u64,
     repository_root: &Path,
     data_root: &Path,
     scanned: &ScannedRepository,
+    configured_language: Option<&str>,
 ) -> Result<(Vec<u8>, usize)> {
     let temporary_root = data_root.join("tmp");
     std::fs::create_dir_all(&temporary_root)
@@ -299,9 +314,28 @@ async fn generate_with_joern(
         .prefix("joern-dataflow-")
         .tempdir_in(&temporary_root)
         .map_err(|error| CceError::io(&temporary_root, error))?;
+    let inferred_javascript = configured_language.is_none()
+        && scanned.files.iter().any(|file| {
+            matches!(
+                file.language.as_deref(),
+                Some("javascript" | "typescript" | "tsx")
+            )
+        })
+        && !scanned.files.iter().any(|file| {
+            matches!(
+                file.language.as_deref(),
+                Some("rust" | "c" | "cpp" | "python" | "go" | "java" | "csharp")
+            )
+        });
+    let language = configured_language.or(inferred_javascript.then_some("JAVASCRIPT"));
+    let mut parse_arguments = vec![repository_root.as_os_str()];
+    if let Some(language) = language {
+        parse_arguments.push(std::ffi::OsStr::new("--language"));
+        parse_arguments.push(std::ffi::OsStr::new(language));
+    }
     run_local_analysis_command(
-        parse_executable,
-        &[repository_root.as_os_str()],
+        executables.parse,
+        &parse_arguments,
         temporary.path(),
         timeout_seconds,
         "joern-parse",
@@ -329,7 +363,7 @@ async fn generate_with_joern(
         export_directory.as_os_str(),
     ];
     run_local_analysis_command(
-        export_executable,
+        executables.export,
         &arguments,
         temporary.path(),
         timeout_seconds,
@@ -704,9 +738,15 @@ fn joern_artifact(
         .iter()
         .map(|file| (file.relative_path.as_str(), file))
         .collect::<HashMap<_, _>>();
+    let resolved_paths =
+        resolve_joern_paths(&graph_nodes, &graph_edges, repository_root, &current_files);
     let mut nodes = HashMap::<String, ArtifactNode>::new();
     for node in graph_nodes {
-        if let Some(aligned) = align_joern_node(&node, repository_root, &current_files)? {
+        if let Some(aligned) = align_joern_node(
+            &node,
+            resolved_paths.get(&node.id).map(String::as_str),
+            &current_files,
+        )? {
             nodes.entry(node.id).or_insert(aligned);
         }
     }
@@ -794,13 +834,10 @@ fn joern_edge_kind(edge: &GraphEdge) -> Option<ArtifactEdgeKind> {
 
 fn align_joern_node(
     node: &GraphNode,
-    repository_root: &Path,
+    resolved_path: Option<&str>,
     files: &HashMap<&str, &ScannedFile>,
 ) -> Result<Option<ArtifactNode>> {
-    let Some(raw_path) = graph_property(&node.properties, &["FILENAME", "filename"]) else {
-        return Ok(None);
-    };
-    let Some(path) = normalize_joern_path(raw_path, repository_root, files) else {
+    let Some(path) = resolved_path.map(str::to_owned) else {
         return Ok(None);
     };
     let Some(file) = files.get(path.as_str()).copied() else {
@@ -840,6 +877,68 @@ fn align_joern_node(
         name,
         address,
     }))
+}
+
+fn resolve_joern_paths(
+    nodes: &[GraphNode],
+    edges: &[GraphEdge],
+    repository_root: &Path,
+    files: &HashMap<&str, &ScannedFile>,
+) -> HashMap<String, String> {
+    let mut resolved = HashMap::<String, String>::new();
+    let mut queue = VecDeque::new();
+    for node in nodes {
+        let label = graph_property(&node.properties, &["labelV", "label", ":LABEL"]);
+        let raw_path = graph_property(&node.properties, &["FILENAME", "filename"]).or_else(|| {
+            label
+                .is_some_and(|value| value.eq_ignore_ascii_case("FILE"))
+                .then(|| graph_property(&node.properties, &["NAME", "name"]))
+                .flatten()
+        });
+        if let Some(path) =
+            raw_path.and_then(|value| normalize_joern_path(value, repository_root, files))
+        {
+            resolved.insert(node.id.clone(), path);
+            queue.push_back(node.id.clone());
+        }
+    }
+
+    let mut outgoing = HashMap::<&str, Vec<&str>>::new();
+    for edge in edges {
+        let Some(label) = graph_property(&edge.properties, &["labelE", "label", "TYPE", ":TYPE"])
+        else {
+            continue;
+        };
+        match label.trim().to_ascii_uppercase().as_str() {
+            "AST" | "CONTAINS" => outgoing
+                .entry(edge.source.as_str())
+                .or_default()
+                .push(edge.target.as_str()),
+            "SOURCE_FILE" => {
+                outgoing
+                    .entry(edge.source.as_str())
+                    .or_default()
+                    .push(edge.target.as_str());
+                outgoing
+                    .entry(edge.target.as_str())
+                    .or_default()
+                    .push(edge.source.as_str());
+            }
+            _ => {}
+        }
+    }
+    while let Some(source) = queue.pop_front() {
+        let Some(path) = resolved.get(&source).cloned() else {
+            continue;
+        };
+        for target in outgoing.get(source.as_str()).into_iter().flatten() {
+            if !resolved.contains_key(*target) {
+                resolved.insert((*target).to_owned(), path.clone());
+                queue.push_back((*target).to_owned());
+            }
+        }
+    }
+    resolved
 }
 
 fn graph_property<'a>(properties: &'a HashMap<String, String>, names: &[&str]) -> Option<&'a str> {
@@ -1185,6 +1284,50 @@ mod tests {
         assert_eq!(
             nodes[0].properties.get("CODE").map(String::as_str),
             Some("a < b && b > 0")
+        );
+    }
+
+    #[test]
+    fn propagates_joern_file_identity_through_ast_edges() {
+        let file = ScannedFile {
+            relative_path: "src/main.ts".to_owned(),
+            absolute_path: PathBuf::from("/repo/src/main.ts"),
+            language: Some("typescript".to_owned()),
+            bytes: b"const value = input;\n".to_vec(),
+            content_hash: "hash".to_owned(),
+            line_count: 1,
+        };
+        let files = HashMap::from([("src/main.ts", &file)]);
+        let nodes = vec![
+            GraphNode {
+                id: "method".to_owned(),
+                properties: HashMap::from([
+                    ("labelV".to_owned(), "METHOD".to_owned()),
+                    ("FILENAME".to_owned(), "/repo/src/main.ts".to_owned()),
+                ]),
+            },
+            GraphNode {
+                id: "identifier".to_owned(),
+                properties: HashMap::from([
+                    ("labelV".to_owned(), "IDENTIFIER".to_owned()),
+                    ("LINE_NUMBER".to_owned(), "1".to_owned()),
+                    ("COLUMN_NUMBER".to_owned(), "6".to_owned()),
+                    ("CODE".to_owned(), "value".to_owned()),
+                ]),
+            },
+        ];
+        let edges = vec![GraphEdge {
+            id: "ast".to_owned(),
+            source: "method".to_owned(),
+            target: "identifier".to_owned(),
+            properties: HashMap::from([("labelE".to_owned(), "AST".to_owned())]),
+        }];
+
+        let paths = resolve_joern_paths(&nodes, &edges, Path::new("/repo"), &files);
+
+        assert_eq!(
+            paths.get("identifier").map(String::as_str),
+            Some("src/main.ts")
         );
     }
 }

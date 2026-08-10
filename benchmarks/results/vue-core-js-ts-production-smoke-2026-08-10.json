@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "status": "local-reproducible-smoke",
+  "system": "CCE worktree on agent/production-context-graph",
+  "dataset": {
+    "path": "benchmarks/datasets/vue-core-js-ts.jsonl",
+    "revision": "vue-core-js-ts-v1",
+    "repository": "https://github.com/vuejs/core",
+    "repositoryRevision": "40423896796ff7438a1aa70ee3cf22fe5b0ac224",
+    "cases": 11,
+    "goldFilesAcrossArchitectureCases": 15
+  },
+  "hardware": {
+    "architecture": "x86_64",
+    "logicalCpuQuotaVisible": 9,
+    "cpu": "AMD EPYC 9V74 80-Core Processor"
+  },
+  "index": {
+    "files": 703,
+    "parsedJsTsDocuments": 527,
+    "scipDocumentCoverage": "527/527",
+    "scipDefinitions": 37997,
+    "scipReferences": 216180,
+    "relations": 90169,
+    "graphOnlySeconds": 58,
+    "localFastEmbeddingDocuments": 5728,
+    "localFastEmbeddingIndexSeconds": 334
+  },
+  "measurements": {
+    "standardSparse": {
+      "fileRecallAt5": 0.706060606060606,
+      "fileRecallAt10": 0.8757575757575757,
+      "fileRecallAt20": 0.9696969696969697,
+      "fileSuccessAt20": 0.9090909090909091,
+      "symbolRecallAt20": 1.0,
+      "mrr": 0.6848484848484848,
+      "ndcgAt10": 0.7110131443206853,
+      "citationCorrectness": 1.0,
+      "meanOneShotQueryMs": 243.56327254579148
+    },
+    "exactEntityTop1": {
+      "passed": 6,
+      "total": 6
+    },
+    "architecturePackFileRecall": {
+      "beforeCandidateGovernance": 0.8,
+      "afterCandidateGovernanceSparse": 0.9333333333333333,
+      "afterCandidateGovernanceLocalFastDense": 0.9333333333333333,
+      "budgetTokens": 8192,
+      "maxCandidates": 24
+    },
+    "joernReactivitySubset": {
+      "files": 40,
+      "wallSeconds": 42,
+      "sourceAlignedNodes": 11392,
+      "evidenceBackedEdges": 36548,
+      "skippedUnalignedEdges": 216,
+      "dataDirectoryMiB": 96
+    },
+    "denseDaemonSingleSessionDebugBuild": {
+      "qpsAtConcurrency1": 0.92,
+      "qpsAtConcurrency4": 1.1,
+      "qpsAtConcurrency8": 1.08,
+      "qpsAtConcurrency16": 1.03
+    },
+    "denseDaemonFourSessionDebugBuild": {
+      "threadsPerSession": 2,
+      "qpsAtConcurrency1": 0.97,
+      "qpsAtConcurrency4": 1.14,
+      "qpsAtConcurrency8": 1.13,
+      "qpsAtConcurrency16": 1.13
+    },
+    "denseDaemonReleaseBuild": {
+      "singleSessionThreads": 8,
+      "singleSessionQpsAtConcurrency1": 1.9,
+      "singleSessionQpsAtConcurrency4": 2.0,
+      "singleSessionQpsAtConcurrency8": 2.24,
+      "singleSessionQpsAtConcurrency16": 2.05,
+      "fourSessionThreadsPerSession": 2,
+      "fourSessionQpsAtConcurrency1": 1.92,
+      "fourSessionQpsAtConcurrency4": 2.08,
+      "fourSessionQpsAtConcurrency8": 1.31,
+      "fourSessionQpsAtConcurrency16": 1.46
+    }
+  },
+  "tooling": {
+    "scipTypescript": "0.4.0",
+    "joern": "4.0.599",
+    "joernArchiveSha256": "5ee5738a92e8a8dbdd5d96abe921ecd39c0c4ab77e8a0b629fbff6f86ed92fa7",
+    "embeddingPreset": "fast",
+    "embeddingRuntime": "local ONNX"
+  },
+  "limitations": [
+    "This is a regression and production-smoke dataset, not a statistically sufficient cross-system superiority claim.",
+    "The architecture set contains five questions from one repository; the 95% confidence intervals remain wide.",
+    "The local fast embedding model tied sparse retrieval on this set; candidate governance, compiler facts, and path recall produced the measured gain.",
+    "The four-session load tests were CPU-bound in this sandbox. The pool removed the model-lock ceiling and slightly improved release throughput at concurrency 4, but oversubscription reduced throughput at 8 and 16; the one-session default remains appropriate until deployment-specific load testing proves otherwise.",
+    "Joern remains partial when either endpoint lacks an exact current-source range; CCE does not synthesize those missing edges.",
+    "No directly executable Augment Context Engine benchmark adapter or identical public result bundle was available, so this result makes no parity claim."
+  ]
+}

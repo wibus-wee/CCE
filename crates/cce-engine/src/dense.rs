@@ -4,7 +4,10 @@ use std::{
     fs::OpenOptions,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -65,6 +68,7 @@ impl EmbeddingBackend {
                 max_length,
                 threads,
                 batch_size,
+                sessions,
                 query_prefix,
                 document_prefix,
             } => {
@@ -78,6 +82,7 @@ impl EmbeddingBackend {
                 let max_length = *max_length;
                 let threads = *threads;
                 let batch_size = *batch_size;
+                let sessions = *sessions;
                 let query_prefix = query_prefix.clone();
                 let document_prefix = document_prefix.clone();
                 let embedder = tokio::task::spawn_blocking(move || {
@@ -92,6 +97,7 @@ impl EmbeddingBackend {
                         max_length,
                         threads,
                         batch_size,
+                        sessions,
                         &query_prefix,
                         &document_prefix,
                     )
@@ -197,11 +203,16 @@ impl Embedder for DeterministicEmbedder {
 
 #[derive(Clone)]
 pub struct LocalFastEmbedder {
-    model: Arc<Mutex<TextEmbedding>>,
+    pool: Arc<EmbeddingPool>,
     profile: String,
     batch_size: usize,
     query_prefix: String,
     document_prefix: String,
+}
+
+struct EmbeddingPool {
+    models: Vec<Mutex<TextEmbedding>>,
+    next: AtomicUsize,
 }
 
 impl fmt::Debug for LocalFastEmbedder {
@@ -210,6 +221,7 @@ impl fmt::Debug for LocalFastEmbedder {
             .debug_struct("LocalFastEmbedder")
             .field("profile", &self.profile)
             .field("batch_size", &self.batch_size)
+            .field("sessions", &self.pool.models.len())
             .finish_non_exhaustive()
     }
 }
@@ -227,6 +239,7 @@ impl LocalFastEmbedder {
         max_length: usize,
         threads: Option<usize>,
         batch_size: usize,
+        sessions: usize,
         query_prefix: &str,
         document_prefix: &str,
     ) -> Result<Self> {
@@ -237,9 +250,10 @@ impl LocalFastEmbedder {
             ));
         }
         validate_local_resource_budget(max_length, batch_size, allow_high_memory)?;
-        if threads == Some(0) {
+        if threads == Some(0) || !(1..=16).contains(&sessions) {
             return Err(CceError::Configuration(
-                "local embedding thread count must be positive".to_owned(),
+                "local embedding thread count must be positive and sessions must be 1..=16"
+                    .to_owned(),
             ));
         }
         initialize_onnx_runtime(runtime_library)?;
@@ -310,11 +324,21 @@ impl LocalFastEmbedder {
         if let Some(threads) = threads {
             options = options.with_intra_threads(threads);
         }
-        let model = TextEmbedding::try_new_from_user_defined(user_model, options)
-            .map_err(|error| CceError::Provider(format!("failed to load local model: {error}")))?;
+        let models = (0..sessions)
+            .map(|_| {
+                TextEmbedding::try_new_from_user_defined(user_model.clone(), options.clone())
+                    .map(Mutex::new)
+                    .map_err(|error| {
+                        CceError::Provider(format!("failed to load local model: {error}"))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let artifact_digest = digest.finalize().to_hex();
         Ok(Self {
-            model: Arc::new(Mutex::new(model)),
+            pool: Arc::new(EmbeddingPool {
+                models,
+                next: AtomicUsize::new(0),
+            }),
             profile: format!(
                 "local-fastembed:{}@{}:{}:max{}:q{}:d{}",
                 model_info.model_code,
@@ -335,10 +359,11 @@ impl LocalFastEmbedder {
             .iter()
             .map(|input| format!("{prefix}{input}"))
             .collect::<Vec<_>>();
-        let model = Arc::clone(&self.model);
+        let pool = Arc::clone(&self.pool);
         let batch_size = self.batch_size;
         tokio::task::spawn_blocking(move || {
-            let mut model = model.lock().map_err(|_| {
+            let index = pool.next.fetch_add(1, Ordering::Relaxed) % pool.models.len();
+            let mut model = pool.models[index].lock().map_err(|_| {
                 CceError::Provider("local embedding model lock poisoned".to_owned())
             })?;
             model

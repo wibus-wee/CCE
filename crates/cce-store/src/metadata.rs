@@ -610,6 +610,28 @@ impl MetadataStore {
         if query.is_empty() {
             return Ok(Vec::new());
         }
+        self.lexical_search_fts(snapshot_id, &query, limit)
+    }
+
+    pub fn lexical_path_search(
+        &self,
+        snapshot_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<LexicalHit>> {
+        let query = fts_query(query);
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.lexical_search_fts(snapshot_id, &format!("path : ({query})"), limit)
+    }
+
+    fn lexical_search_fts(
+        &self,
+        snapshot_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<LexicalHit>> {
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(
@@ -1101,7 +1123,14 @@ fn fts_query(query: &str) -> String {
         .filter(|term| !term.is_empty())
         .filter(|term| !is_query_stopword(term))
         .take(32)
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .flat_map(|term| {
+            let exact = format!("\"{}\"", term.replace('"', "\"\""));
+            if term.chars().count() >= 4 {
+                vec![exact.clone(), format!("{exact}*")]
+            } else {
+                vec![exact]
+            }
+        })
         .collect::<Vec<_>>()
         .join(" OR ")
 }
@@ -1192,11 +1221,11 @@ mod tests {
     fn fts_query_is_bounded_and_quoted() {
         assert_eq!(
             fts_query("resumeAttempt cursor"),
-            "\"resumeAttempt\" OR \"cursor\""
+            "\"resumeAttempt\" OR \"resumeAttempt\"* OR \"cursor\" OR \"cursor\"*"
         );
         assert_eq!(
             fts_query("Where is the snapshot freshness decided?"),
-            "\"snapshot\" OR \"freshness\" OR \"decided\""
+            "\"snapshot\" OR \"snapshot\"* OR \"freshness\" OR \"freshness\"* OR \"decided\" OR \"decided\"*"
         );
     }
 

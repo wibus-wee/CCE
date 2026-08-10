@@ -75,6 +75,12 @@ pub enum ScipBackendConfig {
         threads: Option<usize>,
         timeout_seconds: u64,
     },
+    Auto {
+        rust_analyzer: PathBuf,
+        typescript_indexer: PathBuf,
+        threads: Option<usize>,
+        timeout_seconds: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +94,7 @@ pub enum DataflowBackendConfig {
         export_executable: PathBuf,
         version: String,
         timeout_seconds: u64,
+        language: Option<String>,
     },
 }
 
@@ -97,6 +104,15 @@ impl DataflowBackendConfig {
         export_executable: impl Into<PathBuf>,
         timeout_seconds: u64,
     ) -> Result<Self> {
+        Self::joern_with_language(parse_executable, export_executable, timeout_seconds, None)
+    }
+
+    pub fn joern_with_language(
+        parse_executable: impl Into<PathBuf>,
+        export_executable: impl Into<PathBuf>,
+        timeout_seconds: u64,
+        language: Option<&str>,
+    ) -> Result<Self> {
         if !(30..=86_400).contains(&timeout_seconds) {
             return Err(CceError::Configuration(format!(
                 "Joern timeout must be 30..=86400 seconds, got {timeout_seconds}"
@@ -104,6 +120,22 @@ impl DataflowBackendConfig {
         }
         let parse_executable = resolve_executable(parse_executable.into())?;
         let export_executable = resolve_executable(export_executable.into())?;
+        let language = language
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                if value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                {
+                    Ok(value.to_ascii_uppercase())
+                } else {
+                    Err(CceError::Configuration(format!(
+                        "invalid Joern language {value:?}; expected an alphanumeric frontend name"
+                    )))
+                }
+            })
+            .transpose()?;
         let output = std::process::Command::new(&export_executable)
             .arg("--version")
             .output()
@@ -113,10 +145,17 @@ impl DataflowBackendConfig {
                     export_executable.display()
                 ))
             })?;
-        let reported_version = if output.status.success() && output.stdout.is_empty() {
-            String::from_utf8_lossy(&output.stderr).trim().to_owned()
-        } else if output.status.success() {
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        let reported_version = if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            [stdout, stderr]
+                .into_iter()
+                .find(|value| {
+                    !value.is_empty()
+                        && !value.to_ascii_lowercase().contains("unknown option")
+                        && !value.to_ascii_lowercase().starts_with("error:")
+                })
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -134,6 +173,7 @@ impl DataflowBackendConfig {
             export_executable,
             version,
             timeout_seconds,
+            language,
         })
     }
 
@@ -149,33 +189,41 @@ impl DataflowBackendConfig {
                 parse_executable,
                 export_executable,
                 version,
+                language,
                 ..
             } => format!(
-                "joern:{}:{}:{}",
+                "joern:{}:{}:{}:{}",
                 parse_executable.display(),
                 export_executable.display(),
-                short_hash(version)
+                short_hash(version),
+                language.as_deref().unwrap_or("auto")
             ),
         }
     }
 }
 
 impl ScipBackendConfig {
+    pub fn auto(
+        rust_analyzer: impl Into<PathBuf>,
+        typescript_indexer: impl Into<PathBuf>,
+        threads: Option<usize>,
+        timeout_seconds: u64,
+    ) -> Result<Self> {
+        validate_scip_limits(threads, timeout_seconds)?;
+        Ok(Self::Auto {
+            rust_analyzer: rust_analyzer.into(),
+            typescript_indexer: typescript_indexer.into(),
+            threads,
+            timeout_seconds,
+        })
+    }
+
     pub fn rust_analyzer(
         executable: impl Into<PathBuf>,
         threads: Option<usize>,
         timeout_seconds: u64,
     ) -> Result<Self> {
-        if threads == Some(0) {
-            return Err(CceError::Configuration(
-                "SCIP indexer thread count must be positive".to_owned(),
-            ));
-        }
-        if !(10..=86_400).contains(&timeout_seconds) {
-            return Err(CceError::Configuration(format!(
-                "SCIP indexer timeout must be 10..=86400 seconds, got {timeout_seconds}"
-            )));
-        }
+        validate_scip_limits(threads, timeout_seconds)?;
         let executable = resolve_executable(executable.into())?;
         let output = std::process::Command::new(&executable)
             .arg("--version")
@@ -232,8 +280,35 @@ impl ScipBackendConfig {
                 short_hash(version),
                 threads.map_or_else(|| "auto".to_owned(), |value| value.to_string())
             ),
+            Self::Auto {
+                rust_analyzer,
+                typescript_indexer,
+                threads,
+                ..
+            } => format!(
+                "auto:rust={}:{}:typescript={}:{}:threads{}",
+                rust_analyzer.display(),
+                executable_digest(rust_analyzer),
+                typescript_indexer.display(),
+                executable_digest(typescript_indexer),
+                threads.map_or_else(|| "auto".to_owned(), |value| value.to_string())
+            ),
         }
     }
+}
+
+fn validate_scip_limits(threads: Option<usize>, timeout_seconds: u64) -> Result<()> {
+    if threads == Some(0) {
+        return Err(CceError::Configuration(
+            "SCIP indexer thread count must be positive".to_owned(),
+        ));
+    }
+    if !(10..=86_400).contains(&timeout_seconds) {
+        return Err(CceError::Configuration(format!(
+            "SCIP indexer timeout must be 10..=86400 seconds, got {timeout_seconds}"
+        )));
+    }
+    Ok(())
 }
 
 impl Default for IndexOptions {
@@ -248,6 +323,7 @@ impl Default for IndexOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // One engine-owned serving config; boxing fields obscures CLI wiring.
 pub enum DenseBackendConfig {
     Disabled,
     DeterministicBaseline {
@@ -264,6 +340,7 @@ pub enum DenseBackendConfig {
         max_length: usize,
         threads: Option<usize>,
         batch_size: usize,
+        sessions: usize,
         query_prefix: String,
         document_prefix: String,
     },
@@ -399,6 +476,20 @@ fn file_digest(path: &Path) -> Option<String> {
     std::fs::read(path)
         .ok()
         .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn executable_digest(path: &Path) -> String {
+    if path.components().count() == 1 {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+            .map(|directory| directory.join(path))
+            .find(|candidate| candidate.is_file())
+            .and_then(|candidate| file_digest(&candidate))
+            .unwrap_or_else(|| "unavailable".to_owned())
+    } else {
+        file_digest(path).unwrap_or_else(|| "unavailable".to_owned())
+    }
 }
 
 fn resolve_executable(path: PathBuf) -> Result<PathBuf> {

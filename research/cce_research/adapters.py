@@ -28,9 +28,15 @@ class Adapter:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError(f"{path}: adapter must be an object")
+        command = [str(item) for item in raw["command"]]
+        executable = Path(command[0])
+        if not executable.is_absolute():
+            workspace_executable = (Path.cwd() / executable).resolve()
+            if workspace_executable.is_file():
+                command[0] = str(workspace_executable)
         return cls(
             name=str(raw["name"]),
-            command=[str(item) for item in raw["command"]],
+            command=command,
             timeout_seconds=int(raw.get("timeout_seconds", 120)),
             environment={str(key): str(value) for key, value in raw.get("environment", {}).items()},
             model_identity=str(raw.get("model_identity", "none")),
@@ -46,7 +52,8 @@ class Adapter:
         }
         command = [part.format_map(variables) for part in self.command]
         environment = os.environ.copy()
-        environment.update(self.environment)
+        for key, value in self.environment.items():
+            environment.setdefault(key, value)
         started = time.perf_counter()
         completed = subprocess.run(
             command,

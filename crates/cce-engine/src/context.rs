@@ -71,6 +71,11 @@ impl ContextPacker {
         let mut seen_entities = HashSet::new();
         let mut seen_ranges = HashSet::new();
         let mut ranges_per_file = HashMap::<String, usize>::new();
+        let maximum_ranges_per_file = if search.plan.intent == QueryIntent::PreciseDataflow {
+            12
+        } else {
+            4
+        };
         for hit in &search.hits {
             let range_key = hit.address.as_ref().map(|address| {
                 (
@@ -88,7 +93,7 @@ impl ContextPacker {
             }
             if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
                 let count = ranges_per_file.entry(path.clone()).or_default();
-                if *count >= 4 {
+                if *count >= maximum_ranges_per_file {
                     continue;
                 }
                 *count += 1;

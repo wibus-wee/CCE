@@ -40,6 +40,13 @@ struct Arguments {
     embedding_threads: Option<usize>,
     #[arg(long, global = true, default_value_t = 4)]
     embedding_batch_size: usize,
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_EMBEDDING_SESSIONS",
+        default_value_t = 1
+    )]
+    embedding_sessions: usize,
     #[arg(long, global = true)]
     embedding_query_prefix: Option<String>,
     #[arg(long, global = true)]
@@ -97,6 +104,13 @@ struct Arguments {
         default_value = "rust-analyzer"
     )]
     rust_analyzer: PathBuf,
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_SCIP_TYPESCRIPT",
+        default_value = "scip-typescript"
+    )]
+    scip_typescript: PathBuf,
     #[arg(long, global = true)]
     scip_threads: Option<usize>,
     #[arg(long, global = true, default_value_t = 900)]
@@ -124,6 +138,8 @@ struct Arguments {
         default_value = "joern-export"
     )]
     joern_export: PathBuf,
+    #[arg(long, global = true, env = "CCE_JOERN_LANGUAGE")]
+    joern_language: Option<String>,
     #[arg(
         long,
         global = true,
@@ -340,6 +356,7 @@ fn engine(arguments: &Arguments, repository: &PathBuf) -> anyhow::Result<CceEngi
                 max_length: arguments.embedding_max_length,
                 threads: arguments.embedding_threads,
                 batch_size: arguments.embedding_batch_size,
+                sessions: arguments.embedding_sessions,
                 query_prefix: arguments.embedding_query_prefix.clone().unwrap_or_else(|| {
                     preset.map_or_else(String::new, |value| value.query_prefix.to_owned())
                 }),
@@ -390,8 +407,9 @@ fn engine(arguments: &Arguments, repository: &PathBuf) -> anyhow::Result<CceEngi
         }
     };
     config.scip = if arguments.scip_auto {
-        ScipBackendConfig::rust_analyzer(
+        ScipBackendConfig::auto(
             &arguments.rust_analyzer,
+            &arguments.scip_typescript,
             arguments.scip_threads,
             arguments.scip_timeout_seconds,
         )?
@@ -401,10 +419,11 @@ fn engine(arguments: &Arguments, repository: &PathBuf) -> anyhow::Result<CceEngi
         ScipBackendConfig::Disabled
     };
     config.dataflow = if arguments.dataflow_joern {
-        DataflowBackendConfig::joern(
+        DataflowBackendConfig::joern_with_language(
             &arguments.joern_parse,
             &arguments.joern_export,
             arguments.joern_timeout_seconds,
+            arguments.joern_language.as_deref(),
         )?
     } else {
         arguments

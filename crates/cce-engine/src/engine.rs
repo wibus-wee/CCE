@@ -644,7 +644,13 @@ impl CceEngine {
                 records.relations.extend(import.relations);
                 let complete = import.trusted_snapshot
                     && import.matched_documents >= parse_candidates
-                    && import.skipped_occurrences == 0;
+                    && import.skipped_occurrences == 0
+                    && import.failures.is_empty();
+                let provider_failures = if import.failures.is_empty() {
+                    String::new()
+                } else {
+                    format!("; provider failures: {}", import.failures.join("; "))
+                };
                 let mut graph_status = status(
                     &scanned.snapshot,
                     if complete {
@@ -674,18 +680,24 @@ impl CceEngine {
                                 "artifact_unattested".to_owned()
                             },
                             reason: Some(format!(
-                                "{}: {}/{} documents matched, {} definitions, {} references, {} skipped occurrences",
+                                "{}: {}/{} documents matched, {} definitions, {} references, {} skipped occurrences{}",
                                 import.tool,
                                 import.matched_documents,
                                 import.documents,
                                 import.definitions,
                                 import.references,
-                                import.skipped_occurrences
+                                import.skipped_occurrences,
+                                provider_failures
                             )),
                         },
                     ],
                     (!complete).then(|| {
-                        if import.trusted_snapshot {
+                        if !import.failures.is_empty() {
+                            format!(
+                                "Some SCIP providers failed while successful compiler graphs were retained: {}",
+                                import.failures.join("; ")
+                            )
+                        } else if import.trusted_snapshot {
                             format!(
                                 "SCIP precisely covers {} of {} parsed code files; uncovered languages retain syntax-only graph facts",
                                 import.matched_documents, parse_candidates
@@ -806,6 +818,7 @@ impl CceEngine {
             return Err(CceError::Cancelled);
         }
 
+        deduplicate_relations(&mut records.relations)?;
         self.store.commit_snapshot(&scanned.snapshot, &records)?;
         let syntax_coverage = if parse_candidates == 0 {
             1.0
@@ -1192,6 +1205,61 @@ fn document_id(entity_id: &str, representation: &str, start: usize, end: usize) 
 
 fn relation_id(source: &str, target: &str, kind: &str) -> String {
     digest_id("rel", &[source, target, kind])
+}
+
+fn deduplicate_relations(relations: &mut Vec<Relation>) -> Result<()> {
+    let mut merged = HashMap::<String, Relation>::with_capacity(relations.len());
+    for mut relation in relations.drain(..) {
+        match merged.entry(relation.id.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(relation);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if existing.source_entity_id != relation.source_entity_id
+                    || existing.target_entity_id != relation.target_entity_id
+                    || existing.kind != relation.kind
+                {
+                    return Err(CceError::ArtifactCorrupt(format!(
+                        "relation id {} identifies conflicting graph edges",
+                        relation.id
+                    )));
+                }
+                existing.confidence = existing.confidence.max(relation.confidence);
+                merge_source_evidence(&mut existing.evidence, &relation.evidence, 32);
+                if existing.extractor != relation.extractor {
+                    let mut extractors = existing
+                        .extractor
+                        .split('+')
+                        .chain(relation.extractor.split('+'))
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    extractors.sort();
+                    extractors.dedup();
+                    existing.extractor = extractors.join("+");
+                }
+                existing.attributes.append(&mut relation.attributes);
+            }
+        }
+    }
+    *relations = merged.into_values().collect();
+    relations.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(())
+}
+
+fn merge_source_evidence(
+    target: &mut Vec<SourceAddress>,
+    incoming: &[SourceAddress],
+    maximum: usize,
+) {
+    for address in incoming {
+        if target.len() >= maximum {
+            break;
+        }
+        if !target.contains(address) {
+            target.push(address.clone());
+        }
+    }
 }
 
 fn digest_id(prefix: &str, components: &[&str]) -> String {
@@ -1660,5 +1728,31 @@ mod tests {
 
         working.workspace_overlay_hash = "changed".to_owned();
         assert!(!source_identity_matches(&indexed, &working));
+    }
+
+    #[test]
+    fn duplicate_relation_ids_are_merged_before_sqlite_commit() {
+        let relation = Relation {
+            id: "rel_duplicate".to_owned(),
+            source_entity_id: "source".to_owned(),
+            target_entity_id: "target".to_owned(),
+            kind: RelationKind::Imports,
+            origin: RelationOrigin::FrameworkRule,
+            confidence: 0.8,
+            snapshot_id: "snapshot".to_owned(),
+            extractor: "one".to_owned(),
+            evidence: Vec::new(),
+            attributes: serde_json::Map::new(),
+        };
+        let mut duplicate = relation.clone();
+        duplicate.confidence = 1.0;
+        duplicate.extractor = "two".to_owned();
+        let mut relations = vec![relation, duplicate];
+
+        deduplicate_relations(&mut relations).expect("deduplicate relations");
+
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].confidence, 1.0);
+        assert_eq!(relations[0].extractor, "one+two");
     }
 }

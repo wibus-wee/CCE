@@ -106,7 +106,24 @@ def reciprocal_rank(case: BenchmarkCase, retrieved: list[RetrievedRange]) -> flo
 
 
 def ndcg(case: BenchmarkCase, retrieved: list[RetrievedRange]) -> float:
-    gains = [float(relevant(case, candidate)) for candidate in retrieved]
+    gains: list[float] = []
+    seen_gold: set[str | int] = set()
+    for candidate in retrieved:
+        matched: str | int | None = None
+        if case.gold_ranges:
+            matched = next(
+                (
+                    index
+                    for index, gold in enumerate(case.gold_ranges)
+                    if index not in seen_gold and overlaps(gold, candidate)
+                ),
+                None,
+            )
+        elif candidate.path in case.gold_files and candidate.path not in seen_gold:
+            matched = candidate.path
+        gains.append(float(matched is not None))
+        if matched is not None:
+            seen_gold.add(matched)
     dcg = sum(gain / math.log2(index + 2) for index, gain in enumerate(gains))
     gold_items = len(case.gold_ranges) if case.gold_ranges else len(set(case.gold_files))
     ideal_relevant = min(gold_items, len(retrieved))
