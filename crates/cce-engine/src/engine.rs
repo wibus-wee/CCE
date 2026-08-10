@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use cce_core::{
     Capability, CceError, CodeEntity, EntityKind, Relation, RelationKind, RelationOrigin, Result,
@@ -11,10 +14,11 @@ use cce_store::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
-    DenseBackendConfig, DenseIndex, Embedder, EmbeddingBackend, EngineConfig, RepositoryScanner,
-    ScannedFile, SourceParser,
+    DenseBackendConfig, DenseIndex, Embedder, EmbeddingBackend, EngineConfig, LocalReranker,
+    RepositoryScanner, RerankerBackendConfig, ScannedFile, SourceParser,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,6 +30,7 @@ pub struct IndexReport {
     pub indexed_files: usize,
     pub parsed_files: usize,
     pub reused_file_analyses: usize,
+    pub reused_embeddings: usize,
     pub source_units: usize,
     pub relations: usize,
     pub retrieval_documents: usize,
@@ -34,11 +39,22 @@ pub struct IndexReport {
     pub manifest: ViewManifest,
 }
 
+#[derive(Debug)]
+struct CachedDenseIndex {
+    digest: String,
+    index: Arc<DenseIndex>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CceEngine {
     config: EngineConfig,
     store: MetadataStore,
     parser: SourceParser,
+    embedder: Arc<OnceLock<EmbeddingBackend>>,
+    embedder_init: Arc<AsyncMutex<()>>,
+    reranker: Arc<OnceLock<LocalReranker>>,
+    reranker_init: Arc<AsyncMutex<()>>,
+    dense_index: Arc<Mutex<Option<CachedDenseIndex>>>,
 }
 
 impl CceEngine {
@@ -48,6 +64,11 @@ impl CceEngine {
             config,
             store,
             parser: SourceParser::new(),
+            embedder: Arc::new(OnceLock::new()),
+            embedder_init: Arc::new(AsyncMutex::new(())),
+            reranker: Arc::new(OnceLock::new()),
+            reranker_init: Arc::new(AsyncMutex::new(())),
+            dense_index: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -61,6 +82,85 @@ impl CceEngine {
         &self.config
     }
 
+    pub(crate) async fn embedding_backend(&self) -> Result<Option<&EmbeddingBackend>> {
+        if matches!(&self.config.dense, DenseBackendConfig::Disabled) {
+            return Ok(None);
+        }
+        if let Some(embedder) = self.embedder.get() {
+            return Ok(Some(embedder));
+        }
+        let _initialization = self.embedder_init.lock().await;
+        if let Some(embedder) = self.embedder.get() {
+            return Ok(Some(embedder));
+        }
+        let embedder = EmbeddingBackend::from_config(&self.config.dense)
+            .await?
+            .ok_or_else(|| {
+                CceError::Configuration(
+                    "dense backend configuration produced no embedder".to_owned(),
+                )
+            })?;
+        let _ = self.embedder.set(embedder);
+        Ok(self.embedder.get())
+    }
+
+    pub(crate) async fn reranker_backend(&self) -> Result<Option<&LocalReranker>> {
+        let RerankerBackendConfig::LocalFastEmbed {
+            model,
+            revision,
+            model_directory,
+            cache_dir,
+            runtime_library,
+            allow_download,
+            max_length,
+            threads,
+            batch_size,
+            sessions,
+        } = &self.config.reranker
+        else {
+            return Ok(None);
+        };
+        if let Some(reranker) = self.reranker.get() {
+            return Ok(Some(reranker));
+        }
+        let _initialization = self.reranker_init.lock().await;
+        if let Some(reranker) = self.reranker.get() {
+            return Ok(Some(reranker));
+        }
+        let model = model.clone();
+        let revision = revision.clone();
+        let model_directory = model_directory.clone();
+        let cache_dir = cache_dir.clone();
+        let runtime_library = runtime_library.clone();
+        let allow_download = *allow_download;
+        let max_length = *max_length;
+        let threads = *threads;
+        let batch_size = *batch_size;
+        let sessions = *sessions;
+        let reranker = tokio::task::spawn_blocking(move || {
+            LocalReranker::new(
+                &model,
+                &revision,
+                model_directory.as_deref(),
+                &cache_dir,
+                &runtime_library,
+                allow_download,
+                max_length,
+                threads,
+                batch_size,
+                sessions,
+            )
+        })
+        .await
+        .map_err(|error| {
+            CceError::Provider(format!(
+                "local reranker initialization task failed: {error}"
+            ))
+        })??;
+        let _ = self.reranker.set(reranker);
+        Ok(self.reranker.get())
+    }
+
     pub fn status(&self) -> Result<ViewManifest> {
         let scanned = RepositoryScanner::new(self.config.clone()).scan()?;
         let current = self
@@ -70,8 +170,15 @@ impl CceEngine {
                 view: "manifest".to_owned(),
                 reason: "repository has not been indexed".to_owned(),
             })?;
+        let indexed =
+            self.store
+                .snapshot_identity(&current)?
+                .ok_or_else(|| CceError::ViewUnavailable {
+                    view: "manifest".to_owned(),
+                    reason: format!("current snapshot {current} is incomplete or missing"),
+                })?;
         let mut manifest = self.store.view_manifest(&scanned.identity.id, &current)?;
-        if current != scanned.snapshot.id {
+        if !source_identity_matches(&indexed, &scanned.snapshot) {
             for view in manifest.views.values_mut() {
                 if !matches!(view.state, ViewState::Unavailable | ViewState::Failed) {
                     view.state = ViewState::Stale;
@@ -89,6 +196,39 @@ impl CceEngine {
         self.store.health()
     }
 
+    pub(crate) async fn snapshot_for_query(
+        &self,
+        require_fresh: bool,
+    ) -> Result<(String, SnapshotIdentity, ViewManifest, bool)> {
+        let scanned = RepositoryScanner::new(self.config.clone()).scan()?;
+        if let Some(current_id) = self.store.current_snapshot(&scanned.identity.id)?
+            && let Some(current) = self.store.snapshot_identity(&current_id)?
+        {
+            let manifest = self
+                .store
+                .view_manifest(&scanned.identity.id, &current.id)?;
+            let fresh = source_identity_matches(&current, &scanned.snapshot);
+            if fresh || !require_fresh {
+                return Ok((scanned.identity.id, current, manifest, fresh));
+            }
+            return Err(CceError::ViewUnavailable {
+                view: "snapshot".to_owned(),
+                reason: format!(
+                    "indexed snapshot {} differs from working source {}; run `cce index` with the intended compiler/dataflow profile before querying",
+                    current.id, scanned.snapshot.id
+                ),
+            });
+        }
+
+        let indexed = self.index().await?;
+        Ok((
+            indexed.repository_id,
+            indexed.snapshot,
+            indexed.manifest,
+            true,
+        ))
+    }
+
     pub async fn index(&self) -> Result<IndexReport> {
         let _lease = crate::lock::IndexLease::acquire(&self.config.data_root)?;
         let scanned = RepositoryScanner::new(self.config.clone()).scan()?;
@@ -104,6 +244,7 @@ impl CceEngine {
                 indexed_files: scanned.files.len(),
                 parsed_files: 0,
                 reused_file_analyses: scanned.files.len(),
+                reused_embeddings: 0,
                 source_units: 0,
                 relations: 0,
                 retrieval_documents: 0,
@@ -112,6 +253,20 @@ impl CceEngine {
                 manifest,
             });
         }
+
+        let previous_dense_digest = if let Some(snapshot_id) = self
+            .store
+            .current_snapshot(&scanned.identity.id)?
+            .filter(|snapshot_id| snapshot_id != &scanned.snapshot.id)
+        {
+            self.store
+                .view_manifest(&scanned.identity.id, &snapshot_id)?
+                .views
+                .get(&ViewKind::Dense)
+                .and_then(|status| status.artifact_digest.clone())
+        } else {
+            None
+        };
 
         self.store.begin_snapshot(&scanned.snapshot)?;
         for kind in [
@@ -148,6 +303,7 @@ impl CceEngine {
         let mut parsed_files = 0_usize;
         let mut parse_candidates = 0_usize;
         let mut reused_file_analyses = 0_usize;
+        let mut reused_embeddings = 0_usize;
         let mut source_units = 0_usize;
         let mut file_entities = HashMap::new();
         let mut parsed_by_path = HashMap::new();
@@ -417,28 +573,35 @@ impl CceEngine {
                 );
                 history_status.artifact_digest = Some(artifact.digest.clone());
                 records.artifacts.push(artifact.clone());
-                records.documents.push(IndexedDocument {
-                    document: RetrievalDocument {
-                        id: document_id(
-                            &repository_entity_id,
-                            "commit_summary",
-                            0,
-                            summary.body.len(),
-                        ),
-                        entity_id: repository_entity_id.clone(),
-                        snapshot_id: scanned.snapshot.id.clone(),
-                        representation: RetrievalRepresentation::CommitSummary,
-                        body_artifact_digest: artifact.digest,
-                        address: None,
-                        embedding_profile: None,
-                        generated_by: Some("cce-gitoxide-history-v1".to_owned()),
-                        evidence: Vec::new(),
-                        terms: lexical_terms(&summary.body),
-                    },
-                    path: ".git".to_owned(),
-                    name: "commit history".to_owned(),
-                    body: summary.body,
-                });
+                for commit in summary.commits {
+                    let commit_artifact = self
+                        .store
+                        .artifacts()
+                        .put_bytes(ArtifactKind::Knowledge, commit.body.as_bytes())?;
+                    records.artifacts.push(commit_artifact.clone());
+                    records.documents.push(IndexedDocument {
+                        document: RetrievalDocument {
+                            id: document_id(
+                                &repository_entity_id,
+                                &format!("commit_summary:{}", commit.id),
+                                0,
+                                commit.body.len(),
+                            ),
+                            entity_id: repository_entity_id.clone(),
+                            snapshot_id: scanned.snapshot.id.clone(),
+                            representation: RetrievalRepresentation::CommitSummary,
+                            body_artifact_digest: commit_artifact.digest,
+                            address: None,
+                            embedding_profile: None,
+                            generated_by: Some("cce-gitoxide-history-v2".to_owned()),
+                            evidence: Vec::new(),
+                            terms: lexical_terms(&commit.body),
+                        },
+                        path: format!(".git/commits/{}", commit.id),
+                        name: commit.subject,
+                        body: commit.body,
+                    });
+                }
                 history_status
             }
             Ok(None) => status(
@@ -454,6 +617,194 @@ impl CceEngine {
                 Some(format!("gitoxide could not read commit history: {error}")),
             ),
         };
+
+        let graph_view_status = match crate::scip_graph::build(
+            &self.config.scip,
+            &self.config.repository_root,
+            &self.config.data_root,
+            &scanned,
+            &records.entities,
+        )
+        .await
+        {
+            Ok(Some(import)) => {
+                if import.trusted_snapshot {
+                    let verified = RepositoryScanner::new(self.config.clone()).scan()?;
+                    if verified.snapshot.id != scanned.snapshot.id {
+                        return Err(CceError::Cancelled);
+                    }
+                }
+                let artifact = self
+                    .store
+                    .artifacts()
+                    .put_bytes(ArtifactKind::Other, &import.bytes)?;
+                let artifact_digest = artifact.digest.clone();
+                records.artifacts.push(artifact);
+                records.entities.extend(import.entities);
+                records.relations.extend(import.relations);
+                let complete = import.trusted_snapshot
+                    && import.matched_documents >= parse_candidates
+                    && import.skipped_occurrences == 0;
+                let mut graph_status = status(
+                    &scanned.snapshot,
+                    if complete {
+                        ViewState::Ready
+                    } else {
+                        ViewState::Partial
+                    },
+                    vec![
+                        Capability {
+                            name: "contains".to_owned(),
+                            level: "syntax_fact".to_owned(),
+                            reason: None,
+                        },
+                        Capability {
+                            name: "relative_imports".to_owned(),
+                            level: "framework_derived".to_owned(),
+                            reason: Some(
+                                "relative imports supplement compiler-resolved SCIP edges"
+                                    .to_owned(),
+                            ),
+                        },
+                        Capability {
+                            name: "scip_precise_references".to_owned(),
+                            level: if import.trusted_snapshot {
+                                "compiler_generated".to_owned()
+                            } else {
+                                "artifact_unattested".to_owned()
+                            },
+                            reason: Some(format!(
+                                "{}: {}/{} documents matched, {} definitions, {} references, {} skipped occurrences",
+                                import.tool,
+                                import.matched_documents,
+                                import.documents,
+                                import.definitions,
+                                import.references,
+                                import.skipped_occurrences
+                            )),
+                        },
+                    ],
+                    (!complete).then(|| {
+                        if import.trusted_snapshot {
+                            format!(
+                                "SCIP precisely covers {} of {} parsed code files; uncovered languages retain syntax-only graph facts",
+                                import.matched_documents, parse_candidates
+                            )
+                        } else {
+                            "Supplied SCIP artifact is digest-verified but was not generated inside this snapshot transaction"
+                                .to_owned()
+                        }
+                    }),
+                );
+                graph_status.artifact_digest = Some(artifact_digest);
+                graph_status
+            }
+            Ok(None) => status(
+                &scanned.snapshot,
+                ViewState::Partial,
+                vec![
+                    Capability {
+                        name: "contains".to_owned(),
+                        level: "syntax_fact".to_owned(),
+                        reason: None,
+                    },
+                    Capability {
+                        name: "relative_imports".to_owned(),
+                        level: "framework_derived".to_owned(),
+                        reason: Some("relative imports only; no compiler resolution".to_owned()),
+                    },
+                ],
+                Some("Compiler/SCIP resolved references are not built".to_owned()),
+            ),
+            Err(error) => status(
+                &scanned.snapshot,
+                ViewState::Partial,
+                vec![
+                    Capability {
+                        name: "contains".to_owned(),
+                        level: "syntax_fact".to_owned(),
+                        reason: None,
+                    },
+                    Capability {
+                        name: "scip_precise_references".to_owned(),
+                        level: "failed".to_owned(),
+                        reason: Some(error.to_string()),
+                    },
+                ],
+                Some("SCIP import failed; syntax-only graph remains available".to_owned()),
+            ),
+        };
+
+        let dataflow_view_status = match crate::dataflow::build(
+            &self.config.dataflow,
+            &self.config.repository_root,
+            &self.config.data_root,
+            &scanned,
+            &records.entities,
+        )
+        .await
+        {
+            Ok(Some(import)) => {
+                let artifact = self
+                    .store
+                    .artifacts()
+                    .put_bytes(ArtifactKind::Other, &import.bytes)?;
+                let artifact_digest = artifact.digest.clone();
+                records.artifacts.push(artifact);
+                records.entities.extend(import.entities);
+                records.relations.extend(import.relations);
+                let complete = import.edges > 0 && import.skipped_edges == 0;
+                let mut view = status(
+                        &scanned.snapshot,
+                        if complete {
+                            ViewState::Ready
+                        } else {
+                            ViewState::Partial
+                        },
+                        vec![Capability {
+                            name: "precise_static_dataflow".to_owned(),
+                            level: if complete {
+                                "authoritative_artifact".to_owned()
+                            } else {
+                                "partial_source_aligned".to_owned()
+                            },
+                            reason: Some(format!(
+                                "{} supplied {} source-aligned nodes and {} evidence-backed edges; {} relevant edges were skipped because an endpoint lacked exact source alignment",
+                                import.generator,
+                                import.nodes,
+                                import.edges,
+                                import.skipped_edges
+                            )),
+                        }],
+                        (!complete).then(|| {
+                            "Static analysis completed with incomplete source alignment; precise queries report the partial capability instead of inferring missing edges".to_owned()
+                        }),
+                    );
+                view.artifact_digest = Some(artifact_digest);
+                view
+            }
+            Ok(None) => status(
+                &scanned.snapshot,
+                ViewState::Unavailable,
+                Vec::new(),
+                Some("No source-aligned static-analysis dataflow artifact was supplied".to_owned()),
+            ),
+            Err(error) => status(
+                &scanned.snapshot,
+                ViewState::Failed,
+                vec![Capability {
+                    name: "precise_static_dataflow".to_owned(),
+                    level: "rejected".to_owned(),
+                    reason: Some(error.to_string()),
+                }],
+                Some("Dataflow artifact failed strict snapshot/provenance validation".to_owned()),
+            ),
+        };
+
+        let verified = RepositoryScanner::new(self.config.clone()).scan()?;
+        if verified.snapshot.id != scanned.snapshot.id {
+            return Err(CceError::Cancelled);
+        }
 
         self.store.commit_snapshot(&scanned.snapshot, &records)?;
         let syntax_coverage = if parse_candidates == 0 {
@@ -518,25 +869,9 @@ impl CceEngine {
             &scanned.identity.id,
             &scanned.snapshot.id,
             ViewKind::Graph,
-            &status(
-                &scanned.snapshot,
-                ViewState::Partial,
-                vec![
-                    Capability {
-                        name: "contains".to_owned(),
-                        level: "syntax_fact".to_owned(),
-                        reason: None,
-                    },
-                    Capability {
-                        name: "relative_imports".to_owned(),
-                        level: "framework_derived".to_owned(),
-                        reason: Some("relative imports only; no compiler resolution".to_owned()),
-                    },
-                ],
-                Some("Compiler/SCIP resolved references are not built".to_owned()),
-            ),
+            &graph_view_status,
         )?;
-        if let Some(embedder) = EmbeddingBackend::from_config(&self.config.dense)? {
+        if let Some(embedder) = self.embedding_backend().await? {
             self.store.set_view_status(
                 &scanned.identity.id,
                 &scanned.snapshot.id,
@@ -545,7 +880,7 @@ impl CceEngine {
                     &scanned.snapshot,
                     ViewState::Building,
                     vec![Capability {
-                        name: "flat_inner_product".to_owned(),
+                        name: "parallel_exact_inner_product".to_owned(),
                         level: "building".to_owned(),
                         reason: None,
                     }],
@@ -553,23 +888,36 @@ impl CceEngine {
                 ),
             )?;
             let batch_size = match &self.config.dense {
-                DenseBackendConfig::OpenAiCompatible { batch_size, .. } => *batch_size,
+                DenseBackendConfig::LocalFastEmbed { batch_size, .. } => *batch_size,
                 DenseBackendConfig::DeterministicBaseline { .. } => 64,
                 DenseBackendConfig::Disabled => 64,
             };
-            let dense_result: Result<ArtifactRecord> = async {
+            let dense_result: Result<(ArtifactRecord, DenseIndex, usize, usize)> = async {
                 let documents = self.store.documents_for_snapshot(&scanned.snapshot.id)?;
-                let index = DenseIndex::build(&documents, &embedder, batch_size).await?;
+                let previous = previous_dense_digest
+                    .as_deref()
+                    .map(|digest| DenseIndex::decode(&self.store.artifacts().read(digest)?))
+                    .transpose()?;
+                let (index, reused) = DenseIndex::build_incremental(
+                    &documents,
+                    embedder,
+                    batch_size,
+                    previous.as_ref(),
+                )
+                .await?;
                 let artifact = self
                     .store
                     .artifacts()
                     .put_bytes(ArtifactKind::VectorIndex, &index.encode()?)?;
                 self.store.register_artifact(&artifact)?;
-                Ok(artifact)
+                Ok((artifact, index, reused, documents.len()))
             }
             .await;
             match dense_result {
-                Ok(artifact) => {
+                Ok((artifact, index, reused, document_count)) => {
+                    reused_embeddings = reused;
+                    let dense_capability = index.capability_name().to_owned();
+                    self.cache_dense_index(&artifact.digest, index)?;
                     let mut dense_status = status(
                         &scanned.snapshot,
                         if embedder.production_ready() {
@@ -577,18 +925,27 @@ impl CceEngine {
                         } else {
                             ViewState::Partial
                         },
-                        vec![Capability {
-                            name: "flat_inner_product".to_owned(),
-                            level: if embedder.production_ready() {
-                                "production".to_owned()
-                            } else {
-                                "benchmark_only".to_owned()
+                        vec![
+                            Capability {
+                                name: dense_capability,
+                                level: if embedder.production_ready() {
+                                    "production".to_owned()
+                                } else {
+                                    "benchmark_only".to_owned()
+                                },
+                                reason: (!embedder.production_ready()).then(|| {
+                                    "deterministic hash embeddings are a reproducible baseline, not semantic production retrieval"
+                                        .to_owned()
+                                }),
                             },
-                            reason: (!embedder.production_ready()).then(|| {
-                                "deterministic hash embeddings are a reproducible baseline, not semantic production retrieval"
-                                    .to_owned()
-                            }),
-                        }],
+                            Capability {
+                                name: "incremental_embedding_reuse".to_owned(),
+                                level: "content_identity".to_owned(),
+                                reason: Some(format!(
+                                    "reused {reused} of {document_count} snapshot-aligned document vectors"
+                                )),
+                            },
+                        ],
                         None,
                     );
                     dense_status.artifact_digest = Some(artifact.digest);
@@ -662,15 +1019,7 @@ impl CceEngine {
             &scanned.identity.id,
             &scanned.snapshot.id,
             ViewKind::Dataflow,
-            &status(
-                &scanned.snapshot,
-                ViewState::Unavailable,
-                Vec::new(),
-                Some(
-                    "No evidence-backed SCIP or static-analysis dataflow artifact was supplied"
-                        .to_owned(),
-                ),
-            ),
+            &dataflow_view_status,
         )?;
         let manifest = self
             .store
@@ -682,6 +1031,7 @@ impl CceEngine {
             indexed_files: scanned.files.len(),
             parsed_files,
             reused_file_analyses,
+            reused_embeddings,
             source_units,
             relations: records.relations.len(),
             retrieval_documents: records.documents.len(),
@@ -689,6 +1039,40 @@ impl CceEngine {
             skipped_binary_files: scanned.skipped_binary_files,
             manifest,
         })
+    }
+
+    pub(crate) fn dense_index(&self, digest: &str) -> Result<Arc<DenseIndex>> {
+        {
+            let cached = self
+                .dense_index
+                .lock()
+                .map_err(|_| CceError::Storage("dense index cache lock poisoned".to_owned()))?;
+            if let Some(cached) = cached.as_ref()
+                && cached.digest == digest
+            {
+                return Ok(Arc::clone(&cached.index));
+            }
+        }
+        let index = DenseIndex::decode(&self.store.artifacts().read(digest)?)?;
+        self.cache_dense_index(digest, index)
+    }
+
+    fn cache_dense_index(&self, digest: &str, index: DenseIndex) -> Result<Arc<DenseIndex>> {
+        let mut cached = self
+            .dense_index
+            .lock()
+            .map_err(|_| CceError::Storage("dense index cache lock poisoned".to_owned()))?;
+        if let Some(cached) = cached.as_ref()
+            && cached.digest == digest
+        {
+            return Ok(Arc::clone(&cached.index));
+        }
+        let index = Arc::new(index);
+        *cached = Some(CachedDenseIndex {
+            digest: digest.to_owned(),
+            index: Arc::clone(&index),
+        });
+        Ok(index)
     }
 
     fn parse_with_cache(
@@ -741,6 +1125,12 @@ impl CceEngine {
             .put_bytes(ArtifactKind::Other, &serde_json::to_vec(&cache)?)?;
         Ok((parsed, artifact))
     }
+}
+
+fn source_identity_matches(indexed: &SnapshotIdentity, working: &SnapshotIdentity) -> bool {
+    indexed.repository_id == working.repository_id
+        && indexed.base_revision == working.base_revision
+        && indexed.workspace_overlay_hash == working.workspace_overlay_hash
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1249,5 +1639,26 @@ mod tests {
         let terms = lexical_terms("resumeAttempt workspace_overlay");
         assert!(terms.contains(&"resume".to_owned()));
         assert!(terms.contains(&"attempt".to_owned()));
+    }
+
+    #[test]
+    fn query_reuses_source_identical_snapshot_across_index_profiles() {
+        let indexed = SnapshotIdentity {
+            id: "indexed".to_owned(),
+            repository_id: "repo".to_owned(),
+            base_revision: Some("revision".to_owned()),
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "scip-enabled".to_owned(),
+            created_at: Utc::now(),
+            file_count: 1,
+            source_bytes: 10,
+        };
+        let mut working = indexed.clone();
+        working.id = "working".to_owned();
+        working.index_profile_hash = "query-only-profile".to_owned();
+        assert!(source_identity_matches(&indexed, &working));
+
+        working.workspace_overlay_hash = "changed".to_owned();
+        assert!(!source_identity_matches(&indexed, &working));
     }
 }

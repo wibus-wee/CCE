@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "status": "smoke_not_production_promotion",
+  "dataset": {
+    "trainRepository": "sqlite",
+    "trainQueries": 256,
+    "trainPairs": 2048,
+    "testRepository": "ripgrep",
+    "testQueries": 120,
+    "testPairs": 960,
+    "testDatasetSha256": "d20bd5f229286ea8dd33cc1121d170167cb0564a2c9efd91a64c18635daf9b7a",
+    "candidatesPerQuery": 8,
+    "candidatePolicy": "one positive plus seven same-repository mined hard negatives"
+  },
+  "base": {
+    "model": "jinaai/jina-reranker-v1-turbo-en",
+    "revision": "5bcd26bbe1913aff3cc1983d91f2c3ac9ee91cbf",
+    "recallAt1": 0.25,
+    "recallAt5": 0.95,
+    "recallAt10": 1.0,
+    "mrr": 0.4691071428571429,
+    "ndcgAt10": 0.5982805097365667,
+    "pairsPerSecond": 15.760344679001161,
+    "queryP50Ms": 416.054034998524,
+    "queryP95Ms": 941.3017750011932,
+    "peakMemoryBytes": 8040361984
+  },
+  "tuned": {
+    "recipe": "one CPU seed, one epoch, max sequence length 128, hard-negative BCE",
+    "onnxBundleRevision": "2a1b223e7c3cfde14256b2f9e139babaf00d0bcc4fdb8511d2e0523df2fe1c68",
+    "recallAt1": 0.39166666666666666,
+    "recallAt5": 0.9916666666666667,
+    "recallAt10": 1.0,
+    "mrr": 0.6007738095238095,
+    "ndcgAt10": 0.700497115361331,
+    "pairsPerSecond": 13.92662140491921,
+    "queryP50Ms": 503.6611310024455,
+    "queryP95Ms": 1123.4573379988433,
+    "peakMemoryBytes": 8055250944
+  },
+  "limitations": [
+    "Single seed and two repositories; not a production promotion.",
+    "Latency and peak RSS are PyTorch benchmark measurements, not the Rust ONNX serving profile.",
+    "The benchmark tests reranking over mined candidates, not end-to-end answer quality.",
+    "The five available change-localization cases had zero Recall@1 for both models."
+  ]
+}

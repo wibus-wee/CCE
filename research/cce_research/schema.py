@@ -16,6 +16,7 @@ Intent = Literal[
     "history",
     "precise_dataflow",
 ]
+DatasetSplit = Literal["train", "validation", "test"]
 
 
 class LineRange(BaseModel):
@@ -111,6 +112,83 @@ class ResultBundleManifest(BaseModel):
     python_version: str
     dependency_lock_sha256: dict[str, str]
     environment_keys: list[str]
+
+
+class CorpusRepository(BaseModel):
+    """A source repository frozen at an immutable revision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    url: str
+    revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+    split: DatasetSplit
+    license_spdx: str
+    languages: list[str] = Field(default_factory=list)
+    max_documents: int = Field(default=20_000, ge=1, le=2_000_000)
+    history_depth: int = Field(default=128, ge=1, le=10_000)
+
+
+class CorpusManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = 1
+    dataset_revision: str
+    repositories: list[CorpusRepository]
+
+    @model_validator(mode="after")
+    def repositories_are_unique(self) -> CorpusManifest:
+        names = [repository.name for repository in self.repositories]
+        if len(names) != len(set(names)):
+            raise ValueError("corpus repository names must be unique")
+        identities = [(repository.url, repository.revision) for repository in self.repositories]
+        if len(identities) != len(set(identities)):
+            raise ValueError("a pinned repository may appear in only one split")
+        return self
+
+
+class TrainingDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: str
+    repository: str
+    revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+    path: str
+    symbol: str
+    language: str | None = None
+    start_byte: int = Field(ge=0)
+    end_byte: int = Field(ge=0)
+    text: str
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def byte_range_is_ordered(self) -> TrainingDocument:
+        if self.end_byte <= self.start_byte:
+            raise ValueError("end_byte must be greater than start_byte")
+        return self
+
+
+class TrainingExample(BaseModel):
+    """One repository-local contrastive example with explicit hard negatives."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    example_id: str
+    dataset_revision: str
+    split: DatasetSplit
+    query: str
+    query_kind: Literal["documentation", "symbol_navigation", "change_localization"]
+    positive: TrainingDocument
+    negatives: list[TrainingDocument] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def repository_local_and_unique(self) -> TrainingExample:
+        if any(negative.repository != self.positive.repository for negative in self.negatives):
+            raise ValueError("hard negatives must come from the positive repository")
+        identifiers = [self.positive.document_id, *(item.document_id for item in self.negatives)]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("positive and negative document IDs must be distinct")
+        return self
 
 
 def load_jsonl[ModelT: BaseModel](path: Path, model: type[ModelT]) -> Iterator[ModelT]:

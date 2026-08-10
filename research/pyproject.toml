@@ -24,6 +24,7 @@ training = [
   "accelerate>=1.10,<2",
   "peft>=0.17,<1",
 ]
+onnx = ["sentence-transformers[onnx]>=5,<6"]
 
 [project.scripts]
 cce-research = "cce_research.cli:app"

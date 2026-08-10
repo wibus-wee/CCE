@@ -26,6 +26,9 @@ pub enum RelationKind {
     UsesHook,
     SerializesAs,
     PersistsTo,
+    DataFlowsTo,
+    TaintFlowsTo,
+    ControlFlowsTo,
     Semantic,
     Other(String),
 }
@@ -39,6 +42,7 @@ pub enum RelationOrigin {
     TreeSitter,
     BuildSystem,
     FrameworkRule,
+    StaticAnalysis,
     ModelInference,
 }
 

@@ -15,7 +15,17 @@ from rich.table import Table
 
 from .adapters import Adapter
 from .metrics import evaluate
+from .model_benchmark import benchmark_models
+from .reranker_benchmark import benchmark_rerankers
 from .schema import BenchmarkCase, CaseResult, ResultBundleManifest, load_jsonl
+from .train_reranker import (
+    RerankerTrainingRecipe,
+    export_reranker_onnx,
+    promote_reranker_bundle,
+    train_reranker,
+)
+from .train_retriever import TrainingRecipe, export_onnx, train_retriever
+from .training_data import build_training_dataset
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
@@ -114,6 +124,183 @@ def plot_recall(metrics_files: list[Path], output: Path) -> None:
     plt.legend()
     output.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output, bbox_inches="tight", dpi=180)
+
+
+@app.command("build-training-data")
+def build_training_data_command(
+    manifest: Path,
+    workspace: Path,
+    output: Path,
+    cce_binary: Path = Path("target/release/cce"),
+    hard_negatives: int = 7,
+) -> None:
+    summary = build_training_dataset(
+        manifest,
+        workspace,
+        output,
+        cce_binary,
+        hard_negatives,
+    )
+    console.print_json(json.dumps(asdict(summary)))
+
+
+@app.command("train-retriever")
+def train_retriever_command(
+    dataset: Path,
+    output: Path,
+    base_model: str,
+    base_revision: str,
+    code_revision: str | None = None,
+    query_prefix: str = "query: ",
+    document_prefix: str = "passage: ",
+    hard_negatives: int = 7,
+    epochs: float = 1.0,
+    batch_size: int = 8,
+    gradient_accumulation_steps: int = 4,
+    max_sequence_length: int = 512,
+    max_train_examples: int | None = None,
+    max_validation_examples: int | None = None,
+    trust_remote_code: bool = False,
+) -> None:
+    summary = train_retriever(
+        TrainingRecipe(
+            base_model=base_model,
+            base_revision=base_revision,
+            code_revision=code_revision,
+            dataset_directory=str(dataset),
+            output_directory=str(output),
+            query_prefix=query_prefix,
+            document_prefix=document_prefix,
+            same_repository_hard_negatives=hard_negatives,
+            epochs=epochs,
+            batch_size=batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            max_sequence_length=max_sequence_length,
+            max_train_examples=max_train_examples,
+            max_validation_examples=max_validation_examples,
+            trust_remote_code=trust_remote_code,
+        )
+    )
+    console.print_json(json.dumps(asdict(summary)))
+
+
+@app.command("export-onnx")
+def export_onnx_command(
+    model: Path,
+    output: Path,
+    optimization: str = "O3",
+    quantization: str | None = None,
+) -> None:
+    exported = export_onnx(model, output, optimization, quantization)
+    console.print(str(exported))
+
+
+@app.command("benchmark-models")
+def benchmark_models_command(
+    dataset: Path,
+    models: Path,
+    output: Path,
+    batch_size: int = 16,
+    limit: int | None = None,
+) -> None:
+    measurements = benchmark_models(dataset, models, output, batch_size, limit)
+    table = Table("Model", "R@1", "R@5", "MRR", "nDCG@10", "doc/s", "query p95 ms")
+    for measurement in measurements:
+        table.add_row(
+            measurement.model,
+            f"{measurement.recall_at_1:.4f}",
+            f"{measurement.recall_at_5:.4f}",
+            f"{measurement.mrr:.4f}",
+            f"{measurement.ndcg_at_10:.4f}",
+            f"{measurement.documents_per_second:.1f}",
+            f"{measurement.single_query_p95_ms:.1f}",
+        )
+    console.print(table)
+
+
+@app.command("train-reranker")
+def train_reranker_command(
+    dataset: Path,
+    output: Path,
+    base_model: str,
+    base_revision: str,
+    code_revision: str | None = None,
+    hard_negatives: int = 7,
+    epochs: float = 1.0,
+    batch_size: int = 8,
+    gradient_accumulation_steps: int = 4,
+    max_sequence_length: int = 512,
+    max_train_examples: int | None = None,
+    max_validation_examples: int | None = None,
+    trust_remote_code: bool = False,
+) -> None:
+    summary = train_reranker(
+        RerankerTrainingRecipe(
+            base_model=base_model,
+            base_revision=base_revision,
+            dataset_directory=str(dataset),
+            output_directory=str(output),
+            code_revision=code_revision,
+            hard_negatives=hard_negatives,
+            epochs=epochs,
+            batch_size=batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            max_sequence_length=max_sequence_length,
+            max_train_examples=max_train_examples,
+            max_validation_examples=max_validation_examples,
+            trust_remote_code=trust_remote_code,
+        )
+    )
+    console.print_json(json.dumps(asdict(summary)))
+
+
+@app.command("export-reranker-onnx")
+def export_reranker_onnx_command(
+    model: Path,
+    output: Path,
+    runtime_model: str,
+    source_revision: str,
+    max_sequence_length: int = 512,
+) -> None:
+    summary = export_reranker_onnx(
+        model, output, runtime_model, source_revision, max_sequence_length
+    )
+    console.print_json(json.dumps(asdict(summary)))
+
+
+@app.command("promote-reranker-bundle")
+def promote_reranker_bundle_command(
+    source: Path,
+    output: Path,
+    runtime_model: str,
+    source_revision: str,
+) -> None:
+    summary = promote_reranker_bundle(source, output, runtime_model, source_revision)
+    console.print_json(json.dumps(asdict(summary)))
+
+
+@app.command("benchmark-rerankers")
+def benchmark_rerankers_command(
+    dataset: Path,
+    models: Path,
+    output: Path,
+    batch_size: int = 8,
+    candidates: int = 16,
+    limit: int | None = None,
+) -> None:
+    measurements = benchmark_rerankers(dataset, models, output, batch_size, candidates, limit)
+    table = Table("Model", "R@1", "R@5", "MRR", "nDCG@10", "pairs/s", "query p95 ms")
+    for measurement in measurements:
+        table.add_row(
+            measurement.model,
+            f"{measurement.recall_at_1:.4f}",
+            f"{measurement.recall_at_5:.4f}",
+            f"{measurement.mrr:.4f}",
+            f"{measurement.ndcg_at_10:.4f}",
+            f"{measurement.pairs_per_second:.1f}",
+            f"{measurement.query_p95_ms:.1f}",
+        )
+    console.print(table)
 
 
 def sha256(path: Path) -> str:

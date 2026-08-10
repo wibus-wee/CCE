@@ -83,6 +83,8 @@ fn unparsed() -> ParsedFile {
 fn language(name: &str) -> Option<Language> {
     match name {
         "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
+        "c" => Some(tree_sitter_c::LANGUAGE.into()),
+        "cpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
         "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
@@ -143,7 +145,7 @@ fn assign_parents(units: &mut [ParsedUnit]) {
 fn node_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     let candidate = node.child_by_field_name("name").or_else(|| {
         node.child_by_field_name("declarator")
-            .and_then(|value| value.child_by_field_name("name"))
+            .and_then(declarator_name)
     })?;
     candidate
         .utf8_text(source)
@@ -151,6 +153,28 @@ fn node_name(node: Node<'_>, source: &[u8]) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn declarator_name(node: Node<'_>) -> Option<Node<'_>> {
+    if matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "type_identifier"
+    ) {
+        return Some(node);
+    }
+    node.child_by_field_name("name")
+        .or_else(|| {
+            node.child_by_field_name("declarator")
+                .and_then(declarator_name)
+        })
+        .or_else(|| {
+            (0..node.named_child_count()).find_map(|index| {
+                u32::try_from(index)
+                    .ok()
+                    .and_then(|index| node.named_child(index))
+                    .and_then(declarator_name)
+            })
+        })
 }
 
 fn signature(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -176,6 +200,11 @@ fn entity_kind(language: &str, kind: &str) -> Option<EntityKind> {
         ("rust", "impl_item") => EntityKind::Module,
         ("rust", "mod_item") => EntityKind::Module,
         ("rust", "const_item" | "static_item") => EntityKind::Constant,
+        ("c" | "cpp", "function_definition") => EntityKind::Function,
+        ("c" | "cpp", "struct_specifier" | "union_specifier") => EntityKind::Struct,
+        ("c" | "cpp", "enum_specifier") => EntityKind::Enum,
+        ("cpp", "class_specifier") => EntityKind::Class,
+        ("cpp", "namespace_definition") => EntityKind::Module,
         (
             "typescript" | "tsx" | "javascript",
             "function_declaration" | "generator_function_declaration",
@@ -222,5 +251,42 @@ mod tests {
         assert!(parsed.parsed);
         assert!(parsed.units.iter().any(|unit| unit.name == "Store"));
         assert!(parsed.units.iter().any(|unit| unit.name == "open"));
+    }
+
+    #[test]
+    fn extracts_c_and_cpp_functions_and_types() {
+        for (language, path, source, expected) in [
+            (
+                "c",
+                "src/store.c",
+                b"struct Store { int value; };\nint store_open(struct Store *store) { return store->value; }\n".as_slice(),
+                ["Store", "store_open"],
+            ),
+            (
+                "cpp",
+                "src/store.cpp",
+                b"class Store { public: int open() { return 1; } };\nint make_store() { return 1; }\n".as_slice(),
+                ["Store", "make_store"],
+            ),
+        ] {
+            let bytes = source.to_vec();
+            let file = ScannedFile {
+                relative_path: path.to_owned(),
+                absolute_path: PathBuf::from(path),
+                language: Some(language.to_owned()),
+                content_hash: blake3::hash(&bytes).to_hex().to_string(),
+                line_count: 2,
+                bytes,
+            };
+            let parsed = SourceParser::new().parse(&file);
+            assert!(parsed.parsed);
+            for name in expected {
+                assert!(
+                    parsed.units.iter().any(|unit| unit.name == name),
+                    "missing {name} from {language}: {:?}",
+                    parsed.units
+                );
+            }
+        }
     }
 }

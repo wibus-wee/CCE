@@ -53,7 +53,7 @@ impl QueryPlanner {
                     SearchRoute::Hybrid,
                 ],
                 graph_policy: GraphPolicy::None,
-                rerank: false,
+                rerank: true,
                 required_views: vec![ViewKind::Lexical, ViewKind::Dense],
                 reasons: vec!["behavior query crosses natural-language and source-code vocabularies".to_owned()],
             },
@@ -92,7 +92,7 @@ impl QueryPlanner {
                     SearchRoute::Structural,
                 ],
                 graph_policy: GraphPolicy::IncomingImpact,
-                rerank: false,
+                rerank: true,
                 required_views: vec![ViewKind::Symbols, ViewKind::Lexical, ViewKind::Graph],
                 reasons: vec!["impact query traverses incoming references and containment".to_owned()],
             },
@@ -113,7 +113,7 @@ impl QueryPlanner {
                 intent,
                 routes: vec![SearchRoute::History, SearchRoute::Lexical, SearchRoute::DenseSummary],
                 graph_policy: GraphPolicy::None,
-                rerank: false,
+                rerank: true,
                 required_views: vec![ViewKind::History, ViewKind::Lexical],
                 reasons: vec!["why/history query must not infer rationale from current source alone".to_owned()],
             },
@@ -129,7 +129,7 @@ impl QueryPlanner {
                 intent: QueryIntent::NaturalLanguageBehavior,
                 routes: vec![SearchRoute::Lexical, SearchRoute::DenseRaw, SearchRoute::Hybrid],
                 graph_policy: GraphPolicy::None,
-                rerank: false,
+                rerank: true,
                 required_views: vec![ViewKind::Lexical, ViewKind::Dense],
                 reasons: vec!["unknown intent uses conservative hybrid recall without graph expansion".to_owned()],
             },
@@ -151,18 +151,32 @@ fn classify(query: &str) -> QueryIntent {
     ) {
         return QueryIntent::PreciseDataflow;
     }
-    if contains_any(
+    let explicit_history = contains_any(
+        query,
+        &["history", "commit", "blame", "历史", "提交", "什么时候改"],
+    );
+    let asks_why = contains_any(query, &["why ", "why was", "为什么", "为何"]);
+    let names_a_change = contains_any(
         query,
         &[
-            "why ",
-            "history",
-            "commit",
-            "为什么",
-            "为何",
-            "历史",
-            "什么时候改",
+            " added",
+            " introduced",
+            " changed",
+            " removed",
+            " deprecated",
+            " migrated",
+            " adopted",
+            "引入",
+            "新增",
+            "改成",
+            "移除",
+            "废弃",
+            "迁移",
+            "采用",
+            "当时选择",
         ],
-    ) {
+    );
+    if explicit_history || (asks_why && names_a_change) {
         return QueryIntent::History;
     }
     if contains_any(
@@ -220,6 +234,11 @@ fn classify(query: &str) -> QueryIntent {
             "失败",
             "偶发",
             "不生效",
+            "问题",
+            "异常",
+            "误判",
+            "哪里修",
+            "在哪里修",
         ],
     ) {
         return QueryIntent::IssueLocalization;
@@ -256,7 +275,9 @@ fn identifier_ratio(value: &str) -> f64 {
     }
     let identifier = value
         .chars()
-        .filter(|character| character.is_alphanumeric() || *character == '_' || *character == ':')
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || *character == '_' || *character == ':'
+        })
         .count();
     identifier as f64 / non_space as f64
 }
@@ -275,6 +296,41 @@ mod tests {
     #[test]
     fn routes_plain_behavior_without_graph() {
         let plan = QueryPlanner::new().plan("用户退出之后消息仍然恢复", None);
+        assert_eq!(plan.intent, QueryIntent::NaturalLanguageBehavior);
         assert_eq!(plan.graph_policy, GraphPolicy::None);
+        assert!(plan.rerank);
+    }
+
+    #[test]
+    fn reranks_broad_queries_but_preserves_exact_and_precise_routes() {
+        for intent in [
+            QueryIntent::NaturalLanguageBehavior,
+            QueryIntent::IssueLocalization,
+            QueryIntent::Impact,
+            QueryIntent::Architecture,
+            QueryIntent::History,
+        ] {
+            assert!(QueryPlanner::new().plan("query", Some(intent)).rerank);
+        }
+        for intent in [
+            QueryIntent::ExactEntity,
+            QueryIntent::Trace,
+            QueryIntent::PreciseDataflow,
+        ] {
+            assert!(!QueryPlanner::new().plan("query", Some(intent)).rerank);
+        }
+    }
+
+    #[test]
+    fn distinguishes_current_failures_from_historical_rationale() {
+        let issue = QueryPlanner::new().plan(
+            "为什么自然语言查询会被误判成精确符号检索，应该在哪里修复意图路由？",
+            None,
+        );
+        assert_eq!(issue.intent, QueryIntent::IssueLocalization);
+
+        let history =
+            QueryPlanner::new().plan("Why was quantized ANN candidate retrieval added?", None);
+        assert_eq!(history.intent, QueryIntent::History);
     }
 }

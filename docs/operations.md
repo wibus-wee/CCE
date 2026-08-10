@@ -21,8 +21,19 @@ Artifact objects are immutable and deduplicated. Orphans can exist after a faile
 - An interrupted build does not advance `current_snapshots`; retry `cce index`.
 - A corrupt artifact produces an explicit error and must be restored from backup or rebuilt from source.
 - A newer SQLite format is never downgraded in place; deploy a compatible binary.
-- If an embedding provider fails, the dense view becomes failed while the prior complete snapshot remains available. Disable dense retrieval or repair provider configuration before retrying.
-- If the repository changes during a long build, the resulting snapshot still identifies the exact bytes scanned; the next freshness check marks it stale and a subsequent index converges.
+- If local model loading or embedding fails, the dense view becomes failed while the prior complete snapshot remains available. Verify the pinned model cache, ONNX Runtime path, and memory-budget flags before retrying.
+- Keep `--embedding-allow-download` disabled in steady-state service units. Populate the model cache once, record its BLAKE3-bearing serving profile from result provenance, then serve network-free.
+- Keep `--reranker-allow-download` disabled in steady state as well. Prefer a promoted `cce-reranker-manifest.json` bundle and record its content-derived revision in deployment configuration.
+- Prefer daemon or MCP deployment for local dense retrieval so model weights remain resident. One-shot CLI query latency includes ONNX model initialization.
+- Size reranker capacity from measured candidate count, sequence length, p95, and RSS. It is a bounded Top-K stage, but a cross-encoder is materially more expensive than vector scoring; long-lived processes amortize initialization, not pairwise compute. Increase `--reranker-sessions` only after load testing because every additional session trades memory for concurrent throughput.
+- Keep the daemon process long-lived to retain both the ONNX session and decoded vector artifact. Query workers share the immutable index; candidate scoring is parallel and only Top-K source bodies are loaded from the artifact store.
+- Inspect `reusedEmbeddings` and the `incremental_embedding_reuse` dense capability after each build. An unexpected zero with an unchanged serving profile usually means retrieval-document identities shifted because a file or enclosing source range changed.
+- The default memory guard rejects large `batch × sequence²` configurations. Raising it with `--embedding-allow-high-memory` is an operator decision and should be paired with a measured RSS limit.
+- `--scip-auto` requires a local `rust-analyzer` with SCIP support. Its resolved executable path, version, and thread count are part of the index profile. A timeout or non-zero exit retains syntax graph facts and reports the compiler graph failure explicitly.
+- Treat supplied SCIP files as unattested unless the producing system separately binds them to source hashes. For authoritative dataflow, validate analyzer output against `schemas/dataflow-v1.schema.json`; a source, overlay, repository, or range mismatch rejects the entire view.
+- For `--dataflow-joern`, install and pin Joern locally; CCE performs no container pull or remote analysis. Size the temporary artifact volume and JVM heap for the repository, set a finite `--joern-timeout-seconds`, and monitor partial status for source-unmapped relevant endpoints. Analyzer stdout is discarded and failure diagnostics are bounded; temporary CPG/GraphML files are removed after import.
+- CCE rescans the repository before committing an index. If source changes during SCIP generation or any other long build stage, the transaction is cancelled and the previous complete snapshot remains current.
+- Search rescans source identity but reuses a source-identical current snapshot even when query-only flags differ from its index profile. If source changed, a fresh search fails closed; run `cce index` explicitly with the intended compiler, dataflow, parser, and embedding materialization. Callers that deliberately set `requireFresh=false` may read the last complete snapshot, whose hits are marked unverified. Search never silently downgrades materialized views.
 
 ## Upgrade policy
 

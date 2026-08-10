@@ -4,7 +4,23 @@
 
 `cce index [REPOSITORY]` builds or reuses the exact snapshot. `cce status [REPOSITORY]` is read-only and reports staleness. `cce search REPOSITORY QUERY` returns the plan, manifest, ranked hits, and missing capabilities. `cce context REPOSITORY QUERY` emits the canonical budgeted context pack. Add `--json` for machine-readable output.
 
-Dense retrieval defaults to disabled. `--dense baseline` enables deterministic hash embeddings only for tests and benchmark ablations. Production embeddings require `--dense provider`, an OpenAI-compatible base URL and model, and an API key held in the environment named by `--embedding-api-key-environment`.
+Dense retrieval defaults to disabled. `--dense baseline` enables deterministic hash embeddings only for tests and benchmark ablations. `--dense local` is the production local-inference path: it loads a pinned ONNX model and a caller-supplied local ONNX Runtime shared library, verifies the model artifact set, and never calls an inference API. `--embedding-allow-download` permits only the initial pinned model download; leave it off for offline serving.
+
+The local model argument accepts the coupled presets `quality`, `balanced`, and `fast`. A custom model must include `--embedding-revision` with an immutable 40–64 character hexadecimal commit. Query and document prefixes can be overridden independently, but are part of the index profile and therefore invalidate incompatible dense artifacts.
+
+Remote embedding inference is not part of the runtime. A trained local bundle is selected with `--embedding-model-directory`, its `bundleRevision` with `--embedding-revision`, and the matching built-in runtime family with `--embedding-model`. CCE verifies the bundle manifest and required files before loading ONNX.
+
+`--reranker local` enables a local cross-encoder for broad natural-language, issue, impact, architecture, and history intents; exact symbol, trace, and precise-dataflow routes preserve deterministic ordering. The default is the commit-pinned `jinaai/jina-reranker-v1-turbo-en`; `--reranker-allow-download` is only for initial acquisition. Offline deployments use `--reranker-model-directory` plus the bundle's `--reranker-revision`. `--reranker-max-length`, `--reranker-threads`, and `--reranker-batch-size` bound local compute. `--reranker-sessions` creates 1–16 independently locked ONNX sessions for concurrent daemon/MCP queries and multiplies model memory accordingly; the default is one. CLI, daemon, and MCP expose the same flags and `CCE_RERANKER_*` environment variables. There is no remote reranking backend.
+
+## Compiler graph and dataflow inputs
+
+`--scip-auto` runs the local `rust-analyzer scip` indexer inside the indexing transaction. The executable version is part of the index profile; CCE writes the protobuf to its temporary area, imports definition/reference/implementation facts, stores the original payload by BLAKE3 digest, and rescans source before commit. `--scip-index PATH` imports a prebuilt SCIP protobuf but reports its snapshot alignment as unattested. Use `--rust-analyzer PATH`, `--scip-threads`, and `--scip-timeout-seconds` to control the bounded local process.
+
+`--dataflow-index PATH` imports a local static-analysis artifact conforming to `schemas/dataflow-v1.schema.json`. `--dataflow-joern` instead invokes local `joern-parse` and `joern-export` executables; paths and timeout are configured by `--joern-parse`, `--joern-export`, `--joern-timeout-seconds` or the corresponding `CCE_JOERN_*` variables. CCE records the reported exporter version, falling back to content digests of launchers that do not implement `--version`. The modes conflict. Joern's `REACHING_DEF` and `CDG` edges become data and control dependencies only when both endpoints map to current source.
+
+Both paths pass through the same importer, which accepts only artifacts whose repository ID, base revision, workspace overlay hash, per-file content hashes, byte ranges, and line ranges match the current source. Valid `data_flow`, `taint_flow`, and `control_flow` edges make the dataflow view ready; malformed or stale input is rejected rather than inferred. A Joern run with skipped relevant endpoints is explicitly partial.
+
+Git history is materialized as one retrieval document per reachable commit, including commit ID, timestamp, subject, and up to 64 changed paths computed from Git trees. History results therefore compete as individual evidence rather than one repository-wide summary. Commit messages and tree diffs remain historical evidence, not current-source truth.
 
 ## HTTP
 

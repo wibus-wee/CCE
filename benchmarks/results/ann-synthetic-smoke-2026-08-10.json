@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "status": "smoke_not_production_promotion",
+  "system": "CCEVEC2 USearch HNSW i8 candidate generation with f32 exact rerank",
+  "corpus": {
+    "generator": "dense::tests::quantized_ann_preserves_exact_top_ten_recall",
+    "documents": 2500,
+    "queries": 31,
+    "dimensions": 96,
+    "seedPolicy": "deterministic identifier-derived documents and queries"
+  },
+  "configuration": {
+    "connectivity": 32,
+    "expansionAdd": 256,
+    "expansionSearch": 512,
+    "candidateMultiplier": 48,
+    "hnswInsertionWorkers": 1,
+    "candidateQuantization": "i8",
+    "rerankPrecision": "f32"
+  },
+  "measurements": {
+    "repeatedBuilds": 20,
+    "exactTop10ItemsPerBuild": 310,
+    "buildRecallAt10": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "minimumRecallAt10": 1.0,
+    "meanRecallAt10": 1.0,
+    "maximumRecallAt10": 1.0
+  },
+  "promotionGate": {
+    "minimumRecallAt10": 0.99,
+    "passed": true
+  },
+  "limitations": [
+    "synthetic corpus",
+    "deterministic baseline embeddings",
+    "single-writer HNSW insertion was selected after concurrent insertion produced unstable Recall@10; the gate was repeated across twenty independent builds",
+    "does not replace repository-held-out embedding or end-to-end retrieval benchmarks",
+    "latency and peak RSS are not measured by this smoke gate"
+  ]
+}

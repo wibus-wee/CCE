@@ -1,0 +1,94 @@
+{
+  "schemaVersion": 1,
+  "status": "smoke_not_promotion",
+  "dataset": {
+    "repository": "BurntSushi/ripgrep",
+    "revision": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+    "sha256": "d20bd5f229286ea8dd33cc1121d170167cb0564a2c9efd91a64c18635daf9b7a",
+    "queries": 120,
+    "candidateDocuments": 182,
+    "queryKinds": {
+      "documentation": 19,
+      "symbol_navigation": 100,
+      "change_localization": 1
+    }
+  },
+  "training": {
+    "repository": "sqlite/sqlite",
+    "revision": "ab5206d096d6ecc5f9ea2586889c07e52e852c23",
+    "examples": 128,
+    "seed": 3278,
+    "baseModel": "intfloat/multilingual-e5-small",
+    "baseRevision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+    "hardNegatives": 3,
+    "epochs": 1.0,
+    "maxSequenceLength": 192
+  },
+  "hardware": {
+    "platform": "Linux-6.18.35-x86_64-with-glibc2.39",
+    "cpuCount": 9,
+    "accelerator": "none"
+  },
+  "measurements": [
+    {
+      "model": "multilingual-e5-small-base",
+      "recallAt1": 0.1166666667,
+      "recallAt5": 0.2916666667,
+      "recallAt10": 0.3666666667,
+      "recallAt20": 0.5166666667,
+      "mrr": 0.2193268733,
+      "ndcgAt10": 0.2355304793,
+      "documentsPerSecond": 29.4477261663,
+      "singleQueryP95Ms": 39.369427,
+      "peakMemoryBytes": 1918287872
+    },
+    {
+      "model": "bge-small-en-v1.5-base",
+      "recallAt1": 0.1916666667,
+      "recallAt5": 0.35,
+      "recallAt10": 0.4333333333,
+      "recallAt20": 0.575,
+      "mrr": 0.2752973997,
+      "ndcgAt10": 0.2959957305,
+      "documentsPerSecond": 34.1258617655,
+      "singleQueryP95Ms": 25.749155,
+      "peakMemoryBytes": 1345867776
+    },
+    {
+      "model": "jina-code-v2-base",
+      "recallAt1": 0.2166666667,
+      "recallAt5": 0.3583333333,
+      "recallAt10": 0.475,
+      "recallAt20": 0.6416666667,
+      "mrr": 0.3066691248,
+      "ndcgAt10": 0.330335679,
+      "documentsPerSecond": 6.304300414,
+      "singleQueryP95Ms": 108.657689,
+      "peakMemoryBytes": 4080177152
+    },
+    {
+      "model": "cce-e5-sqlite-smoke-tuned",
+      "recallAt1": 0.275,
+      "recallAt5": 0.425,
+      "recallAt10": 0.5416666667,
+      "recallAt20": 0.725,
+      "mrr": 0.3639405061,
+      "ndcgAt10": 0.3887735434,
+      "documentsPerSecond": 14.7846509185,
+      "singleQueryP95Ms": 45.31367,
+      "peakMemoryBytes": 1838510080,
+      "byQueryKind": {
+        "documentation": {"recallAt1": 0.6842105263, "recallAt10": 0.9473684211, "mrr": 0.769545659},
+        "symbol_navigation": {"recallAt1": 0.2, "recallAt10": 0.47, "mrr": 0.2904012958},
+        "change_localization": {"recallAt1": 0.0, "recallAt10": 0.0, "mrr": 0.0113636364}
+      }
+    }
+  ],
+  "limitations": [
+    "one training seed",
+    "small smoke sample",
+    "only one held-out repository",
+    "change-localization bucket contains one query and did not improve",
+    "no confidence intervals; not eligible for production promotion"
+  ]
+}

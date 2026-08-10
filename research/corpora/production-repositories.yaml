@@ -1,0 +1,51 @@
+schema_version: 1
+dataset_revision: cce-production-retrieval-v1
+repositories:
+  - name: sqlite
+    url: https://github.com/sqlite/sqlite.git
+    revision: ab5206d096d6ecc5f9ea2586889c07e52e852c23
+    split: train
+    license_spdx: blessing
+    languages: [c]
+    max_documents: 20000
+    history_depth: 256
+  - name: redis
+    url: https://github.com/redis/redis.git
+    revision: 8f365337d48c8a264bc9f3381c7b8cc12ffb51d2
+    split: train
+    license_spdx: RSALv2-or-SSPL-1.0
+    languages: [c]
+    max_documents: 20000
+    history_depth: 256
+  - name: django
+    url: https://github.com/django/django.git
+    revision: c9eb16a87e60c305fb3651459639f647cce498db
+    split: train
+    license_spdx: BSD-3-Clause
+    languages: [python]
+    max_documents: 20000
+    history_depth: 256
+  - name: tokio
+    url: https://github.com/tokio-rs/tokio.git
+    revision: 8b13642a1f7346814f189937b2d6e1e80b210db1
+    split: validation
+    license_spdx: MIT
+    languages: [rust]
+    max_documents: 15000
+    history_depth: 192
+  - name: flask
+    url: https://github.com/pallets/flask.git
+    revision: 6a2f545bfd8ed31e19066a299296917e034aca58
+    split: validation
+    license_spdx: BSD-3-Clause
+    languages: [python]
+    max_documents: 8000
+    history_depth: 192
+  - name: ripgrep
+    url: https://github.com/BurntSushi/ripgrep.git
+    revision: 3fce3b5bb0236da2df6d99672afb8a719642eca7
+    split: test
+    license_spdx: Unlicense-or-MIT
+    languages: [rust]
+    max_documents: 15000
+    history_depth: 192

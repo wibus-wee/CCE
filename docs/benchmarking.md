@@ -11,7 +11,7 @@ Each JSONL case records repository and immutable revision, query, intent, gold f
 - ranked retrieval: Recall@5/10/20/50, MRR, nDCG@10, file success, symbol and line recall
 - selective retrieval: abstention accuracy, no-context precision, false-positive rate
 - budgeted packs: coverage at 2K/4K/8K, relevant-line density, unique gold entities per token, redundancy, relation coverage, citation correctness
-- systems: cold index time, incremental p50/p95, stale window, query and rerank p50/p95, disk/LOC, peak memory, context tokens and provider cost
+- systems: cold index time, incremental p50/p95, stale window, query and rerank p50/p95, disk/LOC, peak memory, context tokens, and local compute cost
 
 ## Mandatory ablations
 
@@ -32,4 +32,29 @@ uv run --project research cce-research run benchmarks/datasets/cce-self.jsonl be
 uv run --project research cce-research evaluate benchmarks/datasets/cce-self.jsonl research/output/cce-self.jsonl --output research/output/cce-self-metrics.json
 ```
 
-Published bundles must replace `WORKTREE` with an immutable commit and record CPU, memory, operating system, model endpoint/revision, cold versus warm cache state, and lockfile digests.
+Published bundles must replace `WORKTREE` with an immutable commit and record CPU, memory, operating system, model/bundle revision, cold versus warm cache state, and lockfile digests.
+
+Embedding benchmarks use repository-isolated splits and run each model in a clean process so peak RSS is not contaminated by a previously loaded model. They report overall and per-query-kind Recall@1/5/10/20, MRR, nDCG@10, indexing throughput, single-query p50/p95, and peak RSS. Run the pinned base suite with:
+
+```bash
+uv run --project research --extra models cce-research benchmark-models \
+  research/output/corpus/test.jsonl \
+  benchmarks/embedding-models.yaml \
+  research/output/base-models.json
+```
+
+Base-versus-tuned comparisons must use the same held-out repository split. A lower training loss is not a promotion result.
+
+ANN recall gates must cover repeated independent HNSW builds; a single passing construction can hide graph-build variance. CCE's synthetic smoke records minimum, mean, maximum, and raw per-build Recall@10, while production promotion additionally requires held-out repository queries plus p95 latency and peak RSS.
+
+Cross-encoder benchmarks operate on one positive plus the same repository-local hard negatives per query. Each model runs in a clean process and reports Recall@1/5/10, MRR, nDCG@10, pairs/s, per-query p50/p95, peak RSS, per-query-kind metrics, and raw case ranks:
+
+```bash
+uv run --project research --extra models cce-research benchmark-rerankers \
+  research/output/corpus/test.jsonl \
+  benchmarks/reranker-models.yaml \
+  research/output/base-rerankers.json \
+  --candidates 8
+```
+
+Use an identical candidate count and held-out file for a tuned model. A runtime end-to-end ablation must additionally compare CCE with `--reranker disabled` and `--reranker local`, because candidate construction, query-centered snippets, fusion weight, and model ranking can each change the final order.

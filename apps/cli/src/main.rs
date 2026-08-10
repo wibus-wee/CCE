@@ -4,7 +4,11 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use cce_core::{QueryIntent, SearchRequest};
-use cce_engine::{CceEngine, ContextRequest, DenseBackendConfig, EngineConfig};
+use cce_engine::{
+    CceEngine, ContextRequest, DEFAULT_LOCAL_EMBEDDING_MODEL, DEFAULT_LOCAL_RERANKER_MODEL,
+    DEFAULT_LOCAL_RERANKER_REVISION, DataflowBackendConfig, DenseBackendConfig, EngineConfig,
+    RerankerBackendConfig, ScipBackendConfig, local_embedding_preset,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -16,14 +20,117 @@ struct Arguments {
     json: bool,
     #[arg(long, global = true, value_enum, default_value_t = DenseMode::Disabled)]
     dense: DenseMode,
-    #[arg(long, global = true, env = "CCE_EMBEDDING_BASE_URL")]
-    embedding_base_url: Option<String>,
     #[arg(long, global = true, env = "CCE_EMBEDDING_MODEL")]
     embedding_model: Option<String>,
-    #[arg(long, global = true, default_value = "CCE_EMBEDDING_API_KEY")]
-    embedding_api_key_environment: String,
+    #[arg(long, global = true, env = "CCE_EMBEDDING_REVISION")]
+    embedding_revision: Option<String>,
+    #[arg(long, global = true, env = "CCE_EMBEDDING_MODEL_DIRECTORY")]
+    embedding_model_directory: Option<PathBuf>,
+    #[arg(long, global = true, env = "CCE_EMBEDDING_CACHE_DIR")]
+    embedding_cache_dir: Option<PathBuf>,
+    #[arg(long, global = true, env = "CCE_ONNX_RUNTIME_LIBRARY")]
+    onnx_runtime_library: Option<PathBuf>,
+    #[arg(long, global = true, env = "CCE_EMBEDDING_ALLOW_DOWNLOAD")]
+    embedding_allow_download: bool,
+    #[arg(long, global = true, env = "CCE_EMBEDDING_ALLOW_HIGH_MEMORY")]
+    embedding_allow_high_memory: bool,
+    #[arg(long, global = true, default_value_t = 512)]
+    embedding_max_length: usize,
+    #[arg(long, global = true)]
+    embedding_threads: Option<usize>,
+    #[arg(long, global = true, default_value_t = 4)]
+    embedding_batch_size: usize,
+    #[arg(long, global = true)]
+    embedding_query_prefix: Option<String>,
+    #[arg(long, global = true)]
+    embedding_document_prefix: Option<String>,
     #[arg(long, global = true)]
     embedding_dimensions: Option<usize>,
+    #[arg(long, global = true, value_enum, default_value_t = RerankerMode::Disabled)]
+    reranker: RerankerMode,
+    #[arg(long, global = true, env = "CCE_RERANKER_MODEL")]
+    reranker_model: Option<String>,
+    #[arg(long, global = true, env = "CCE_RERANKER_REVISION")]
+    reranker_revision: Option<String>,
+    #[arg(long, global = true, env = "CCE_RERANKER_MODEL_DIRECTORY")]
+    reranker_model_directory: Option<PathBuf>,
+    #[arg(long, global = true, env = "CCE_RERANKER_CACHE_DIR")]
+    reranker_cache_dir: Option<PathBuf>,
+    #[arg(long, global = true, env = "CCE_RERANKER_ALLOW_DOWNLOAD")]
+    reranker_allow_download: bool,
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_RERANKER_MAX_LENGTH",
+        default_value_t = 512
+    )]
+    reranker_max_length: usize,
+    #[arg(long, global = true, env = "CCE_RERANKER_THREADS")]
+    reranker_threads: Option<usize>,
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_RERANKER_BATCH_SIZE",
+        default_value_t = 8
+    )]
+    reranker_batch_size: usize,
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_RERANKER_SESSIONS",
+        default_value_t = 1
+    )]
+    reranker_sessions: usize,
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_SCIP_AUTO",
+        conflicts_with = "scip_index"
+    )]
+    scip_auto: bool,
+    #[arg(long, global = true, env = "CCE_SCIP_INDEX")]
+    scip_index: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_RUST_ANALYZER",
+        default_value = "rust-analyzer"
+    )]
+    rust_analyzer: PathBuf,
+    #[arg(long, global = true)]
+    scip_threads: Option<usize>,
+    #[arg(long, global = true, default_value_t = 900)]
+    scip_timeout_seconds: u64,
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_DATAFLOW_INDEX",
+        conflicts_with = "dataflow_joern"
+    )]
+    dataflow_index: Option<PathBuf>,
+    #[arg(long, global = true, env = "CCE_DATAFLOW_JOERN")]
+    dataflow_joern: bool,
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_JOERN_PARSE",
+        default_value = "joern-parse"
+    )]
+    joern_parse: PathBuf,
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_JOERN_EXPORT",
+        default_value = "joern-export"
+    )]
+    joern_export: PathBuf,
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_JOERN_TIMEOUT_SECONDS",
+        default_value_t = 1_800
+    )]
+    joern_timeout_seconds: u64,
     #[command(subcommand)]
     command: Command,
 }
@@ -32,7 +139,13 @@ struct Arguments {
 enum DenseMode {
     Disabled,
     Baseline,
-    Provider,
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RerankerMode {
+    Disabled,
+    Local,
 }
 
 #[derive(Debug, Subcommand)]
@@ -199,19 +312,107 @@ fn engine(arguments: &Arguments, repository: &PathBuf) -> anyhow::Result<CceEngi
         DenseMode::Baseline => DenseBackendConfig::DeterministicBaseline {
             dimensions: arguments.embedding_dimensions.unwrap_or(512),
         },
-        DenseMode::Provider => DenseBackendConfig::OpenAiCompatible {
-            base_url: arguments
-                .embedding_base_url
-                .clone()
-                .context("--embedding-base-url is required for --dense provider")?,
-            model: arguments
+        DenseMode::Local => {
+            let requested_model = arguments
                 .embedding_model
                 .clone()
-                .context("--embedding-model is required for --dense provider")?,
-            api_key_environment: arguments.embedding_api_key_environment.clone(),
-            dimensions: arguments.embedding_dimensions,
-            batch_size: 32,
-        },
+                .unwrap_or_else(|| DEFAULT_LOCAL_EMBEDDING_MODEL.to_owned());
+            let preset = local_embedding_preset(&requested_model);
+            DenseBackendConfig::LocalFastEmbed {
+                model: preset.map_or(requested_model, |value| value.model.to_owned()),
+                revision: arguments
+                    .embedding_revision
+                    .clone()
+                    .or_else(|| preset.map(|value| value.revision.to_owned()))
+                    .context("--embedding-revision is required for a custom local model")?,
+                model_directory: arguments.embedding_model_directory.clone(),
+                cache_dir: arguments
+                    .embedding_cache_dir
+                    .clone()
+                    .unwrap_or_else(|| config.data_root.join("models")),
+                runtime_library: arguments.onnx_runtime_library.clone().unwrap_or_else(|| {
+                    config
+                        .data_root
+                        .join("runtime/lib/libonnxruntime.so.1.28.0")
+                }),
+                allow_download: arguments.embedding_allow_download,
+                allow_high_memory: arguments.embedding_allow_high_memory,
+                max_length: arguments.embedding_max_length,
+                threads: arguments.embedding_threads,
+                batch_size: arguments.embedding_batch_size,
+                query_prefix: arguments.embedding_query_prefix.clone().unwrap_or_else(|| {
+                    preset.map_or_else(String::new, |value| value.query_prefix.to_owned())
+                }),
+                document_prefix: arguments
+                    .embedding_document_prefix
+                    .clone()
+                    .unwrap_or_else(|| {
+                        preset.map_or_else(String::new, |value| value.document_prefix.to_owned())
+                    }),
+            }
+        }
+    };
+    config.reranker = match arguments.reranker {
+        RerankerMode::Disabled => RerankerBackendConfig::Disabled,
+        RerankerMode::Local => {
+            let model = arguments
+                .reranker_model
+                .clone()
+                .unwrap_or_else(|| DEFAULT_LOCAL_RERANKER_MODEL.to_owned());
+            let revision = arguments
+                .reranker_revision
+                .clone()
+                .or_else(|| {
+                    model
+                        .eq_ignore_ascii_case(DEFAULT_LOCAL_RERANKER_MODEL)
+                        .then(|| DEFAULT_LOCAL_RERANKER_REVISION.to_owned())
+                })
+                .context("--reranker-revision is required for a custom local reranker")?;
+            RerankerBackendConfig::LocalFastEmbed {
+                model,
+                revision,
+                model_directory: arguments.reranker_model_directory.clone(),
+                cache_dir: arguments
+                    .reranker_cache_dir
+                    .clone()
+                    .unwrap_or_else(|| config.data_root.join("rerankers")),
+                runtime_library: arguments.onnx_runtime_library.clone().unwrap_or_else(|| {
+                    config
+                        .data_root
+                        .join("runtime/lib/libonnxruntime.so.1.28.0")
+                }),
+                allow_download: arguments.reranker_allow_download,
+                max_length: arguments.reranker_max_length,
+                threads: arguments.reranker_threads,
+                batch_size: arguments.reranker_batch_size,
+                sessions: arguments.reranker_sessions,
+            }
+        }
+    };
+    config.scip = if arguments.scip_auto {
+        ScipBackendConfig::rust_analyzer(
+            &arguments.rust_analyzer,
+            arguments.scip_threads,
+            arguments.scip_timeout_seconds,
+        )?
+    } else if let Some(path) = &arguments.scip_index {
+        ScipBackendConfig::Supplied { path: path.clone() }
+    } else {
+        ScipBackendConfig::Disabled
+    };
+    config.dataflow = if arguments.dataflow_joern {
+        DataflowBackendConfig::joern(
+            &arguments.joern_parse,
+            &arguments.joern_export,
+            arguments.joern_timeout_seconds,
+        )?
+    } else {
+        arguments
+            .dataflow_index
+            .as_ref()
+            .map_or(DataflowBackendConfig::Disabled, |path| {
+                DataflowBackendConfig::Supplied { path: path.clone() }
+            })
     };
     CceEngine::open(config).map_err(Into::into)
 }

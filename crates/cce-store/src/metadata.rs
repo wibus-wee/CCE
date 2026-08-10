@@ -11,7 +11,9 @@ use cce_core::{
 };
 use chrono::Utc;
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{ArtifactRecord, ArtifactStore};
@@ -60,11 +62,22 @@ pub struct LexicalHit {
 pub struct DocumentContent {
     pub document_id: String,
     pub entity_id: String,
+    pub symbol_name: Option<String>,
     pub representation: RetrievalRepresentation,
     pub address: Option<SourceAddress>,
     pub evidence: Vec<SourceAddress>,
     pub text: String,
 }
+
+type DocumentRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    String,
+    String,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationDirection {
@@ -450,6 +463,62 @@ impl MetadataStore {
             .map_err(storage_error)
     }
 
+    pub fn snapshot_identity(&self, snapshot_id: &str) -> Result<Option<SnapshotIdentity>> {
+        let row = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT id, repository_id, base_revision, workspace_overlay_hash,
+                 index_profile_hash, created_at, file_count, source_bytes
+                 FROM snapshots WHERE id=?1 AND complete=1",
+                [snapshot_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        row.map(
+            |(
+                id,
+                repository_id,
+                base_revision,
+                workspace_overlay_hash,
+                index_profile_hash,
+                created_at,
+                file_count,
+                source_bytes,
+            )| {
+                Ok(SnapshotIdentity {
+                    id,
+                    repository_id,
+                    base_revision,
+                    workspace_overlay_hash,
+                    index_profile_hash,
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+                        .map_err(|error| CceError::Storage(error.to_string()))?
+                        .with_timezone(&Utc),
+                    file_count: u64::try_from(file_count).map_err(|_| {
+                        CceError::Storage("snapshot file count is negative".to_owned())
+                    })?,
+                    source_bytes: u64::try_from(source_bytes).map_err(|_| {
+                        CceError::Storage("snapshot source byte count is negative".to_owned())
+                    })?,
+                })
+            },
+        )
+        .transpose()
+    }
+
     pub fn snapshot_is_complete(&self, snapshot_id: &str) -> Result<bool> {
         self.connection
             .lock()
@@ -544,7 +613,9 @@ impl MetadataStore {
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(
-                "SELECT f.document_id, f.entity_id, e.name, d.representation, d.address_json,
+                "SELECT f.document_id, f.entity_id,
+                 CASE d.representation WHEN '\"commit_summary\"' THEN f.name ELSE e.name END,
+                 d.representation, d.address_json,
                  d.evidence_json,
                  bm25(documents_fts, 0.0, 0.0, 0.0, 3.0, 5.0, 2.0, 1.0) AS rank,
                  snippet(documents_fts, 6, '<mark>', '</mark>', ' … ', 24)
@@ -711,39 +782,81 @@ impl MetadataStore {
         direction: RelationDirection,
         limit: usize,
     ) -> Result<Vec<Relation>> {
+        Ok(self
+            .relations_for_entities(snapshot_id, &[entity_id.to_owned()], direction, limit)?
+            .remove(entity_id)
+            .unwrap_or_default())
+    }
+
+    pub fn relations_for_entities(
+        &self,
+        snapshot_id: &str,
+        entity_ids: &[String],
+        direction: RelationDirection,
+        limit_per_entity: usize,
+    ) -> Result<std::collections::HashMap<String, Vec<Relation>>> {
+        let mut grouped = entity_ids
+            .iter()
+            .map(|entity_id| (entity_id.clone(), Vec::new()))
+            .collect::<std::collections::HashMap<_, _>>();
+        if entity_ids.is_empty() || limit_per_entity == 0 {
+            return Ok(grouped);
+        }
         let predicate = match direction {
-            RelationDirection::Outgoing => "source_entity_id=?2",
-            RelationDirection::Incoming => "target_entity_id=?2",
-            RelationDirection::Both => "(source_entity_id=?2 OR target_entity_id=?2)",
+            RelationDirection::Outgoing => "relation.source_entity_id=frontier.entity_id",
+            RelationDirection::Incoming => "relation.target_entity_id=frontier.entity_id",
+            RelationDirection::Both => {
+                "(relation.source_entity_id=frontier.entity_id OR relation.target_entity_id=frontier.entity_id)"
+            }
         };
+        let values = std::iter::repeat_n("(?)", entity_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
-            "SELECT id, source_entity_id, target_entity_id, kind, origin, confidence,
-             extractor, evidence_json, attributes_json FROM relations
-             WHERE snapshot_id=?1 AND {predicate} ORDER BY confidence DESC LIMIT ?3"
+            "WITH frontier(entity_id) AS (VALUES {values}), ranked AS (
+               SELECT frontier.entity_id AS frontier_entity_id, relation.id,
+                      relation.source_entity_id, relation.target_entity_id, relation.kind,
+                      relation.origin, relation.confidence, relation.extractor,
+                      relation.evidence_json, relation.attributes_json,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY frontier.entity_id
+                        ORDER BY relation.confidence DESC, relation.id
+                      ) AS relation_rank
+               FROM frontier JOIN relations AS relation ON {predicate}
+               WHERE relation.snapshot_id=?
+             )
+             SELECT frontier_entity_id, id, source_entity_id, target_entity_id, kind, origin,
+                    confidence, extractor, evidence_json, attributes_json
+             FROM ranked WHERE relation_rank<=? ORDER BY frontier_entity_id, relation_rank"
         );
+        let mut parameters = entity_ids
+            .iter()
+            .cloned()
+            .map(Value::Text)
+            .collect::<Vec<_>>();
+        parameters.push(Value::Text(snapshot_id.to_owned()));
+        parameters.push(Value::Integer(usize_to_i64(limit_per_entity)?));
         let connection = self.connection.lock();
         let mut statement = connection.prepare(&sql).map_err(storage_error)?;
         let rows = statement
-            .query_map(
-                params![snapshot_id, entity_id, usize_to_i64(limit)?],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, f64>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
-                    ))
-                },
-            )
+            .query_map(params_from_iter(parameters.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, f64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })
             .map_err(storage_error)?;
-        let mut relations = Vec::new();
         for row in rows {
             let (
+                frontier_entity_id,
                 id,
                 source_entity_id,
                 target_entity_id,
@@ -754,7 +867,7 @@ impl MetadataStore {
                 evidence,
                 attributes,
             ) = row.map_err(storage_error)?;
-            relations.push(Relation {
+            let relation = Relation {
                 id,
                 source_entity_id,
                 target_entity_id,
@@ -765,9 +878,13 @@ impl MetadataStore {
                 extractor,
                 evidence: parse_json(&evidence)?,
                 attributes: parse_json(&attributes)?,
-            });
+            };
+            grouped
+                .entry(frontier_entity_id)
+                .or_default()
+                .push(relation);
         }
-        Ok(relations)
+        Ok(grouped)
     }
 
     pub fn source_text(&self, address: &SourceAddress) -> Result<String> {
@@ -800,9 +917,12 @@ impl MetadataStore {
             let connection = self.connection.lock();
             let mut statement = connection
                 .prepare(
-                    "SELECT id, entity_id, representation, address_json, body_artifact_digest,
-                     evidence_json
-                     FROM retrieval_documents WHERE snapshot_id=?1 ORDER BY id",
+                    "SELECT document.id, document.entity_id, entity.name, document.representation,
+                     document.address_json, document.body_artifact_digest, document.evidence_json
+                     FROM retrieval_documents AS document
+                     LEFT JOIN entities AS entity ON entity.snapshot_id=document.snapshot_id
+                                                  AND entity.id=document.entity_id
+                     WHERE document.snapshot_id=?1 ORDER BY document.id",
                 )
                 .map_err(storage_error)?;
             statement
@@ -810,19 +930,81 @@ impl MetadataStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 })
                 .map_err(storage_error)?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(storage_error)?
         };
+        self.materialize_documents(rows)
+    }
+
+    pub fn documents_by_ids(
+        &self,
+        snapshot_id: &str,
+        document_ids: &[String],
+    ) -> Result<Vec<DocumentContent>> {
+        const IDS_PER_QUERY: usize = 400;
+        let mut rows = Vec::with_capacity(document_ids.len());
+        for chunk in document_ids.chunks(IDS_PER_QUERY) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT document.id, document.entity_id, entity.name, document.representation,
+                 document.address_json, document.body_artifact_digest, document.evidence_json
+                 FROM retrieval_documents AS document
+                 LEFT JOIN entities AS entity ON entity.snapshot_id=document.snapshot_id
+                                              AND entity.id=document.entity_id
+                 WHERE document.snapshot_id=? AND document.id IN ({placeholders})"
+            );
+            let mut parameters = Vec::with_capacity(chunk.len() + 1);
+            parameters.push(Value::Text(snapshot_id.to_owned()));
+            parameters.extend(chunk.iter().cloned().map(Value::Text));
+            let chunk_rows = {
+                let connection = self.connection.lock();
+                let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+                statement
+                    .query_map(params_from_iter(parameters.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    })
+                    .map_err(storage_error)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(storage_error)?
+            };
+            rows.extend(chunk_rows);
+        }
+        self.materialize_documents(rows)
+    }
+
+    fn materialize_documents(&self, rows: Vec<DocumentRow>) -> Result<Vec<DocumentContent>> {
         rows.into_iter()
             .map(
-                |(document_id, entity_id, representation, address_json, digest, evidence_json)| {
+                |(
+                    document_id,
+                    entity_id,
+                    symbol_name,
+                    representation,
+                    address_json,
+                    digest,
+                    evidence_json,
+                )| {
                     let address: Option<SourceAddress> =
                         address_json.as_deref().map(parse_json).transpose()?;
                     let text = if let Some(address) = &address {
@@ -835,6 +1017,7 @@ impl MetadataStore {
                     Ok(DocumentContent {
                         document_id,
                         entity_id,
+                        symbol_name,
                         representation: parse_json(&representation)?,
                         address,
                         evidence: parse_json(&evidence_json)?,
@@ -964,6 +1147,48 @@ mod tests {
     }
 
     #[test]
+    fn reads_only_complete_snapshot_identities() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("metadata store");
+        let repository = RepositoryIdentity {
+            id: "repo".to_owned(),
+            canonical_root: "/repo".to_owned(),
+            remote: None,
+        };
+        store
+            .register_repository(&repository)
+            .expect("register repository");
+        let snapshot = SnapshotIdentity {
+            id: "snapshot".to_owned(),
+            repository_id: repository.id,
+            base_revision: Some("revision".to_owned()),
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 7,
+            source_bytes: 42,
+        };
+        store.begin_snapshot(&snapshot).expect("begin snapshot");
+        assert!(
+            store
+                .snapshot_identity(&snapshot.id)
+                .expect("read incomplete")
+                .is_none()
+        );
+        store
+            .commit_snapshot(&snapshot, &SnapshotRecords::default())
+            .expect("commit snapshot");
+        let loaded = store
+            .snapshot_identity(&snapshot.id)
+            .expect("read complete")
+            .expect("complete snapshot");
+        assert_eq!(loaded.id, snapshot.id);
+        assert_eq!(loaded.index_profile_hash, snapshot.index_profile_hash);
+        assert_eq!(loaded.file_count, 7);
+        assert_eq!(loaded.source_bytes, 42);
+    }
+
+    #[test]
     fn fts_query_is_bounded_and_quoted() {
         assert_eq!(
             fts_query("resumeAttempt cursor"),
@@ -973,5 +1198,62 @@ mod tests {
             fts_query("Where is the snapshot freshness decided?"),
             "\"snapshot\" OR \"freshness\" OR \"decided\""
         );
+    }
+
+    #[test]
+    fn batches_frontier_relations_with_a_limit_per_entity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("metadata store");
+        {
+            let connection = store.connection.lock();
+            connection
+                .execute(
+                    "INSERT INTO repositories(id, canonical_root, created_at, updated_at)
+                     VALUES ('repo', '/repo', ?1, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )
+                .expect("repository");
+            connection
+                .execute(
+                    "INSERT INTO snapshots(id, repository_id, workspace_overlay_hash,
+                     index_profile_hash, created_at, file_count, source_bytes, complete)
+                     VALUES ('snapshot', 'repo', 'overlay', 'profile', ?1, 0, 0, 1)",
+                    [Utc::now().to_rfc3339()],
+                )
+                .expect("snapshot");
+            for (id, source, target, confidence) in [
+                ("r1", "a", "b", 0.9),
+                ("r2", "a", "c", 0.8),
+                ("r3", "d", "a", 0.7),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO relations(id, snapshot_id, source_entity_id, target_entity_id,
+                         kind, origin, confidence, extractor, evidence_json, attributes_json)
+                         VALUES (?1, 'snapshot', ?2, ?3, ?4, ?5, ?6, 'test', '[]', '{}')",
+                        params![
+                            id,
+                            source,
+                            target,
+                            json(&cce_core::RelationKind::Calls).expect("kind"),
+                            json(&cce_core::RelationOrigin::Compiler).expect("origin"),
+                            confidence,
+                        ],
+                    )
+                    .expect("relation");
+            }
+        }
+        let grouped = store
+            .relations_for_entities(
+                "snapshot",
+                &["a".to_owned(), "d".to_owned()],
+                RelationDirection::Outgoing,
+                1,
+            )
+            .expect("batched relations");
+        assert_eq!(grouped["a"][0].id, "r1");
+        assert_eq!(grouped["d"][0].id, "r3");
+        assert_eq!(grouped["a"].len(), 1);
+        assert_eq!(grouped["d"].len(), 1);
     }
 }

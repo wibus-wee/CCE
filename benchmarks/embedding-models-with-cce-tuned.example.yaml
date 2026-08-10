@@ -1,0 +1,10 @@
+models:
+  - name: multilingual-e5-small-base
+    model: intfloat/multilingual-e5-small
+    revision: 614241f622f53c4eeff9890bdc4f31cfecc418b3
+    query_prefix: "query: "
+    document_prefix: "passage: "
+  - name: cce-e5-enhanced
+    model: research/output/models/cce-e5-enhanced
+    query_prefix: "query: "
+    document_prefix: "passage: "

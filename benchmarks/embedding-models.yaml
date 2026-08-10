@@ -1,0 +1,15 @@
+models:
+  - name: multilingual-e5-small-base
+    model: intfloat/multilingual-e5-small
+    revision: 614241f622f53c4eeff9890bdc4f31cfecc418b3
+    query_prefix: "query: "
+    document_prefix: "passage: "
+  - name: bge-small-en-v1.5-base
+    model: BAAI/bge-small-en-v1.5
+    revision: 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
+    query_prefix: "Represent this sentence for searching relevant passages: "
+  - name: jina-code-v2-base
+    model: jinaai/jina-embeddings-v2-base-code
+    revision: 516f4baf13dec4ddddda8631e019b5737c8bc250
+    code_revision: 3baf9e3ac750e76e8edd3019170176884695fb94
+    trust_remote_code: true

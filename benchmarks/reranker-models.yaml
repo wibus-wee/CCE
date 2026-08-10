@@ -1,0 +1,6 @@
+models:
+  - name: jina-reranker-v1-turbo-en-onnx
+    model: jinaai/jina-reranker-v1-turbo-en
+    revision: 5bcd26bbe1913aff3cc1983d91f2c3ac9ee91cbf
+    backend: onnx
+    file_name: onnx/model.onnx

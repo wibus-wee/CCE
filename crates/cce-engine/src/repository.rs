@@ -182,6 +182,8 @@ fn is_probably_binary(bytes: &[u8]) -> bool {
 fn language_for_path(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "rs" => Some("rust"),
+        "c" | "h" => Some("c"),
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => Some("cpp"),
         "ts" | "mts" | "cts" => Some("typescript"),
         "tsx" => Some("tsx"),
         "js" | "mjs" | "cjs" | "jsx" => Some("javascript"),
