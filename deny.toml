@@ -1,7 +1,12 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+  # Transitive chain: fastembed -> tokenizers -> paste. The advisory marks
+  # paste as unmaintained and explicitly has no safe upgrade; this is not a
+  # vulnerability. Keep the exception exact so all other advisories fail CI.
+  "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
