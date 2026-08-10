@@ -15,7 +15,12 @@ from typing import Any
 import numpy as np
 import yaml
 
-from .model_benchmark import evaluate_ranks, percentile, sha256_file
+from .model_benchmark import (
+    evaluate_ranks,
+    percentile,
+    require_sentence_transformers,
+    sha256_file,
+)
 from .schema import TrainingExample, load_jsonl
 
 
@@ -124,14 +129,14 @@ def benchmark_reranker(
     batch_size: int,
     candidates: int,
 ) -> RerankerMeasurement:
-    from sentence_transformers import CrossEncoder
+    sentence_transformers: Any = require_sentence_transformers()
 
     model_kwargs: dict[str, Any] = {}
     if spec.backend == "onnx":
         model_kwargs["provider"] = "CPUExecutionProvider"
         if spec.file_name:
             model_kwargs["file_name"] = spec.file_name
-    model = CrossEncoder(
+    model = sentence_transformers.CrossEncoder(
         spec.model,
         revision=spec.revision,
         trust_remote_code=spec.trust_remote_code,
