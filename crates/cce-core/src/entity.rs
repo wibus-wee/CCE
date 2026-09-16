@@ -9,6 +9,7 @@ pub enum EntityKind {
     Repository,
     Directory,
     File,
+    Package,
     Module,
     Namespace,
     Class,
@@ -40,6 +41,9 @@ pub struct CodeEntity {
     pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Canonical region this entity occupies, when it maps to a source range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<SourceAddress>,
     #[serde(default)]

@@ -74,7 +74,7 @@ impl ArtifactStore {
             .replace('\\', "/");
 
         if destination.exists() {
-            self.verify_existing(&destination, &digest, bytes.len() as u64)?;
+            Self::verify_existing(&destination, &digest, bytes.len() as u64)?;
             return Ok(ArtifactRecord {
                 digest,
                 kind,
@@ -101,7 +101,7 @@ impl ArtifactStore {
         match temporary.persist_noclobber(&destination) {
             Ok(_) => {}
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                self.verify_existing(&destination, &digest, bytes.len() as u64)?;
+                Self::verify_existing(&destination, &digest, bytes.len() as u64)?;
             }
             Err(error) => return Err(CceError::io(&destination, error.error)),
         }
@@ -128,6 +128,72 @@ impl ArtifactStore {
         Ok(self.path_for(digest)?.is_file())
     }
 
+    /// Remove object files whose digest is not in `keep`, clear the temporary
+    /// directory, and drop empty prefix directories. `keep` is the set of
+    /// digests still referenced by metadata.
+    pub fn retain(&self, keep: &std::collections::HashSet<String>) -> Result<crate::GcReport> {
+        let mut report = crate::GcReport {
+            pruned_snapshots: 0,
+            removed_digests: 0,
+            removed_orphan_files: 0,
+            reclaimed_bytes: 0,
+        };
+        if self.temporary.is_dir() {
+            for entry in fs::read_dir(&self.temporary)
+                .map_err(|error| CceError::io(&self.temporary, error))?
+            {
+                let entry = entry.map_err(|error| CceError::io(&self.temporary, error))?;
+                let path = entry.path();
+                if path.is_file() {
+                    report.reclaimed_bytes += entry
+                        .metadata()
+                        .map_err(|error| CceError::io(&path, error))?
+                        .len();
+                    fs::remove_file(&path).map_err(|error| CceError::io(&path, error))?;
+                    report.removed_orphan_files += 1;
+                }
+            }
+        }
+        if !self.objects.is_dir() {
+            return Ok(report);
+        }
+        for prefix in
+            fs::read_dir(&self.objects).map_err(|error| CceError::io(&self.objects, error))?
+        {
+            let prefix = prefix.map_err(|error| CceError::io(&self.objects, error))?;
+            let prefix_path = prefix.path();
+            if !prefix_path.is_dir() {
+                continue;
+            }
+            for entry in
+                fs::read_dir(&prefix_path).map_err(|error| CceError::io(&prefix_path, error))?
+            {
+                let entry = entry.map_err(|error| CceError::io(&prefix_path, error))?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let digest = format!(
+                    "{}{}",
+                    prefix.file_name().to_string_lossy(),
+                    entry.file_name().to_string_lossy()
+                );
+                if keep.contains(&digest) {
+                    continue;
+                }
+                report.reclaimed_bytes += entry
+                    .metadata()
+                    .map_err(|error| CceError::io(&path, error))?
+                    .len();
+                fs::remove_file(&path).map_err(|error| CceError::io(&path, error))?;
+                report.removed_orphan_files += 1;
+            }
+            // Drop the prefix directory when it is now empty.
+            let _ = fs::remove_dir(&prefix_path);
+        }
+        Ok(report)
+    }
+
     fn path_for(&self, digest: &str) -> Result<PathBuf> {
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(CceError::ArtifactCorrupt(digest.to_owned()));
@@ -135,7 +201,7 @@ impl ArtifactStore {
         Ok(self.objects.join(&digest[..2]).join(&digest[2..]))
     }
 
-    fn verify_existing(&self, path: &Path, digest: &str, expected_size: u64) -> Result<()> {
+    fn verify_existing(path: &Path, digest: &str, expected_size: u64) -> Result<()> {
         let metadata = fs::metadata(path).map_err(|error| CceError::io(path, error))?;
         if metadata.len() != expected_size {
             return Err(CceError::ArtifactCorrupt(digest.to_owned()));

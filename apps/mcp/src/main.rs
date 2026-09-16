@@ -21,21 +21,21 @@ struct Arguments {
     data_dir: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = DenseMode::Disabled)]
     dense: DenseMode,
-    #[arg(long, env = "CCE_EMBEDDING_BASE_URL")]
-    embedding_base_url: Option<String>,
+    /// Local embedding model code, used with --dense local.
     #[arg(long, env = "CCE_EMBEDDING_MODEL")]
     embedding_model: Option<String>,
-    #[arg(long, default_value = "CCE_EMBEDDING_API_KEY")]
-    embedding_api_key_environment: String,
     #[arg(long)]
     embedding_dimensions: Option<usize>,
 }
+
+const DEFAULT_LOCAL_MODEL: &str = "intfloat/multilingual-e5-small";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DenseMode {
     Disabled,
     Baseline,
-    Provider,
+    /// In-process ONNX model via fastembed; downloads model files once, then offline.
+    Local,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,16 +82,10 @@ async fn main() -> anyhow::Result<()> {
         DenseMode::Baseline => DenseBackendConfig::DeterministicBaseline {
             dimensions: arguments.embedding_dimensions.unwrap_or(512),
         },
-        DenseMode::Provider => DenseBackendConfig::OpenAiCompatible {
-            base_url: arguments
-                .embedding_base_url
-                .ok_or_else(|| anyhow::anyhow!("--embedding-base-url is required"))?,
+        DenseMode::Local => DenseBackendConfig::Local {
             model: arguments
                 .embedding_model
-                .ok_or_else(|| anyhow::anyhow!("--embedding-model is required"))?,
-            api_key_environment: arguments.embedding_api_key_environment,
-            dimensions: arguments.embedding_dimensions,
-            batch_size: 32,
+                .unwrap_or_else(|| DEFAULT_LOCAL_MODEL.to_owned()),
         },
     };
     serve(Arc::new(CceEngine::open(config)?)).await
@@ -223,6 +217,18 @@ async fn call_tool(engine: &CceEngine, params: &Value) -> Result<Value, (i32, St
             )
             .map_err(|error| (-32603, error.to_string()))?
         }
+        "cce_map" => serde_json::to_value(engine.codebase_map().await.map_err(tool_error)?)
+            .map_err(|error| (-32603, error.to_string()))?,
+        "cce_explain" => {
+            let name = required_string(&arguments, "name")?;
+            serde_json::to_value(engine.explain_component(&name).await.map_err(tool_error)?)
+                .map_err(|error| (-32603, error.to_string()))?
+        }
+        "cce_impact" => {
+            let name = required_string(&arguments, "name")?;
+            serde_json::to_value(engine.impact_analysis(&name).await.map_err(tool_error)?)
+                .map_err(|error| (-32603, error.to_string()))?
+        }
         _ => return Err((-32602, format!("unknown tool: {name}"))),
     };
     let text = serde_json::to_string_pretty(&value).map_err(|error| (-32603, error.to_string()))?;
@@ -258,7 +264,7 @@ fn tools() -> Vec<Value> {
                 "properties": {
                     "query": {"type": "string", "minLength": 1},
                     "intent": intent_schema(),
-                    "budgetTokens": {"type": "integer", "minimum": 256, "maximum": 128000},
+                    "budgetTokens": {"type": "integer", "minimum": 256, "maximum": 128_000},
                     "maxCandidates": {"type": "integer", "minimum": 1, "maximum": 500}
                 },
                 "required": ["query"],
@@ -271,6 +277,31 @@ fn tools() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {"name": {"type": "string", "minLength": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}},
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "cce_map",
+            "Package-level architecture map: build boundaries and dependency direction",
+            json!({"type": "object", "additionalProperties": false}),
+        ),
+        tool(
+            "cce_explain",
+            "Explain a package or symbol: members, dependencies, dependents, tests",
+            json!({
+                "type": "object",
+                "properties": {"name": {"type": "string", "minLength": 1}},
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "cce_impact",
+            "Blast radius of a symbol or package through persisted impact edges",
+            json!({
+                "type": "object",
+                "properties": {"name": {"type": "string", "minLength": 1}},
                 "required": ["name"],
                 "additionalProperties": false
             }),

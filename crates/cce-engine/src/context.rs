@@ -16,6 +16,8 @@ pub struct ContextRequest {
     pub budget_tokens: usize,
     pub max_candidates: usize,
     pub require_fresh: bool,
+    #[serde(default)]
+    pub routes: Vec<SearchRoute>,
 }
 
 impl ContextRequest {
@@ -27,6 +29,7 @@ impl ContextRequest {
             budget_tokens,
             max_candidates: 50,
             require_fresh: true,
+            routes: Vec::new(),
         }
     }
 }
@@ -68,78 +71,64 @@ impl ContextPacker {
             used_tokens += orientation_tokens;
         }
 
+        // Role-aware packing: every evidence role that produced a hit keeps a
+        // quota slot, then the remaining budget is filled in rank order. This
+        // prevents a dominant top-K of raw targets from starving callers,
+        // tests, config, and history that the task actually needs.
+        let classified = search
+            .hits
+            .iter()
+            .map(|hit| (role_of(hit), hit))
+            .collect::<Vec<_>>();
         let mut seen_entities = HashSet::new();
         let mut seen_ranges = HashSet::new();
         let mut ranges_per_file = HashMap::<String, usize>::new();
-        for hit in &search.hits {
-            let range_key = hit.address.as_ref().map(|address| {
-                (
-                    address.path.clone(),
-                    address.start_byte,
-                    address.end_byte,
-                    hit.representation.clone(),
-                )
-            });
-            if range_key
-                .as_ref()
-                .is_some_and(|key| !seen_ranges.insert(key.clone()))
-            {
-                continue;
-            }
-            if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
-                let count = ranges_per_file.entry(path.clone()).or_default();
-                if *count >= 4 {
-                    continue;
+        let mut taken = HashSet::new();
+        for role in [
+            ContextRole::Test,
+            ContextRole::Contract,
+            ContextRole::Caller,
+            ContextRole::Config,
+            ContextRole::History,
+            ContextRole::Knowledge,
+        ] {
+            if let Some((_, hit)) = classified.iter().find(|(hit_role, hit)| {
+                *hit_role == role && !taken.contains(hit.document_id.as_str())
+            }) {
+                if let Some(item) = render_item(
+                    hit,
+                    role,
+                    search,
+                    budget_tokens,
+                    used_tokens,
+                    &mut seen_entities,
+                    &mut seen_ranges,
+                    &mut ranges_per_file,
+                ) {
+                    used_tokens += item.estimated_tokens;
+                    taken.insert(hit.document_id.clone());
+                    items.push(item);
                 }
-                *count += 1;
             }
-            let first_entity_occurrence = seen_entities.insert(hit.entity_id.clone());
-            if !first_entity_occurrence && hit.address.is_none() {
+        }
+        for (role, hit) in &classified {
+            if taken.contains(hit.document_id.as_str()) {
                 continue;
             }
-            let body = render_hit(hit);
-            let tokens = estimate_tokens(&body);
-            if tokens > budget_tokens.saturating_sub(used_tokens) {
-                continue;
+            if let Some(item) = render_item(
+                hit,
+                *role,
+                search,
+                budget_tokens,
+                used_tokens,
+                &mut seen_entities,
+                &mut seen_ranges,
+                &mut ranges_per_file,
+            ) {
+                used_tokens += item.estimated_tokens;
+                taken.insert(hit.document_id.clone());
+                items.push(item);
             }
-            let kind = match hit.representation {
-                cce_core::RetrievalRepresentation::TestBehavior => ContextItemKind::Test,
-                cce_core::RetrievalRepresentation::CommitSummary => ContextItemKind::History,
-                cce_core::RetrievalRepresentation::RoleSummary
-                | cce_core::RetrievalRepresentation::ModuleSummary
-                | cce_core::RetrievalRepresentation::FlowSummary
-                | cce_core::RetrievalRepresentation::KnowledgePage => ContextItemKind::Knowledge,
-                _ if hit.route == SearchRoute::Structural => ContextItemKind::RelationPath,
-                _ if hit.route == SearchRoute::ExactSymbol => ContextItemKind::EntryPoint,
-                _ => ContextItemKind::Source,
-            };
-            items.push(ContextItem {
-                id: hit.document_id.clone(),
-                kind,
-                title: hit.address.as_ref().map_or_else(
-                    || hit.entity_id.clone(),
-                    |address| {
-                        format!(
-                            "{}:{}-{}",
-                            address.path, address.start_line, address.end_line
-                        )
-                    },
-                ),
-                body,
-                estimated_tokens: tokens,
-                provenance: ContextProvenance {
-                    why_retrieved: hit.explanation.join("; "),
-                    route: hit.route,
-                    rank: hit.rank,
-                    score: hit.score,
-                    snapshot_id: search.request.snapshot_id.clone(),
-                    verified_current: hit.verified_current,
-                    symbol_name: hit.symbol_name.clone(),
-                    source_address: hit.address.clone(),
-                    evidence_addresses: hit.evidence.clone(),
-                },
-            });
-            used_tokens += tokens;
         }
         let uncertainties = search
             .missing_capabilities
@@ -157,6 +146,8 @@ impl ContextPacker {
             snapshot_id: search.request.snapshot_id.clone(),
             query: search.request.query.clone(),
             intent: search.plan.intent,
+            plan_routes: search.plan.routes.clone(),
+            graph_policy: Some(search.plan.graph_policy),
             budget_tokens,
             used_tokens,
             items,
@@ -176,11 +167,135 @@ impl CceEngine {
                 intent: request.intent,
                 limit: request.max_candidates,
                 require_fresh: request.require_fresh,
-                routes: Vec::new(),
+                routes: request.routes,
             })
             .await?;
         Ok(ContextPacker::new().pack(&search, request.budget_tokens))
     }
+}
+
+/// The task-facing role a hit plays in the delivered pack. Distinct from
+/// `ContextItemKind` (wire format): roles drive quota selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextRole {
+    Target,
+    Contract,
+    Caller,
+    Test,
+    Config,
+    History,
+    Knowledge,
+}
+
+fn role_of(hit: &cce_core::SearchHit) -> ContextRole {
+    use cce_core::RetrievalRepresentation as Repr;
+    match hit.representation {
+        Repr::TestBehavior => ContextRole::Test,
+        Repr::CommitSummary => ContextRole::History,
+        Repr::RoleSummary | Repr::ModuleSummary | Repr::FlowSummary | Repr::KnowledgePage => {
+            ContextRole::Knowledge
+        }
+        Repr::Signature if hit.route == SearchRoute::Structural => ContextRole::Caller,
+        Repr::Signature => ContextRole::Contract,
+        _ => {
+            if hit.route == SearchRoute::Structural {
+                ContextRole::Caller
+            } else if hit.address.as_ref().is_some_and(|address| {
+                let path = std::path::Path::new(&address.path);
+                let config_extension = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        ["toml", "yaml", "yml", "lock"]
+                            .iter()
+                            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+                    });
+                config_extension || path.file_name().is_some_and(|name| name == "package.json")
+            }) {
+                ContextRole::Config
+            } else {
+                ContextRole::Target
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_item(
+    hit: &cce_core::SearchHit,
+    role: ContextRole,
+    search: &SearchResult,
+    budget_tokens: usize,
+    used_tokens: usize,
+    seen_entities: &mut HashSet<String>,
+    seen_ranges: &mut HashSet<(String, u64, u64)>,
+    ranges_per_file: &mut HashMap<String, usize>,
+) -> Option<ContextItem> {
+    // One item per source range: a symbol's summary, signature, and raw
+    // chunks are the same evidence wearing different representations, so
+    // whichever ranks highest wins the slot.
+    let range_key = hit
+        .address
+        .as_ref()
+        .map(|address| (address.path.clone(), address.start_byte, address.end_byte));
+    if range_key
+        .as_ref()
+        .is_some_and(|key| !seen_ranges.insert(key.clone()))
+    {
+        return None;
+    }
+    if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
+        let count = ranges_per_file.entry(path.clone()).or_default();
+        if *count >= 4 {
+            return None;
+        }
+        *count += 1;
+    }
+    let first_entity_occurrence = seen_entities.insert(hit.entity_id.clone());
+    if !first_entity_occurrence && hit.address.is_none() {
+        return None;
+    }
+    let body = render_hit(hit);
+    let tokens = estimate_tokens(&body);
+    if tokens > budget_tokens.saturating_sub(used_tokens) {
+        return None;
+    }
+    let kind = match role {
+        ContextRole::Test => ContextItemKind::Test,
+        ContextRole::History => ContextItemKind::History,
+        ContextRole::Knowledge => ContextItemKind::Knowledge,
+        ContextRole::Caller => ContextItemKind::RelationPath,
+        ContextRole::Contract => ContextItemKind::Contract,
+        ContextRole::Config => ContextItemKind::Config,
+        ContextRole::Target if hit.route == SearchRoute::ExactSymbol => ContextItemKind::EntryPoint,
+        ContextRole::Target => ContextItemKind::Source,
+    };
+    Some(ContextItem {
+        id: hit.document_id.clone(),
+        kind,
+        title: hit.address.as_ref().map_or_else(
+            || hit.entity_id.clone(),
+            |address| {
+                format!(
+                    "{}:{}-{}",
+                    address.path, address.start_line, address.end_line
+                )
+            },
+        ),
+        body,
+        estimated_tokens: tokens,
+        provenance: ContextProvenance {
+            why_retrieved: hit.explanation.join("; "),
+            route: hit.route,
+            rank: hit.rank,
+            score: hit.score,
+            snapshot_id: search.request.snapshot_id.clone(),
+            verified_current: hit.verified_current,
+            symbol_name: hit.symbol_name.clone(),
+            source_address: hit.address.clone(),
+            evidence_addresses: hit.evidence.clone(),
+        },
+    })
 }
 
 fn orientation(search: &SearchResult) -> String {

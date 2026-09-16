@@ -26,6 +26,7 @@ pub enum RelationKind {
     UsesHook,
     SerializesAs,
     PersistsTo,
+    ChangedWith,
     Semantic,
     Other(String),
 }

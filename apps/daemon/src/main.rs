@@ -4,7 +4,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderName, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -34,21 +34,21 @@ struct Arguments {
     web_root: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = DenseMode::Disabled)]
     dense: DenseMode,
-    #[arg(long, env = "CCE_EMBEDDING_BASE_URL")]
-    embedding_base_url: Option<String>,
+    /// Local embedding model code, used with --dense local.
     #[arg(long, env = "CCE_EMBEDDING_MODEL")]
     embedding_model: Option<String>,
-    #[arg(long, default_value = "CCE_EMBEDDING_API_KEY")]
-    embedding_api_key_environment: String,
     #[arg(long)]
     embedding_dimensions: Option<usize>,
 }
+
+const DEFAULT_LOCAL_MODEL: &str = "intfloat/multilingual-e5-small";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DenseMode {
     Disabled,
     Baseline,
-    Provider,
+    /// In-process ONNX model via fastembed; downloads model files once, then offline.
+    Local,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,16 +127,10 @@ async fn main() -> anyhow::Result<()> {
         DenseMode::Baseline => DenseBackendConfig::DeterministicBaseline {
             dimensions: arguments.embedding_dimensions.unwrap_or(512),
         },
-        DenseMode::Provider => DenseBackendConfig::OpenAiCompatible {
-            base_url: arguments
-                .embedding_base_url
-                .ok_or_else(|| anyhow::anyhow!("--embedding-base-url is required"))?,
+        DenseMode::Local => DenseBackendConfig::Local {
             model: arguments
                 .embedding_model
-                .ok_or_else(|| anyhow::anyhow!("--embedding-model is required"))?,
-            api_key_environment: arguments.embedding_api_key_environment,
-            dimensions: arguments.embedding_dimensions,
-            batch_size: 32,
+                .unwrap_or_else(|| DEFAULT_LOCAL_MODEL.to_owned()),
         },
     };
     let state = Arc::new(CceEngine::open(config)?);
@@ -147,6 +141,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/status", get(status))
         .route("/v1/search", post(search))
         .route("/v1/context", post(context))
+        .route("/v1/map", get(codebase_map))
+        .route("/v1/explain/{name}", get(explain))
+        .route("/v1/impact/{name}", get(impact))
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
         .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
@@ -208,6 +205,26 @@ async fn context(
     request.budget_tokens = request.budget_tokens.clamp(256, 128_000);
     request.max_candidates = request.max_candidates.clamp(1, 500);
     Ok(Json(engine.context(request).await?))
+}
+
+async fn codebase_map(
+    State(engine): State<Arc<CceEngine>>,
+) -> Result<Json<cce_engine::CodebaseMap>, ApiError> {
+    Ok(Json(engine.codebase_map().await?))
+}
+
+async fn explain(
+    State(engine): State<Arc<CceEngine>>,
+    Path(name): Path<String>,
+) -> Result<Json<cce_engine::ComponentExplanation>, ApiError> {
+    Ok(Json(engine.explain_component(&name).await?))
+}
+
+async fn impact(
+    State(engine): State<Arc<CceEngine>>,
+    Path(name): Path<String>,
+) -> Result<Json<cce_engine::ImpactReport>, ApiError> {
+    Ok(Json(engine.impact_analysis(&name).await?))
 }
 
 async fn shutdown_signal() {

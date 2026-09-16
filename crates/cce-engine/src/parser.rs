@@ -15,11 +15,27 @@ pub struct ParsedUnit {
     pub end_line: u32,
     pub parent_unit: Option<usize>,
     pub syntax_kind: String,
+    /// Identifier spellings appearing in type positions inside this unit's
+    /// range (sorted, deduplicated) — `fn f(x: &Token)` contributes `Token`.
+    /// These are spellings for `References` edges, not resolved types.
+    pub type_references: Vec<String>,
+}
+
+/// A call expression attributed to the innermost symbol that contains it.
+/// `caller` indexes into `ParsedFile::units`; `None` means the call sits at
+/// file scope (outside any extracted symbol).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedCall {
+    pub caller: Option<usize>,
+    pub name: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedFile {
     pub units: Vec<ParsedUnit>,
+    pub calls: Vec<ParsedCall>,
     pub parsed: bool,
     pub has_syntax_errors: bool,
     pub parser: Option<String>,
@@ -39,7 +55,9 @@ impl SourceParser {
         language(language_name).is_some()
     }
 
-    pub fn parse(&self, file: &ScannedFile) -> ParsedFile {
+    /// `source` must be the file's current bytes (verified against
+    /// `file.content_hash` by the caller).
+    pub fn parse(&self, file: &ScannedFile, source: &[u8]) -> ParsedFile {
         let Some(language_name) = file.language.as_deref() else {
             return unparsed();
         };
@@ -50,20 +68,30 @@ impl SourceParser {
         if parser.set_language(&language).is_err() {
             return unparsed();
         }
-        let Some(tree) = parser.parse(&file.bytes, None) else {
+        let Some(tree) = parser.parse(source, None) else {
             return unparsed();
         };
         let root = tree.root_node();
         let mut candidates = Vec::new();
-        collect_candidates(root, language_name, &file.bytes, &mut candidates);
+        collect_candidates(root, language_name, source, &mut candidates);
         candidates.sort_by(|left, right| {
             left.start_byte
                 .cmp(&right.start_byte)
                 .then_with(|| right.end_byte.cmp(&left.end_byte))
         });
         assign_parents(&mut candidates);
+        let mut calls = Vec::new();
+        collect_calls(root, language_name, source, &mut calls);
+        // Units are sorted by start byte, so the innermost enclosing unit is
+        // the last one whose range covers the call site.
+        for call in &mut calls {
+            call.caller = candidates.iter().rposition(|unit| {
+                unit.start_byte <= call.start_byte && unit.end_byte >= call.end_byte
+            });
+        }
         ParsedFile {
             units: candidates,
+            calls,
             parsed: true,
             has_syntax_errors: root.has_error(),
             parser: Some(format!("tree-sitter-{language_name}")),
@@ -74,9 +102,157 @@ impl SourceParser {
 fn unparsed() -> ParsedFile {
     ParsedFile {
         units: Vec::new(),
+        calls: Vec::new(),
         parsed: false,
         has_syntax_errors: false,
         parser: None,
+    }
+}
+
+fn is_call_node(language: &str, kind: &str) -> bool {
+    match language {
+        "rust" | "typescript" | "tsx" | "javascript" | "go" => kind == "call_expression",
+        "python" => kind == "call",
+        "java" => kind == "method_invocation" || kind == "object_creation_expression",
+        "csharp" => kind == "invocation_expression" || kind == "object_creation_expression",
+        _ => false,
+    }
+}
+
+fn collect_calls(node: Node<'_>, language: &str, source: &[u8], output: &mut Vec<ParsedCall>) {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if is_call_node(language, current.kind()) {
+            let target = current
+                .child_by_field_name("function")
+                .or_else(|| current.child_by_field_name("name"))
+                .or_else(|| current.child_by_field_name("type"))
+                .or_else(|| current.child_by_field_name("constructor"));
+            if let Some(name) = target.and_then(|node| call_target_name(node, source)) {
+                if !name.is_empty() && name.chars().all(|c| c != ' ' && c != '(') {
+                    output.push(ParsedCall {
+                        caller: None,
+                        name,
+                        start_byte: current.start_byte(),
+                        end_byte: current.end_byte(),
+                    });
+                }
+            }
+        }
+        for index in (0..current.child_count())
+            .rev()
+            .filter_map(|value| u32::try_from(value).ok())
+        {
+            if let Some(child) = current.child(index) {
+                if child.is_named() {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a callee expression to its terminal identifier: `foo()` → `foo`,
+/// `a.b.c()` → `c`, `Type::method()` → `method`, `new Foo()` → `Foo`.
+fn call_target_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier"
+        | "field_identifier"
+        | "property_identifier"
+        | "type_identifier"
+        | "attribute"
+        | "shorthand_property_identifier" => node.utf8_text(source).ok().map(str::to_owned),
+        "type_arguments" | "arguments" | "argument_list" => None,
+        _ => (0..node.named_child_count())
+            .rev()
+            .filter_map(|index| u32::try_from(index).ok())
+            .filter_map(|index| node.named_child(index))
+            .find_map(|child| call_target_name(child, source)),
+    }
+}
+
+/// Identifier spellings found in type positions under `node`: leaf
+/// `type_identifier`s across grammars, the terminal name of scoped paths
+/// (`a::b::Foo`, `a.b.Foo`), all identifiers inside Python `type`
+/// annotations and class base lists, and C# `generic_name` members.
+fn collect_type_references(
+    node: Node<'_>,
+    language: &str,
+    source: &[u8],
+    output: &mut Vec<String>,
+) {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        let kind = current.kind();
+        if kind == "type_identifier" {
+            push_node_text(current, source, output);
+            continue;
+        }
+        if matches!(
+            kind,
+            "scoped_type_identifier"
+                | "nested_type_identifier"
+                | "qualified_type"
+                | "qualified_name"
+        ) {
+            if let Some(name) = (0..current.named_child_count())
+                .rev()
+                .filter_map(|index| u32::try_from(index).ok())
+                .filter_map(|index| current.named_child(index))
+                .find_map(|child| child.utf8_text(source).ok())
+            {
+                output.push(name.to_owned());
+            }
+            continue;
+        }
+        if kind == "generic_name" || (language == "python" && kind == "type") {
+            collect_identifiers(current, source, output);
+            continue;
+        }
+        if language == "python" && kind == "class_definition" {
+            // Base classes sit in `superclasses`, outside `type` nodes.
+            if let Some(bases) = current.child_by_field_name("superclasses") {
+                collect_identifiers(bases, source, output);
+            }
+        }
+        for index in (0..current.child_count())
+            .rev()
+            .filter_map(|value| u32::try_from(value).ok())
+        {
+            if let Some(child) = current.child(index) {
+                if child.is_named() {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+}
+
+/// Every `identifier` descendant of `node` — used where a grammar does not
+/// mark type names distinctly (Python annotations, C# generics).
+fn collect_identifiers(node: Node<'_>, source: &[u8], output: &mut Vec<String>) {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "identifier" {
+            push_node_text(current, source, output);
+            continue;
+        }
+        for index in (0..current.child_count())
+            .rev()
+            .filter_map(|value| u32::try_from(value).ok())
+        {
+            if let Some(child) = current.child(index) {
+                if child.is_named() {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+}
+
+fn push_node_text(node: Node<'_>, source: &[u8], output: &mut Vec<String>) {
+    if let Ok(text) = node.utf8_text(source) {
+        output.push(text.to_owned());
     }
 }
 
@@ -100,6 +276,10 @@ fn collect_candidates(node: Node<'_>, language: &str, source: &[u8], output: &mu
         if let Some(kind) = entity_kind(language, current.kind()) {
             if let Some(name) = node_name(current, source) {
                 let signature = signature(current, source);
+                let mut type_references = Vec::new();
+                collect_type_references(current, language, source, &mut type_references);
+                type_references.sort_unstable();
+                type_references.dedup();
                 output.push(ParsedUnit {
                     kind,
                     name,
@@ -110,6 +290,7 @@ fn collect_candidates(node: Node<'_>, language: &str, source: &[u8], output: &mu
                     end_line: current.end_position().row as u32 + 1,
                     parent_unit: None,
                     syntax_kind: current.kind().to_owned(),
+                    type_references,
                 });
             }
         }
@@ -215,10 +396,12 @@ mod tests {
             absolute_path: PathBuf::from("src/store.rs"),
             language: Some("rust".to_owned()),
             content_hash: blake3::hash(&source).to_hex().to_string(),
+            size_bytes: source.len() as u64,
+            mtime_ms: 0,
             line_count: 2,
-            bytes: source,
+            cached_bytes: Some(source.clone()),
         };
-        let parsed = SourceParser::new().parse(&file);
+        let parsed = SourceParser::new().parse(&file, &source);
         assert!(parsed.parsed);
         assert!(parsed.units.iter().any(|unit| unit.name == "Store"));
         assert!(parsed.units.iter().any(|unit| unit.name == "open"));

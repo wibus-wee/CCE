@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .adapters import Adapter
-from .metrics import evaluate
+from .metrics import compare, evaluate
 from .schema import BenchmarkCase, CaseResult, ResultBundleManifest, load_jsonl
 
 app = typer.Typer(no_args_is_help=True)
@@ -46,6 +46,31 @@ def evaluate_results(dataset: Path, results: Path, output: Path | None = None) -
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
             json.dumps({key: asdict(value) for key, value in summary.items()}, indent=2),
+            encoding="utf-8",
+        )
+
+
+@app.command("compare")
+def compare_results(dataset: Path, baseline: Path, candidate: Path, output: Path | None = None) -> None:
+    """Paired per-case deltas (candidate - baseline) with bootstrap CIs.
+    Both result bundles must cover the same cases in `dataset`."""
+    cases = list(load_jsonl(dataset, BenchmarkCase))
+    baseline_results = list(load_jsonl(baseline, CaseResult))
+    candidate_results = list(load_jsonl(candidate, CaseResult))
+    deltas = compare(cases, baseline_results, candidate_results)
+    table = Table("Metric", "Delta", "95% CI", "N")
+    for name, metric in deltas.items():
+        table.add_row(
+            name,
+            f"{metric.value:+.4f}",
+            f"[{metric.ci_low:+.4f}, {metric.ci_high:+.4f}]",
+            str(metric.samples),
+        )
+    console.print(table)
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps({key: asdict(value) for key, value in deltas.items()}, indent=2),
             encoding="utf-8",
         )
 

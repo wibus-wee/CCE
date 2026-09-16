@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import math
-import random
 from collections import defaultdict
 from dataclasses import dataclass
 from statistics import mean
 
 from .schema import BenchmarkCase, CaseResult, LineRange, RetrievedRange
+from .stats import Comparison, bootstrap_ci, compare_metrics
 
 
 @dataclass(frozen=True)
@@ -18,42 +18,60 @@ class MetricSummary:
 
 
 def evaluate(cases: list[BenchmarkCase], results: list[CaseResult]) -> dict[str, MetricSummary]:
+    """Per-metric summaries: overall, plus `by_intent/<intent>/<metric>`
+    groups, plus `intent_accuracy` and per-class intent precision/recall
+    over cases that withhold intent."""
     by_case = {case.case_id: case for case in cases}
     result_by_case = {result.case_id: result for result in results}
     if missing := sorted(set(by_case) - set(result_by_case)):
-        raise ValueError(f"missing results for {len(missing)} cases: {missing[:5]}")
+        raise ValueError(f"missing results for {len(cases)} cases: {missing[:5]}")
 
     observations: dict[str, list[float]] = defaultdict(list)
+    confusion = intent_confusion(cases, results)
     for case_id, case in by_case.items():
         result = result_by_case[case_id]
-        for cutoff in (5, 10, 20, 50):
-            observations[f"recall@{cutoff}"].append(range_recall(case, result.retrieved[:cutoff]))
-            observations[f"file_recall@{cutoff}"].append(
-                file_recall(case, result.retrieved[:cutoff])
+        per_case = case_observations(case, result)
+        for name, value in per_case.items():
+            observations[name].append(value)
+            observations[f"by_intent/{case.intent}/{name}"].append(value)
+        if not case.supply_intent:
+            observations["intent_accuracy"].append(
+                float(result.predicted_intent == case.intent)
             )
-        observations["mrr"].append(reciprocal_rank(case, result.retrieved))
-        observations["ndcg@10"].append(ndcg(case, result.retrieved[:10]))
-        observations["symbol_recall@20"].append(symbol_recall(case, result.retrieved[:20]))
-        observations["line_recall@20"].append(range_recall(case, result.retrieved[:20]))
-        observations["file_success@20"].append(file_success(case, result.retrieved[:20]))
-        observations["abstention_accuracy"].append(float(result.abstained == case.no_context))
-        observations["relevant_line_density"].append(relevant_line_density(case, result.retrieved))
-        observations["citation_correctness"].append(citation_correctness(result.retrieved))
-        observations["query_ms"].append(result.query_ms)
 
     summaries = {name: bootstrap(values) for name, values in sorted(observations.items())}
-    predictions = [result_by_case[case_id].abstained for case_id in by_case]
+    for gold_intent, predictions in confusion.items():
+        total = sum(predictions.values())
+        correct = predictions.get(gold_intent, 0)
+        summaries[f"intent_recall/{gold_intent}"] = MetricSummary(
+            correct / total if total else 0.0,
+            correct / total if total else 0.0,
+            correct / total if total else 0.0,
+            total,
+        )
+    predicted_totals: dict[str, int] = defaultdict(int)
+    predicted_correct: dict[str, int] = defaultdict(int)
+    for gold_intent, predictions in confusion.items():
+        for predicted, count in predictions.items():
+            predicted_totals[predicted] += count
+            if predicted == gold_intent:
+                predicted_correct[predicted] += count
+    for predicted, total in predicted_totals.items():
+        value = predicted_correct[predicted] / total
+        summaries[f"intent_precision/{predicted}"] = MetricSummary(value, value, value, total)
+
+    predictions_flags = [result_by_case[case_id].abstained for case_id in by_case]
     labels = [by_case[case_id].no_context for case_id in by_case]
-    predicted_no_context = sum(predictions)
+    predicted_no_context = sum(predictions_flags)
     true_no_context = sum(
-        prediction and label for prediction, label in zip(predictions, labels, strict=True)
+        prediction and label for prediction, label in zip(predictions_flags, labels, strict=True)
     )
     no_context_cases = sum(labels)
     precision = true_no_context / predicted_no_context if predicted_no_context else 1.0
     false_positive_rate = (
         sum(
             (not prediction) and label
-            for prediction, label in zip(predictions, labels, strict=True)
+            for prediction, label in zip(predictions_flags, labels, strict=True)
         )
         / no_context_cases
         if no_context_cases
@@ -64,6 +82,78 @@ def evaluate(cases: list[BenchmarkCase], results: list[CaseResult]) -> dict[str,
         false_positive_rate, false_positive_rate, false_positive_rate, len(cases)
     )
     return dict(sorted(summaries.items()))
+
+
+def compare(
+    cases: list[BenchmarkCase],
+    baseline: list[CaseResult],
+    candidate: list[CaseResult],
+) -> dict[str, Comparison]:
+    """Paired per-case deltas (candidate - baseline) with bootstrap CI,
+    permutation p-value, Holm-corrected significance, effect size, and the
+    minimum detectable effect of the current suite. Systems must cover the
+    same cases."""
+    by_case = {case.case_id: case for case in cases}
+    baseline_by_case = {result.case_id: result for result in baseline}
+    candidate_by_case = {result.case_id: result for result in candidate}
+    shared = sorted(
+        set(by_case) & set(baseline_by_case) & set(candidate_by_case)
+    )
+    if missing := sorted(set(by_case) - set(shared)):
+        raise ValueError(f"case coverage differs across systems: {missing[:5]}")
+
+    left_obs: dict[str, list[float]] = defaultdict(list)
+    right_obs: dict[str, list[float]] = defaultdict(list)
+    for case_id in shared:
+        case = by_case[case_id]
+        left = case_observations(case, baseline_by_case[case_id])
+        right = case_observations(case, candidate_by_case[case_id])
+        for name in left.keys() & right.keys():
+            left_obs[name].append(left[name])
+            right_obs[name].append(right[name])
+    return compare_metrics(dict(left_obs), dict(right_obs))
+
+
+def intent_confusion(
+    cases: list[BenchmarkCase], results: list[CaseResult]
+) -> dict[str, dict[str, int]]:
+    """gold intent -> predicted intent -> count, over withheld-intent cases."""
+    result_by_case = {result.case_id: result for result in results}
+    confusion: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for case in cases:
+        if case.supply_intent:
+            continue
+        result = result_by_case.get(case.case_id)
+        predicted = (result.predicted_intent if result else None) or "unresolved"
+        confusion[case.intent][predicted] += 1
+    return {gold: dict(row) for gold, row in confusion.items()}
+
+
+def case_observations(case: BenchmarkCase, result: CaseResult) -> dict[str, float]:
+    """All per-case metric values; shared by evaluate() and compare() so both
+    always score the same definitions."""
+    observations: dict[str, float] = {}
+    for cutoff in (5, 10, 20, 50):
+        observations[f"recall@{cutoff}"] = range_recall(case, result.retrieved[:cutoff])
+        observations[f"file_recall@{cutoff}"] = file_recall(case, result.retrieved[:cutoff])
+        observations[f"unjudged_rate@{cutoff}"] = unjudged_rate(
+            case, result.retrieved[:cutoff]
+        )
+    observations["mrr"] = reciprocal_rank(case, result.retrieved)
+    observations["ndcg@10"] = ndcg(case, result.retrieved[:10])
+    observations["symbol_recall@20"] = symbol_recall(case, result.retrieved[:20])
+    observations["line_recall@20"] = range_recall(case, result.retrieved[:20])
+    observations["file_success@20"] = file_success(case, result.retrieved[:20])
+    observations["bpref@20"] = bpref(case, result.retrieved[:20])
+    if case.gold_facts:
+        observations["claim_support"] = claim_support(case, result.retrieved)
+    observations["abstention_accuracy"] = float(result.abstained == case.no_context)
+    observations["relevant_line_density"] = relevant_line_density(case, result.retrieved)
+    observations["citation_correctness"] = citation_correctness(result.retrieved)
+    observations["query_ms"] = result.query_ms
+    if result.index_ms is not None:
+        observations["index_ms"] = result.index_ms
+    return observations
 
 
 def overlaps(left: LineRange, right: LineRange) -> bool:
@@ -106,7 +196,24 @@ def reciprocal_rank(case: BenchmarkCase, retrieved: list[RetrievedRange]) -> flo
 
 
 def ndcg(case: BenchmarkCase, retrieved: list[RetrievedRange]) -> float:
-    gains = [float(relevant(case, candidate)) for candidate in retrieved]
+    # Relevance gain counts once per (path, gold unit): without deduping,
+    # several retrieved ranges inside one gold file inflate DCG past ideal
+    # and nDCG exceeds 1.0.
+    scored: set[tuple[str, int | None]] = set()
+    gains: list[float] = []
+    for candidate in retrieved:
+        gain = 0.0
+        for gold_index, gold in enumerate(case.gold_ranges):
+            key = (candidate.path, gold_index)
+            if key not in scored and overlaps(gold, candidate):
+                scored.add(key)
+                gain = 1.0
+        if candidate.path in case.gold_files:
+            key = (candidate.path, None)
+            if key not in scored:
+                scored.add(key)
+                gain = 1.0
+        gains.append(gain)
     dcg = sum(gain / math.log2(index + 2) for index, gain in enumerate(gains))
     gold_items = len(case.gold_ranges) if case.gold_ranges else len(set(case.gold_files))
     ideal_relevant = min(gold_items, len(retrieved))
@@ -126,6 +233,65 @@ def relevant(case: BenchmarkCase, candidate: RetrievedRange) -> bool:
     return candidate.path in case.gold_files or any(
         overlaps(gold, candidate) for gold in case.gold_ranges
     )
+
+
+def judged_paths(case: BenchmarkCase) -> set[str]:
+    """Every path with a known relevance verdict: gold, supporting, and
+    adjudicated-irrelevant. Anything else retrieved is 'unjudged'."""
+    return (
+        set(case.gold_files)
+        | {item.path for item in case.gold_ranges}
+        | {item.path for item in case.supporting_ranges}
+        | set(case.judged_files)
+    )
+
+
+def unjudged_rate(case: BenchmarkCase, retrieved: list[RetrievedRange]) -> float:
+    """Fraction of retrieved paths with no relevance verdict. High values
+    flag gold incompleteness — those items need adjudication, and metrics
+    that treat them as irrelevant are biased (TREC pooling lesson)."""
+    if not retrieved:
+        return 0.0
+    judged = judged_paths(case)
+    return sum(item.path not in judged for item in retrieved) / len(retrieved)
+
+
+def bpref(case: BenchmarkCase, retrieved: list[RetrievedRange]) -> float:
+    """Binary preference: robust to incomplete gold because only *judged*
+    nonrelevant items count against a relevant hit (Buckley & Voorhees).
+    bpref = (1/R) * Σ_r (1 - min(nonrel_before_r, R)/R)."""
+    gold = set(case.gold_files) | {item.path for item in case.gold_ranges}
+    if not gold:
+        return float(not retrieved)
+    judged_nonrelevant = set(case.judged_files) - gold
+    total_relevant = len(gold)
+    nonrel_before = 0
+    score = 0.0
+    for candidate in retrieved:
+        if candidate.path in gold:
+            score += 1.0 - min(nonrel_before, total_relevant) / total_relevant
+        elif candidate.path in judged_nonrelevant:
+            nonrel_before += 1
+        # Unjudged items are neither reward nor penalty — that is the point.
+    return score / total_relevant
+
+
+def claim_support(case: BenchmarkCase, retrieved: list[RetrievedRange]) -> float:
+    """Fraction of `gold_facts` supported by retrieved evidence: any overlap
+    with a fact's evidence ranges, or a retrieved symbol in the fact's
+    `symbols`. Deterministic claim-level recall — separates 'found the file'
+    from 'found the answer'."""
+    if not case.gold_facts:
+        return 1.0
+    found_symbols = {candidate.symbol for candidate in retrieved if candidate.symbol}
+    supported = 0
+    for fact in case.gold_facts:
+        if any(
+            any(overlaps(evidence, candidate) for candidate in retrieved)
+            for evidence in fact.evidence
+        ) or any(symbol in found_symbols for symbol in fact.symbols):
+            supported += 1
+    return supported / len(case.gold_facts)
 
 
 def relevant_line_density(case: BenchmarkCase, retrieved: list[RetrievedRange]) -> float:
@@ -150,13 +316,5 @@ def citation_correctness(retrieved: list[RetrievedRange]) -> float:
 
 
 def bootstrap(values: list[float], samples: int = 2000, seed: int = 0xCCE) -> MetricSummary:
-    if not values:
-        return MetricSummary(0.0, 0.0, 0.0, 0)
-    generator = random.Random(seed)
-    estimates = sorted(mean(generator.choices(values, k=len(values))) for _ in range(samples))
-    return MetricSummary(
-        value=mean(values),
-        ci_low=estimates[int(samples * 0.025)],
-        ci_high=estimates[min(samples - 1, int(samples * 0.975))],
-        samples=len(values),
-    )
+    value, low, high = bootstrap_ci(values, samples=samples, seed=seed)
+    return MetricSummary(value=value, ci_low=low, ci_high=high, samples=len(values))

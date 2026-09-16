@@ -2,8 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context;
-use cce_core::{QueryIntent, SearchRequest};
+use cce_core::{QueryIntent, SearchRequest, SearchRoute};
 use cce_engine::{CceEngine, ContextRequest, DenseBackendConfig, EngineConfig};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -16,23 +15,23 @@ struct Arguments {
     json: bool,
     #[arg(long, global = true, value_enum, default_value_t = DenseMode::Disabled)]
     dense: DenseMode,
-    #[arg(long, global = true, env = "CCE_EMBEDDING_BASE_URL")]
-    embedding_base_url: Option<String>,
+    /// Local embedding model code (see `cce models`), used with --dense local.
     #[arg(long, global = true, env = "CCE_EMBEDDING_MODEL")]
     embedding_model: Option<String>,
-    #[arg(long, global = true, default_value = "CCE_EMBEDDING_API_KEY")]
-    embedding_api_key_environment: String,
     #[arg(long, global = true)]
     embedding_dimensions: Option<usize>,
     #[command(subcommand)]
     command: Command,
 }
 
+const DEFAULT_LOCAL_MODEL: &str = "intfloat/multilingual-e5-small";
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DenseMode {
     Disabled,
     Baseline,
-    Provider,
+    /// In-process ONNX model via fastembed; downloads model files once, then offline.
+    Local,
 }
 
 #[derive(Debug, Subcommand)]
@@ -60,6 +59,9 @@ enum Command {
         query: String,
         #[arg(long, value_enum)]
         intent: Option<IntentArgument>,
+        /// Override the planner's routes; repeatable. Used for route ablations.
+        #[arg(long = "route", value_enum)]
+        routes: Vec<RouteArgument>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
@@ -68,10 +70,32 @@ enum Command {
         query: String,
         #[arg(long, value_enum)]
         intent: Option<IntentArgument>,
+        /// Override the planner's routes; repeatable. Used for route ablations.
+        #[arg(long = "route", value_enum)]
+        routes: Vec<RouteArgument>,
         #[arg(long, default_value_t = 8_192)]
         budget: usize,
         #[arg(long, default_value_t = 50)]
         candidates: usize,
+    },
+    /// Package-level architecture map of the repository.
+    Map {
+        #[arg(default_value = ".")]
+        repository: PathBuf,
+    },
+    /// Explain one package or symbol: members, dependencies, dependents, tests.
+    Explain { repository: PathBuf, name: String },
+    /// Blast radius of a symbol or package: impact edges within two hops.
+    Impact { repository: PathBuf, name: String },
+    /// List local embedding model codes usable with --dense local.
+    Models,
+    /// Prune old snapshots and unreferenced artifacts.
+    Gc {
+        #[arg(default_value = ".")]
+        repository: PathBuf,
+        /// Number of completed snapshots to retain besides the current one.
+        #[arg(long, default_value_t = 8)]
+        keep: usize,
     },
 }
 
@@ -106,6 +130,48 @@ impl From<IntentArgument> for QueryIntent {
             IntentArgument::Architecture => Self::Architecture,
             IntentArgument::History => Self::History,
             IntentArgument::Dataflow => Self::PreciseDataflow,
+        }
+    }
+}
+
+/// CLI route names mirror the `SearchRoute` `snake_case` wire names.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RouteArgument {
+    #[value(name = "no_retrieval")]
+    NoRetrieval,
+    #[value(name = "exact_symbol")]
+    ExactSymbol,
+    #[value(name = "lexical")]
+    Lexical,
+    #[value(name = "dense_raw")]
+    DenseRaw,
+    #[value(name = "dense_summary")]
+    DenseSummary,
+    #[value(name = "hybrid")]
+    Hybrid,
+    #[value(name = "structural")]
+    Structural,
+    #[value(name = "knowledge")]
+    Knowledge,
+    #[value(name = "history")]
+    History,
+    #[value(name = "reranked")]
+    Reranked,
+}
+
+impl From<RouteArgument> for SearchRoute {
+    fn from(value: RouteArgument) -> Self {
+        match value {
+            RouteArgument::NoRetrieval => Self::NoRetrieval,
+            RouteArgument::ExactSymbol => Self::ExactSymbol,
+            RouteArgument::Lexical => Self::Lexical,
+            RouteArgument::DenseRaw => Self::DenseRaw,
+            RouteArgument::DenseSummary => Self::DenseSummary,
+            RouteArgument::Hybrid => Self::Hybrid,
+            RouteArgument::Structural => Self::Structural,
+            RouteArgument::Knowledge => Self::Knowledge,
+            RouteArgument::History => Self::History,
+            RouteArgument::Reranked => Self::Reranked,
         }
     }
 }
@@ -153,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
             repository,
             query,
             intent,
+            routes,
             limit,
         } => {
             let engine = engine(&arguments, repository)?;
@@ -164,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
                     intent: intent.map(Into::into),
                     limit: *limit,
                     require_fresh: true,
-                    routes: Vec::new(),
+                    routes: routes.iter().map(|route| (*route).into()).collect(),
                 })
                 .await?;
             print_value(&result)?;
@@ -173,12 +240,14 @@ async fn main() -> anyhow::Result<()> {
             repository,
             query,
             intent,
+            routes,
             budget,
             candidates,
         } => {
             let engine = engine(&arguments, repository)?;
             let mut request = ContextRequest::new(query, *budget);
             request.intent = intent.map(Into::into);
+            request.routes = routes.iter().map(|route| (*route).into()).collect();
             request.max_candidates = *candidates;
             let pack = engine.context(request).await?;
             if arguments.json {
@@ -186,6 +255,27 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 print_context(&pack);
             }
+        }
+        Command::Map { repository } => {
+            let engine = engine(&arguments, repository)?;
+            print_value(&engine.codebase_map().await?)?;
+        }
+        Command::Explain { repository, name } => {
+            let engine = engine(&arguments, repository)?;
+            print_value(&engine.explain_component(name).await?)?;
+        }
+        Command::Impact { repository, name } => {
+            let engine = engine(&arguments, repository)?;
+            print_value(&engine.impact_analysis(name).await?)?;
+        }
+        Command::Models => {
+            for code in cce_engine::LocalEmbedder::supported_model_codes() {
+                println!("{code}");
+            }
+        }
+        Command::Gc { repository, keep } => {
+            let engine = engine(&arguments, repository)?;
+            print_value(&engine.gc(*keep)?)?;
         }
     }
     Ok(())
@@ -199,18 +289,11 @@ fn engine(arguments: &Arguments, repository: &PathBuf) -> anyhow::Result<CceEngi
         DenseMode::Baseline => DenseBackendConfig::DeterministicBaseline {
             dimensions: arguments.embedding_dimensions.unwrap_or(512),
         },
-        DenseMode::Provider => DenseBackendConfig::OpenAiCompatible {
-            base_url: arguments
-                .embedding_base_url
-                .clone()
-                .context("--embedding-base-url is required for --dense provider")?,
+        DenseMode::Local => DenseBackendConfig::Local {
             model: arguments
                 .embedding_model
                 .clone()
-                .context("--embedding-model is required for --dense provider")?,
-            api_key_environment: arguments.embedding_api_key_environment.clone(),
-            dimensions: arguments.embedding_dimensions,
-            batch_size: 32,
+                .unwrap_or_else(|| DEFAULT_LOCAL_MODEL.to_owned()),
         },
     };
     CceEngine::open(config).map_err(Into::into)

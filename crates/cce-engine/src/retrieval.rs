@@ -8,7 +8,7 @@ use cce_store::RelationDirection;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CceEngine, DenseIndex, Embedder, EmbeddingBackend, GraphPolicy, QueryPlan, QueryPlanner,
+    CceEngine, DenseIndex, Embedder, GraphPolicy, QueryPlan, QueryPlanner, RepositoryScanner,
 };
 
 const RRF_K: f64 = 60.0;
@@ -30,12 +30,52 @@ struct Candidate {
     fused_score: f64,
 }
 
+/// The snapshot a search will run against, with a record of whether the
+/// working tree was actually verified to match it.
+#[derive(Debug)]
+struct ResolvedIndex {
+    repository_id: String,
+    snapshot_id: String,
+    manifest: ViewManifest,
+    verified_fresh: bool,
+}
+
 impl CceEngine {
+    /// Resolve the snapshot for this request. `require_fresh` runs the full
+    /// scan-and-index path so results always match the working tree (or the
+    /// request fails). Without it, the last committed snapshot is used as-is —
+    /// no working-tree scan happens — and hits are marked unverified.
+    async fn resolve_index(&self, require_fresh: bool) -> Result<ResolvedIndex> {
+        if !require_fresh {
+            let anchor = RepositoryScanner::new(self.config().clone()).identify()?;
+            if let Some(snapshot_id) = self.store().current_snapshot(&anchor.identity.id)? {
+                if self.store().snapshot_is_complete(&snapshot_id)? {
+                    return Ok(ResolvedIndex {
+                        repository_id: anchor.identity.id.clone(),
+                        manifest: self
+                            .store()
+                            .view_manifest(&anchor.identity.id, &snapshot_id)?,
+                        snapshot_id,
+                        verified_fresh: false,
+                    });
+                }
+            }
+        }
+        let report = self.index().await?;
+        Ok(ResolvedIndex {
+            repository_id: report.repository_id,
+            snapshot_id: report.snapshot.id,
+            manifest: report.manifest,
+            verified_fresh: true,
+        })
+    }
+
     pub async fn search(&self, mut request: SearchRequest) -> Result<SearchResult> {
         let started = Instant::now();
-        let indexed = self.index().await?;
-        request.repository_id.clone_from(&indexed.repository_id);
-        request.snapshot_id.clone_from(&indexed.snapshot.id);
+        let resolved = self.resolve_index(request.require_fresh).await?;
+        request.repository_id.clone_from(&resolved.repository_id);
+        request.snapshot_id.clone_from(&resolved.snapshot_id);
+        let verified_fresh = resolved.verified_fresh;
         let mut plan = QueryPlanner::new().plan(&request.query, request.intent);
         if !request.routes.is_empty() {
             plan.routes.clone_from(&request.routes);
@@ -43,11 +83,11 @@ impl CceEngine {
             plan.reasons
                 .push("caller supplied an explicit retrieval route override".to_owned());
         }
-        let manifest = indexed.manifest;
+        let manifest = resolved.manifest;
         let mut missing_capabilities = missing_views(&manifest, &plan);
-        if plan.rerank {
+        if !verified_fresh {
             missing_capabilities.push(
-                "learned reranker is not configured; results use deterministic reciprocal-rank fusion"
+                "requireFresh=false: served from the last committed snapshot; working-tree changes may not be indexed"
                     .to_owned(),
             );
         }
@@ -77,6 +117,7 @@ impl CceEngine {
                         &mut candidates,
                         SearchHit {
                             document_id: format!("entity: {}", entity.id),
+                            region_id: entity.region_id.clone(),
                             symbol_name: Some(entity.name.clone()),
                             entity_id: entity.id,
                             representation: RetrievalRepresentation::Signature,
@@ -87,7 +128,7 @@ impl CceEngine {
                             address: entity.address,
                             evidence: Vec::new(),
                             snippet: truncate_chars(&snippet, 2_000),
-                            verified_current: true,
+                            verified_current: verified_fresh,
                             explanation: vec!["exact symbol or qualified-name match".to_owned()],
                         },
                         2.0 / (RRF_K + rank as f64),
@@ -114,6 +155,7 @@ impl CceEngine {
                     SearchHit {
                         document_id: hit.document_id,
                         entity_id: hit.entity_id,
+                        region_id: hit.region_id,
                         symbol_name: Some(hit.symbol_name),
                         representation: hit.representation,
                         route: SearchRoute::Lexical,
@@ -123,7 +165,7 @@ impl CceEngine {
                         address: hit.address,
                         evidence: hit.evidence,
                         snippet: hit.snippet,
-                        verified_current: true,
+                        verified_current: verified_fresh,
                         explanation: vec!["SQLite FTS5 identifier/path/source match".to_owned()],
                     },
                     1.0 / (RRF_K + rank as f64),
@@ -164,6 +206,7 @@ impl CceEngine {
                     SearchHit {
                         document_id: hit.document_id,
                         entity_id: hit.entity_id,
+                        region_id: hit.region_id,
                         symbol_name: Some(hit.symbol_name),
                         representation: hit.representation,
                         route,
@@ -173,7 +216,7 @@ impl CceEngine {
                         address: hit.address,
                         evidence: hit.evidence,
                         snippet: hit.snippet,
-                        verified_current: true,
+                        verified_current: verified_fresh,
                         explanation: vec![format!(
                             "snapshot-aligned {route:?} artifact retrieved through SQLite FTS5"
                         )],
@@ -193,7 +236,7 @@ impl CceEngine {
                 if matches!(dense_status.state, ViewState::Ready | ViewState::Partial) {
                     if let (Some(digest), Some(embedder)) = (
                         dense_status.artifact_digest.as_deref(),
-                        EmbeddingBackend::from_config(&self.config().dense)?,
+                        self.embedder().await?,
                     ) {
                         let index = DenseIndex::decode(&self.store().artifacts().read(digest)?)?;
                         let dense_hits = index
@@ -224,6 +267,7 @@ impl CceEngine {
                                 SearchHit {
                                     document_id: document.document_id.clone(),
                                     entity_id: document.entity_id.clone(),
+                                    region_id: document.region_id.clone(),
                                     symbol_name,
                                     representation: document.representation.clone(),
                                     route,
@@ -233,7 +277,7 @@ impl CceEngine {
                                     address: document.address.clone(),
                                     evidence: document.evidence.clone(),
                                     snippet: truncate_chars(&document.text, 2_000),
-                                    verified_current: true,
+                                    verified_current: verified_fresh,
                                     explanation: vec![format!(
                                         "dense retrieval via {}",
                                         embedder.profile()
@@ -248,69 +292,102 @@ impl CceEngine {
             }
         }
 
-        if !matches!(
-            plan.graph_policy,
-            GraphPolicy::None | GraphPolicy::ArchitectureBoundary
-        ) {
-            let direction = match plan.graph_policy {
-                GraphPolicy::OutgoingTrace => RelationDirection::Outgoing,
-                GraphPolicy::IncomingImpact => RelationDirection::Incoming,
-                GraphPolicy::DataflowRequired
-                | GraphPolicy::None
-                | GraphPolicy::ArchitectureBoundary => RelationDirection::Both,
-            };
-            let seeds = ranked_candidates(&candidates)
+        if plan.routes.contains(&SearchRoute::Structural)
+            && !matches!(
+                plan.graph_policy,
+                GraphPolicy::None | GraphPolicy::ArchitectureBoundary
+            )
+        {
+            // Typed expansion: the intent selects which edge kinds and
+            // direction are evidence. Seed score decays per hop and hub
+            // nodes are discounted so barrel/utility modules don't flood
+            // the frontier.
+            let (direction, edge_kinds) = expansion_policy(plan.graph_policy);
+            let mut visited = std::collections::HashSet::new();
+            let mut frontier = ranked_candidates(&candidates)
                 .into_iter()
                 .take(5)
-                .map(|candidate| candidate.hit.entity_id.clone())
+                .map(|candidate| (candidate.hit.entity_id.clone(), candidate.fused_score))
                 .collect::<Vec<_>>();
             let mut rank = 1_usize;
-            for seed in seeds {
-                for relation in
-                    self.store()
-                        .relations_for_entity(&request.snapshot_id, &seed, direction, 12)?
-                {
-                    let neighbor = if relation.source_entity_id == seed {
-                        &relation.target_entity_id
-                    } else {
-                        &relation.source_entity_id
-                    };
-                    let Some(entity) = self.store().entity_by_id(&request.snapshot_id, neighbor)?
-                    else {
+            for hop in 0..2_usize {
+                let mut next = Vec::new();
+                for (seed, seed_score) in frontier {
+                    if !visited.insert(seed.clone()) {
                         continue;
-                    };
-                    let snippet = entity
-                        .signature
-                        .clone()
-                        .or_else(|| entity.qualified_name.clone())
-                        .unwrap_or_else(|| entity.name.clone());
-                    add_candidate(
-                        &mut candidates,
-                        SearchHit {
-                            document_id: format!("entity: {}", entity.id),
-                            symbol_name: Some(entity.name.clone()),
-                            entity_id: entity.id,
-                            representation: RetrievalRepresentation::Signature,
-                            route: SearchRoute::Structural,
-                            rank,
-                            score: f64::from(relation.confidence),
-                            contributing_routes: vec![SearchRoute::Structural],
-                            address: entity.address,
-                            evidence: relation.evidence.clone(),
-                            snippet,
-                            verified_current: true,
-                            explanation: vec![format!(
-                                "selective {:?} graph expansion over {:?} ({:?}, confidence {:.2})",
-                                plan.graph_policy,
-                                relation.kind,
-                                relation.origin,
-                                relation.confidence
-                            )],
-                        },
-                        f64::from(relation.confidence) / (RRF_K + rank as f64),
-                    );
-                    rank += 1;
+                    }
+                    for relation in self.store().relations_for_entity(
+                        &request.snapshot_id,
+                        &seed,
+                        direction,
+                        24,
+                    )? {
+                        if !edge_kinds.contains(&relation.kind) {
+                            continue;
+                        }
+                        let neighbor = if relation.source_entity_id == seed {
+                            &relation.target_entity_id
+                        } else {
+                            &relation.source_entity_id
+                        };
+                        let Some(entity) =
+                            self.store().entity_by_id(&request.snapshot_id, neighbor)?
+                        else {
+                            continue;
+                        };
+                        let degree = self
+                            .store()
+                            .entity_relation_degree(&request.snapshot_id, &entity.id)
+                            .unwrap_or(1)
+                            .max(1);
+                        let hop_decay = 0.5_f64.powi(i32::try_from(hop).unwrap_or(0));
+                        let propagated = seed_score * f64::from(relation.confidence) * hop_decay
+                            / (1.0 + (degree as f64).ln());
+                        let snippet = entity
+                            .signature
+                            .clone()
+                            .or_else(|| entity.qualified_name.clone())
+                            .unwrap_or_else(|| entity.name.clone());
+                        add_candidate(
+                            &mut candidates,
+                            SearchHit {
+                                document_id: format!("entity: {}", entity.id),
+                                region_id: entity.region_id.clone(),
+                                symbol_name: Some(entity.name.clone()),
+                                entity_id: entity.id.clone(),
+                                representation: RetrievalRepresentation::Signature,
+                                route: SearchRoute::Structural,
+                                rank,
+                                score: f64::from(relation.confidence),
+                                contributing_routes: vec![SearchRoute::Structural],
+                                address: entity.address,
+                                evidence: relation.evidence.clone(),
+                                snippet,
+                                verified_current: verified_fresh,
+                                explanation: vec![format!(
+                                    "{:?} expansion over {:?} ({:?}, confidence {:.2}, hop {})",
+                                    plan.graph_policy,
+                                    relation.kind,
+                                    relation.origin,
+                                    relation.confidence,
+                                    hop + 1
+                                )],
+                            },
+                            propagated / (RRF_K + rank as f64),
+                        );
+                        next.push((entity.id, propagated));
+                        rank += 1;
+                    }
                 }
+                // Second hop only when it can still matter: cap the frontier
+                // and require meaningful propagated score.
+                next.sort_by(|left, right| right.1.total_cmp(&left.1));
+                next.truncate(4);
+                next.retain(|(_, score)| *score > 0.001);
+                if next.is_empty() {
+                    break;
+                }
+                frontier = next;
             }
         }
 
@@ -326,15 +403,28 @@ impl CceEngine {
             );
         }
 
-        let mut hits = ranked_candidates(&candidates)
-            .into_iter()
-            .map(|candidate| {
-                let mut hit = candidate.hit.clone();
-                hit.score = candidate.fused_score;
-                hit
-            })
-            .collect::<Vec<_>>();
-        hits.truncate(request.limit);
+        apply_structural_features(&request.query, &mut candidates);
+
+        // Region granularity means one file can hold several of the best
+        // spans; cap per-file hits so top-N keeps cross-file coverage. Hits
+        // beyond the cap stay in `candidates` for expansion seeds.
+        let mut hits = Vec::new();
+        let mut per_file = HashMap::<String, usize>::new();
+        for candidate in ranked_candidates(&candidates) {
+            let mut hit = candidate.hit.clone();
+            hit.score = candidate.fused_score;
+            if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
+                let count = per_file.entry(path.clone()).or_default();
+                if *count >= 3 {
+                    continue;
+                }
+                *count += 1;
+            }
+            hits.push(hit);
+            if hits.len() >= request.limit {
+                break;
+            }
+        }
         for (offset, hit) in hits.iter_mut().enumerate() {
             hit.rank = offset + 1;
         }
@@ -346,6 +436,90 @@ impl CceEngine {
             missing_capabilities,
             latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         })
+    }
+}
+
+/// Which edges count as evidence for each graph policy. The intent chooses
+/// the vocabulary of the expansion, not just its direction.
+fn expansion_policy(policy: GraphPolicy) -> (RelationDirection, &'static [cce_core::RelationKind]) {
+    use cce_core::RelationKind;
+    match policy {
+        GraphPolicy::OutgoingTrace => (
+            RelationDirection::Outgoing,
+            &[
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::RouteHandledBy,
+            ],
+        ),
+        GraphPolicy::IncomingImpact => (
+            RelationDirection::Incoming,
+            &[
+                RelationKind::Calls,
+                RelationKind::References,
+                RelationKind::Tests,
+                RelationKind::Implements,
+            ],
+        ),
+        GraphPolicy::DataflowRequired | GraphPolicy::None | GraphPolicy::ArchitectureBoundary => (
+            RelationDirection::Both,
+            &[
+                RelationKind::Calls,
+                RelationKind::References,
+                RelationKind::Imports,
+            ],
+        ),
+    }
+}
+
+/// Structural priors layered on the fused ranking:
+/// - exact symbol/word agreement between the query and a hit's symbol name;
+/// - same-file evidence aggregation (a file holding a top-3 hit makes its
+///   other hits more likely to be task evidence);
+/// - definition prior (Signature/TestBehavior representations beat stray
+///   raw-code mentions for symbol-shaped queries).
+fn apply_structural_features(query: &str, candidates: &mut HashMap<String, Candidate>) {
+    let query_words: std::collections::HashSet<String> = query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| word.len() >= 3)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let top_paths: std::collections::HashSet<String> = ranked_candidates(candidates)
+        .into_iter()
+        .take(3)
+        .filter_map(|candidate| {
+            candidate
+                .hit
+                .address
+                .as_ref()
+                .map(|address| address.path.clone())
+        })
+        .collect();
+    for candidate in candidates.values_mut() {
+        let hit = &candidate.hit;
+        let mut bonus = 0.0;
+        if let Some(name) = &hit.symbol_name {
+            let lowered = name.to_ascii_lowercase();
+            if query_words.contains(&lowered)
+                || lowered
+                    .split('_')
+                    .any(|part| part.len() >= 3 && query_words.contains(part))
+            {
+                bonus += 0.5;
+            }
+        }
+        if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
+            if top_paths.contains(path) {
+                bonus += 0.25;
+            }
+        }
+        if matches!(
+            hit.representation,
+            RetrievalRepresentation::Signature | RetrievalRepresentation::TestBehavior
+        ) {
+            bonus += 0.1;
+        }
+        candidate.fused_score += bonus / RRF_K;
     }
 }
 

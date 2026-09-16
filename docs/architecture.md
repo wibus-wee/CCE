@@ -4,7 +4,9 @@
 
 The repository snapshot is immutable base data. A snapshot is identified by repository identity, base revision, workspace overlay hash, and index profile hash. Lexical, structural, dense, history, and knowledge views are independently materialized and independently fresh.
 
-SQLite owns identities, manifests, source addresses, entities, relations, retrieval-document metadata, occurrences, FTS postings, invalidations, artifact references, and trajectory metadata. It does not own large source archives, vector matrices, model weights, generated knowledge bodies, or raw traces.
+SQLite owns identities, manifests, canonical regions, source addresses, entities, relations, retrieval-document metadata, occurrences, FTS postings, invalidations, artifact references, and trajectory metadata. It does not own large source archives, vector matrices, model weights, generated knowledge bodies, or raw traces.
+
+A `Region` is the canonical code-range identity — a `(snapshot, path, kind, byte/line range, symbol)` tuple persisted in the `regions` table. Entities, retrieval documents, FTS rows, dense vectors, citations, and graph endpoints all join through `region_id`; path+line is never an implicit join key. Indexing emits three region granularities: file descriptors (bounded routing evidence), symbol chunks (the default retrieval unit), and AST subregions for oversized symbols. Delivery granularity stays a separate decision in the context packer.
 
 External payloads use a content-addressed artifact store:
 
@@ -45,7 +47,11 @@ flowchart TD
 
 Every relation stores its origin, confidence, evidence, extractor version, and valid snapshot. Query policies may require a minimum trust level.
 
-Path containment is a deterministic structural fact recorded with extractor identity. Tree-sitter facts are syntax-level. Relative imports are framework-derived and intentionally remain below compiler/SCIP facts. Knowledge and commit-message documents participate in retrieval but cannot create authoritative call or dataflow edges.
+Path containment is a deterministic structural fact recorded with extractor identity. Tree-sitter facts are syntax-level. Relative imports are framework-derived and intentionally remain below compiler/SCIP facts. Package boundaries come from build manifests (`Cargo.toml` workspaces, `package.json` workspaces) and carry `build_system` provenance at full confidence — `BuildDependsOn` edges are declared facts, while `Calls`/`References` from Tree-sitter stay below compiler truth. Knowledge and commit-message documents participate in retrieval but cannot create authoritative call or dataflow edges.
+
+## Architecture Atlas
+
+`codebase_map`, `explain_component`, and `impact_analysis` serve the persisted world model directly: package entities, `Contains` membership, and `BuildDependsOn` direction from manifests; callers/references/tests from typed relation expansion with hop limits and confidence. Every answer reports its provenance; inferred component boundaries above the package level are out of scope until the deterministic layer is verified.
 
 ## Freshness and concurrency
 

@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{QueryIntent, SearchRoute, SourceAddress};
+use crate::{GraphPolicy, QueryIntent, SearchRoute, SourceAddress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -9,8 +9,10 @@ pub enum ContextItemKind {
     Orientation,
     EntryPoint,
     Source,
+    Contract,
     RelationPath,
     Test,
+    Config,
     History,
     Knowledge,
 }
@@ -59,6 +61,11 @@ pub struct ContextPack {
     pub snapshot_id: String,
     pub query: String,
     pub intent: QueryIntent,
+    /// Routes the executed plan selected; empty when unknown.
+    #[serde(default)]
+    pub plan_routes: Vec<SearchRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_policy: Option<GraphPolicy>,
     pub budget_tokens: usize,
     pub used_tokens: usize,
     pub items: Vec<ContextItem>,

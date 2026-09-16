@@ -5,6 +5,6 @@ mod metadata;
 
 pub use artifact::{ArtifactKind, ArtifactRecord, ArtifactStore};
 pub use metadata::{
-    DocumentContent, IndexedDocument, LexicalHit, MetadataStore, RelationDirection,
-    SnapshotRecords, SourceFileRecord, StoreHealth,
+    DocumentContent, GcReport, IndexedDocument, LexicalHit, MetadataStore, RelationDirection,
+    ScanCacheEntry, SnapshotRecords, SourceFileRecord, StoreHealth,
 };

@@ -10,7 +10,9 @@ The default loopback listener is the supported trust boundary. If remote access 
 
 SQLite is canonical metadata. Back up `metadata.sqlite` together with the entire `artifacts/blake3` tree from a consistent filesystem snapshot. WAL and SHM files are runtime state; use SQLite's online backup mechanism or stop the service before a plain filesystem copy.
 
-Artifact objects are immutable and deduplicated. Orphans can exist after a failed build and are safe, but deletion requires a future mark-and-sweep command; do not manually remove objects referenced by SQLite.
+Artifact objects are immutable and deduplicated. Orphans can exist after a failed build and are safe; `cce gc` removes them — it prunes snapshots beyond `--keep` (the current snapshot is always retained) and deletes artifact objects no committed metadata row references. `cce index` also prunes automatically after each commit (retention: 8 completed snapshots). Do not manually remove objects referenced by SQLite.
+
+Embedding models for `--dense local` are downloaded once into `<data-dir>/models/` and reused offline afterward. If huggingface.co is unreachable, set `HF_ENDPOINT` to a mirror before the first index.
 
 ## Health and observability
 
@@ -21,7 +23,7 @@ Artifact objects are immutable and deduplicated. Orphans can exist after a faile
 - An interrupted build does not advance `current_snapshots`; retry `cce index`.
 - A corrupt artifact produces an explicit error and must be restored from backup or rebuilt from source.
 - A newer SQLite format is never downgraded in place; deploy a compatible binary.
-- If an embedding provider fails, the dense view becomes failed while the prior complete snapshot remains available. Disable dense retrieval or repair provider configuration before retrying.
+- If local embedding fails (model download, ONNX session, or inference), the dense view becomes failed while the prior complete snapshot remains available. Re-run `cce index` once the model files are present or the cause is fixed, or disable dense retrieval.
 - If the repository changes during a long build, the resulting snapshot still identifies the exact bytes scanned; the next freshness check marks it stale and a subsequent index converges.
 
 ## Upgrade policy

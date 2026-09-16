@@ -30,8 +30,8 @@ pub enum CceError {
     Serialization(#[from] serde_json::Error),
     #[error("storage error: {0}")]
     Storage(String),
-    #[error("provider error: {0}")]
-    Provider(String),
+    #[error("embedding error: {0}")]
+    Embedding(String),
     #[error("another index operation owns the repository lease at {0}")]
     IndexBusy(PathBuf),
     #[error("operation cancelled")]

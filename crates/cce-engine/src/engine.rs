@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use cce_core::{
-    Capability, CceError, CodeEntity, EntityKind, Relation, RelationKind, RelationOrigin, Result,
-    RetrievalDocument, RetrievalRepresentation, SnapshotIdentity, SourceAddress, ViewKind,
-    ViewManifest, ViewState, ViewStatus,
+    Capability, CceError, CodeEntity, CodeRegion, EntityKind, RegionKind, Relation, RelationKind,
+    RelationOrigin, Result, RetrievalDocument, RetrievalRepresentation, SnapshotIdentity,
+    SourceAddress, ViewKind, ViewManifest, ViewState, ViewStatus,
 };
 use cce_store::{
-    ArtifactKind, ArtifactRecord, IndexedDocument, MetadataStore, SnapshotRecords,
+    ArtifactKind, ArtifactRecord, GcReport, IndexedDocument, MetadataStore, SnapshotRecords,
     SourceFileRecord, StoreHealth,
 };
 use chrono::Utc;
@@ -31,14 +31,20 @@ pub struct IndexReport {
     pub retrieval_documents: usize,
     pub skipped_large_files: Vec<String>,
     pub skipped_binary_files: Vec<String>,
+    pub skipped_sensitive_files: Vec<String>,
     pub manifest: ViewManifest,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CceEngine {
     config: EngineConfig,
     store: MetadataStore,
     parser: SourceParser,
+    /// Lazily initialized dense backend. ONNX session startup (and the
+    /// one-time model download for `--dense local`) runs on the blocking
+    /// pool so a slow fetch never stalls the executor; the result — including
+    /// failures — is cached so a bad model does not retry a download per query.
+    embedder: tokio::sync::OnceCell<std::result::Result<Option<EmbeddingBackend>, String>>,
 }
 
 impl CceEngine {
@@ -48,7 +54,29 @@ impl CceEngine {
             config,
             store,
             parser: SourceParser::new(),
+            embedder: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// Shared dense backend, initialized on first use.
+    pub async fn embedder(&self) -> Result<Option<EmbeddingBackend>> {
+        let dense = self.config.dense.clone();
+        let cache_dir = self.model_cache_dir();
+        let state = self
+            .embedder
+            .get_or_init(move || async move {
+                tokio::task::spawn_blocking(move || {
+                    EmbeddingBackend::from_config(&dense, &cache_dir)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            })
+            .await;
+        match state {
+            Ok(backend) => Ok(backend.clone()),
+            Err(message) => Err(CceError::Embedding(message.clone())),
+        }
     }
 
     #[must_use]
@@ -62,7 +90,7 @@ impl CceEngine {
     }
 
     pub fn status(&self) -> Result<ViewManifest> {
-        let scanned = RepositoryScanner::new(self.config.clone()).scan()?;
+        let scanned = RepositoryScanner::new(self.config.clone()).scan(Some(&self.store))?;
         let current = self
             .store
             .current_snapshot(&scanned.identity.id)?
@@ -89,9 +117,21 @@ impl CceEngine {
         self.store.health()
     }
 
-    pub async fn index(&self) -> Result<IndexReport> {
+    /// Prune snapshots beyond the retention window and delete artifact
+    /// objects no committed metadata row references. Holds the index lease.
+    pub fn gc(&self, keep: usize) -> Result<GcReport> {
         let _lease = crate::lock::IndexLease::acquire(&self.config.data_root)?;
-        let scanned = RepositoryScanner::new(self.config.clone()).scan()?;
+        let anchor = RepositoryScanner::new(self.config.clone()).identify()?;
+        let pruned = self.store.prune_snapshots(&anchor.identity.id, keep)?;
+        let mut report = self.store.gc_artifacts()?;
+        report.pruned_snapshots = pruned.len();
+        Ok(report)
+    }
+
+    pub async fn index(&self) -> Result<IndexReport> {
+        // Scan before taking the write lease: an unchanged repository returns
+        // without ever contending with concurrent readers or writers.
+        let scanned = RepositoryScanner::new(self.config.clone()).scan(Some(&self.store))?;
         self.store.register_repository(&scanned.identity)?;
         if self.store.snapshot_is_complete(&scanned.snapshot.id)? {
             let manifest = self
@@ -109,10 +149,16 @@ impl CceEngine {
                 retrieval_documents: 0,
                 skipped_large_files: scanned.skipped_large_files,
                 skipped_binary_files: scanned.skipped_binary_files,
+                skipped_sensitive_files: scanned.skipped_sensitive_files,
                 manifest,
             });
         }
 
+        // Only the write path needs the lease. The scanned hashes pin the
+        // snapshot; if the tree changes mid-build the byte-level hash check
+        // in `ScannedFile::bytes` fails the index instead of committing a
+        // snapshot that misidentifies content.
+        let _lease = crate::lock::IndexLease::acquire(&self.config.data_root)?;
         self.store.begin_snapshot(&scanned.snapshot)?;
         for kind in [
             ViewKind::Source,
@@ -141,6 +187,7 @@ impl CceEngine {
             qualified_name: scanned.identity.remote.clone(),
             signature: None,
             language: None,
+            region_id: None,
             address: None,
             capabilities: vec!["repository_orientation".to_owned()],
             attributes: serde_json::Map::new(),
@@ -150,27 +197,58 @@ impl CceEngine {
         let mut reused_file_analyses = 0_usize;
         let mut source_units = 0_usize;
         let mut file_entities = HashMap::new();
+        let mut file_regions = HashMap::new();
         let mut parsed_by_path = HashMap::new();
+        let mut unit_ids_by_path: HashMap<String, Vec<String>> = HashMap::new();
+        let mut name_index: HashMap<String, Vec<crate::relations::SymbolCandidate>> =
+            HashMap::new();
 
+        let mut texts_by_path = HashMap::new();
         for file in &scanned.files {
+            let bytes = file.bytes()?;
+            let file_body = std::str::from_utf8(&bytes)
+                .map_err(|error| {
+                    CceError::Configuration(format!("{} is not UTF-8: {error}", file.relative_path))
+                })?
+                .to_owned();
+            texts_by_path.insert(file.relative_path.clone(), file_body.clone());
             let artifact = self
                 .store
                 .artifacts()
-                .put_bytes(ArtifactKind::Source, &file.bytes)?;
+                .put_bytes(ArtifactKind::Source, &bytes)?;
             let file_id = entity_id(
                 &scanned.identity.id,
                 &file.relative_path,
                 0,
-                file.bytes.len(),
+                bytes.len(),
                 "file",
             );
             file_entities.insert(file.relative_path.clone(), file_id.clone());
+            let file_region_id =
+                region_id(&file.relative_path, 0, bytes.len(), RegionKind::File, "");
+            file_regions.insert(file.relative_path.clone(), file_region_id.clone());
+            records.regions.push(CodeRegion {
+                id: file_region_id.clone(),
+                snapshot_id: scanned.snapshot.id.clone(),
+                path: file.relative_path.clone(),
+                kind: RegionKind::File,
+                language: file.language.clone(),
+                symbol_name: None,
+                symbol_kind: None,
+                qualified_name: Some(file.relative_path.clone()),
+                parent_region_id: None,
+                start_byte: 0,
+                end_byte: bytes.len() as u64,
+                start_line: 1,
+                end_line: file.line_count.max(1) as u32,
+            });
             let file_address = address(
                 &scanned.identity.id,
                 &scanned.snapshot.id,
-                file,
+                &file.relative_path,
+                &file_body,
                 0,
-                file.bytes.len(),
+                bytes.len(),
                 Some(&file_id),
             )?;
             records.entities.push(CodeEntity {
@@ -180,41 +258,28 @@ impl CceEngine {
                 qualified_name: Some(file.relative_path.clone()),
                 signature: None,
                 language: file.language.clone(),
-                address: Some(file_address.clone()),
+                region_id: Some(file_region_id),
+                address: Some(file_address),
                 capabilities: vec!["source_truth".to_owned()],
                 attributes: serde_json::Map::new(),
-            });
-            let file_body = file.text()?.to_owned();
-            records.documents.push(IndexedDocument {
-                document: RetrievalDocument {
-                    id: document_id(&file_id, "raw_code", 0, file.bytes.len()),
-                    entity_id: file_id.clone(),
-                    snapshot_id: scanned.snapshot.id.clone(),
-                    representation: RetrievalRepresentation::RawCode,
-                    body_artifact_digest: artifact.digest.clone(),
-                    address: Some(file_address),
-                    embedding_profile: None,
-                    generated_by: None,
-                    evidence: Vec::new(),
-                    terms: lexical_terms(&file.relative_path),
-                },
-                path: file.relative_path.clone(),
-                name: file.relative_path.clone(),
-                body: file_body,
             });
 
             if file.language.as_deref().is_some_and(SourceParser::supports) {
                 parse_candidates += 1;
             }
-            let (parsed, analysis_artifact) =
-                self.parse_with_cache(&scanned.identity.id, file, &mut reused_file_analyses)?;
+            let (parsed, analysis_artifact) = self.parse_with_cache(
+                &scanned.identity.id,
+                file,
+                &bytes,
+                &mut reused_file_analyses,
+            )?;
             records.artifacts.push(analysis_artifact.clone());
             records.files.push(SourceFileRecord {
                 path: file.relative_path.clone(),
                 language: file.language.clone(),
                 content_hash: file.content_hash.clone(),
                 artifact: artifact.clone(),
-                byte_count: file.bytes.len() as u64,
+                byte_count: file.size_bytes,
                 line_count: file.line_count,
                 analysis_artifact_digest: Some(analysis_artifact.digest),
             });
@@ -232,13 +297,20 @@ impl CceEngine {
             let file_id = file_entities
                 .get(&file.relative_path)
                 .ok_or_else(|| CceError::Configuration("file entity disappeared".to_owned()))?;
+            let file_region_id = file_regions
+                .get(&file.relative_path)
+                .ok_or_else(|| CceError::Configuration("file region disappeared".to_owned()))?;
             let file_artifact = records
                 .files
                 .iter()
                 .find(|record| record.path == file.relative_path)
                 .map(|record| record.artifact.digest.clone())
                 .ok_or_else(|| CceError::Configuration("file artifact disappeared".to_owned()))?;
+            let file_text = texts_by_path
+                .get(&file.relative_path)
+                .ok_or_else(|| CceError::Configuration("file text disappeared".to_owned()))?;
             let mut unit_ids = Vec::with_capacity(parsed.units.len());
+            let mut unit_region_ids = Vec::with_capacity(parsed.units.len());
             for unit in &parsed.units {
                 unit_ids.push(entity_id(
                     &scanned.identity.id,
@@ -247,14 +319,127 @@ impl CceEngine {
                     unit.end_byte,
                     &format!("{:?}:{}", unit.kind, unit.name),
                 ));
+                unit_region_ids.push(region_id(
+                    &file.relative_path,
+                    unit.start_byte,
+                    unit.end_byte,
+                    RegionKind::Symbol,
+                    &unit.name,
+                ));
+            }
+
+            // L1 file descriptor: bounded routing evidence (path, language,
+            // imports, top-level signatures) instead of the whole file body.
+            let descriptor = file_descriptor(file, file_text, parsed);
+            records.documents.push(IndexedDocument {
+                document: RetrievalDocument {
+                    id: document_id(file_id, "file_descriptor", 0, descriptor.len()),
+                    entity_id: file_id.clone(),
+                    region_id: Some(file_region_id.clone()),
+                    snapshot_id: scanned.snapshot.id.clone(),
+                    representation: RetrievalRepresentation::FileDescriptor,
+                    body_artifact_digest: file_artifact.clone(),
+                    address: None,
+                    embedding_profile: None,
+                    generated_by: Some("cce-file-descriptor-v1".to_owned()),
+                    evidence: Vec::new(),
+                    terms: lexical_terms(&descriptor),
+                },
+                path: file.relative_path.clone(),
+                name: file.relative_path.clone(),
+                body: descriptor,
+            });
+
+            if parsed.units.is_empty() && !file_text.is_empty() {
+                // No symbol coverage (unparsed language, data files): fall back
+                // to bounded fixed windows so retrieval stays granular.
+                for (start, end) in chunk_ranges(
+                    file_text,
+                    0,
+                    file_text.len(),
+                    self.config.index.max_unit_bytes,
+                ) {
+                    let sub_region_id =
+                        region_id(&file.relative_path, start, end, RegionKind::Subregion, "");
+                    records.regions.push(CodeRegion {
+                        id: sub_region_id.clone(),
+                        snapshot_id: scanned.snapshot.id.clone(),
+                        path: file.relative_path.clone(),
+                        kind: RegionKind::Subregion,
+                        language: file.language.clone(),
+                        symbol_name: None,
+                        symbol_kind: None,
+                        qualified_name: None,
+                        parent_region_id: Some(file_region_id.clone()),
+                        start_byte: start as u64,
+                        end_byte: end as u64,
+                        start_line: line_for_offset(file_text, start),
+                        end_line: line_for_offset(file_text, end),
+                    });
+                    let chunk_address = address(
+                        &scanned.identity.id,
+                        &scanned.snapshot.id,
+                        &file.relative_path,
+                        file_text,
+                        start,
+                        end,
+                        None,
+                    )?;
+                    records.documents.push(IndexedDocument {
+                        document: RetrievalDocument {
+                            id: document_id(file_id, "raw_code", start, end),
+                            entity_id: file_id.clone(),
+                            region_id: Some(sub_region_id),
+                            snapshot_id: scanned.snapshot.id.clone(),
+                            representation: RetrievalRepresentation::RawCode,
+                            body_artifact_digest: file_artifact.clone(),
+                            address: Some(chunk_address),
+                            embedding_profile: None,
+                            generated_by: None,
+                            evidence: Vec::new(),
+                            terms: lexical_terms(&file.relative_path),
+                        },
+                        path: file.relative_path.clone(),
+                        name: file.relative_path.clone(),
+                        body: file_text
+                            .get(start..end)
+                            .ok_or_else(|| CceError::InvalidSourceRange {
+                                path: file.relative_path.clone(),
+                                start_byte: start as u64,
+                                end_byte: end as u64,
+                            })?
+                            .to_owned(),
+                    });
+                }
             }
 
             for (index, unit) in parsed.units.iter().enumerate() {
                 let unit_id = unit_ids[index].clone();
+                let unit_region_id = unit_region_ids[index].clone();
+                let parent_region = unit
+                    .parent_unit
+                    .and_then(|parent| unit_region_ids.get(parent))
+                    .unwrap_or(file_region_id);
+                records.regions.push(CodeRegion {
+                    id: unit_region_id.clone(),
+                    snapshot_id: scanned.snapshot.id.clone(),
+                    path: file.relative_path.clone(),
+                    kind: RegionKind::Symbol,
+                    language: file.language.clone(),
+                    symbol_name: Some(unit.name.clone()),
+                    symbol_kind: Some(unit.kind.clone()),
+                    qualified_name: Some(qualified_name(&file.relative_path, parsed, index)),
+                    parent_region_id: Some(parent_region.clone()),
+                    start_byte: unit.start_byte as u64,
+                    end_byte: unit.end_byte as u64,
+                    start_line: unit.start_line,
+                    end_line: unit.end_line,
+                });
                 let unit_address = address(
                     &scanned.identity.id,
                     &scanned.snapshot.id,
-                    file,
+                    &file.relative_path,
+                    file_text,
                     unit.start_byte,
                     unit.end_byte,
                     Some(&unit_id),
@@ -274,9 +459,10 @@ impl CceEngine {
                     id: unit_id.clone(),
                     kind: unit.kind.clone(),
                     name: unit.name.clone(),
-                    qualified_name: Some(qualified_name),
+                    qualified_name: Some(qualified_name.clone()),
                     signature: unit.signature.clone(),
                     language: file.language.clone(),
+                    region_id: Some(unit_region_id.clone()),
                     address: Some(unit_address.clone()),
                     capabilities: vec!["syntax_fact".to_owned()],
                     attributes,
@@ -296,22 +482,52 @@ impl CceEngine {
                     evidence: vec![unit_address.clone()],
                     attributes: serde_json::Map::new(),
                 });
-                for (start, end) in chunk_ranges(
-                    file.text()?,
+                let chunks = chunk_ranges(
+                    file_text,
                     unit.start_byte,
                     unit.end_byte,
                     self.config.index.max_unit_bytes,
-                ) {
+                );
+                for (start, end) in chunks {
+                    // A single-chunk symbol reuses the symbol region; split
+                    // symbols get one subregion per chunk.
+                    let doc_region_id = if start == unit.start_byte && end == unit.end_byte {
+                        unit_region_id.clone()
+                    } else {
+                        let sub_region_id = region_id(
+                            &file.relative_path,
+                            start,
+                            end,
+                            RegionKind::Subregion,
+                            &unit.name,
+                        );
+                        records.regions.push(CodeRegion {
+                            id: sub_region_id.clone(),
+                            snapshot_id: scanned.snapshot.id.clone(),
+                            path: file.relative_path.clone(),
+                            kind: RegionKind::Subregion,
+                            language: file.language.clone(),
+                            symbol_name: Some(unit.name.clone()),
+                            symbol_kind: Some(unit.kind.clone()),
+                            qualified_name: Some(qualified_name.clone()),
+                            parent_region_id: Some(unit_region_id.clone()),
+                            start_byte: start as u64,
+                            end_byte: end as u64,
+                            start_line: line_for_offset(file_text, start),
+                            end_line: line_for_offset(file_text, end),
+                        });
+                        sub_region_id
+                    };
                     let chunk_address = address(
                         &scanned.identity.id,
                         &scanned.snapshot.id,
-                        file,
+                        &file.relative_path,
+                        file_text,
                         start,
                         end,
                         Some(&unit_id),
                     )?;
-                    let body = file
-                        .text()?
+                    let body = file_text
                         .get(start..end)
                         .ok_or_else(|| CceError::InvalidSourceRange {
                             path: file.relative_path.clone(),
@@ -323,6 +539,7 @@ impl CceEngine {
                         document: RetrievalDocument {
                             id: document_id(&unit_id, "raw_code", start, end),
                             entity_id: unit_id.clone(),
+                            region_id: Some(doc_region_id),
                             snapshot_id: scanned.snapshot.id.clone(),
                             representation: if is_test(file, &unit.name) {
                                 RetrievalRepresentation::TestBehavior
@@ -345,15 +562,51 @@ impl CceEngine {
                         body,
                     });
                 }
+
+                // Symbol summary: a deterministic natural-language-shaped
+                // descriptor per symbol. This is the dense/lexical bridge
+                // between "which code marks views stale" phrasing and
+                // identifier-shaped implementation names — semantic material,
+                // not generated knowledge.
+                let summary_body = symbol_descriptor(&file.relative_path, parsed, index);
+                records.documents.push(IndexedDocument {
+                    document: RetrievalDocument {
+                        id: document_id(&unit_id, "symbol_summary", 0, summary_body.len()),
+                        entity_id: unit_id.clone(),
+                        region_id: Some(unit_region_id.clone()),
+                        snapshot_id: scanned.snapshot.id.clone(),
+                        representation: RetrievalRepresentation::SymbolSummary,
+                        body_artifact_digest: file_artifact.clone(),
+                        address: Some(unit_address.clone()),
+                        embedding_profile: None,
+                        generated_by: Some("cce-symbol-descriptor-v1".to_owned()),
+                        evidence: Vec::new(),
+                        terms: lexical_terms(&summary_body),
+                    },
+                    path: file.relative_path.clone(),
+                    name: unit.name.clone(),
+                    body: summary_body,
+                });
             }
 
+            for (index, unit) in parsed.units.iter().enumerate() {
+                name_index.entry(unit.name.clone()).or_default().push(
+                    crate::relations::SymbolCandidate {
+                        entity_id: unit_ids[index].clone(),
+                        path: file.relative_path.clone(),
+                        kind: unit.kind.clone(),
+                    },
+                );
+            }
+            unit_ids_by_path.insert(file.relative_path.clone(), unit_ids);
             let summary = deterministic_role_summary(file, parsed);
             let summary_evidence = vec![address(
                 &scanned.identity.id,
                 &scanned.snapshot.id,
-                file,
+                &file.relative_path,
+                file_text,
                 0,
-                file.bytes.len(),
+                file_text.len(),
                 Some(file_id),
             )?];
             let summary_artifact = self
@@ -365,6 +618,7 @@ impl CceEngine {
                 document: RetrievalDocument {
                     id: document_id(file_id, "role_summary", 0, summary.len()),
                     entity_id: file_id.clone(),
+                    region_id: Some(file_region_id.clone()),
                     snapshot_id: scanned.snapshot.id.clone(),
                     representation: RetrievalRepresentation::RoleSummary,
                     body_artifact_digest: summary_artifact.digest,
@@ -380,16 +634,39 @@ impl CceEngine {
             });
         }
 
-        add_relative_import_relations(
-            &scanned.snapshot,
-            &scanned.files,
-            &file_entities,
+        crate::relations::add_derived_relations(
+            &crate::relations::RelationContext {
+                repository_id: &scanned.identity.id,
+                snapshot_id: &scanned.snapshot.id,
+                files: &scanned.files,
+                texts: &texts_by_path,
+                file_entities: &file_entities,
+                parsed: &parsed_by_path,
+                unit_ids: &unit_ids_by_path,
+                name_index: &name_index,
+            },
             &mut records.relations,
         );
+
+        // L2 package architecture from build manifests (deterministic
+        // boundaries — BuildSystem provenance at full confidence).
+        let package_infos = crate::packages::extract(&scanned.files, &texts_by_path);
+        let emission = crate::packages::emit(
+            &package_infos,
+            &scanned.identity.id,
+            &scanned.snapshot.id,
+            &scanned.files,
+            &file_entities,
+            &file_regions,
+        );
+        records.entities.extend(emission.entities);
+        records.relations.extend(emission.relations);
+
         add_hierarchical_knowledge(
             &self.store,
             &scanned.snapshot,
             &scanned.files,
+            &texts_by_path,
             &file_entities,
             &repository_entity_id,
             &mut records,
@@ -426,6 +703,7 @@ impl CceEngine {
                             summary.body.len(),
                         ),
                         entity_id: repository_entity_id.clone(),
+                        region_id: None,
                         snapshot_id: scanned.snapshot.id.clone(),
                         representation: RetrievalRepresentation::CommitSummary,
                         body_artifact_digest: artifact.digest,
@@ -536,7 +814,7 @@ impl CceEngine {
                 Some("Compiler/SCIP resolved references are not built".to_owned()),
             ),
         )?;
-        if let Some(embedder) = EmbeddingBackend::from_config(&self.config.dense)? {
+        if let Some(embedder) = self.embedder().await? {
             self.store.set_view_status(
                 &scanned.identity.id,
                 &scanned.snapshot.id,
@@ -553,9 +831,10 @@ impl CceEngine {
                 ),
             )?;
             let batch_size = match &self.config.dense {
-                DenseBackendConfig::OpenAiCompatible { batch_size, .. } => *batch_size,
-                DenseBackendConfig::DeterministicBaseline { .. } => 64,
-                DenseBackendConfig::Disabled => 64,
+                DenseBackendConfig::Local { .. } => 32,
+                DenseBackendConfig::DeterministicBaseline { .. } | DenseBackendConfig::Disabled => {
+                    64
+                }
             };
             let dense_result: Result<ArtifactRecord> = async {
                 let documents = self.store.documents_for_snapshot(&scanned.snapshot.id)?;
@@ -672,6 +951,15 @@ impl CceEngine {
                 ),
             ),
         )?;
+        if let Err(error) = self
+            .store
+            .prune_snapshots(&scanned.identity.id, self.config.index.snapshot_retention)
+        {
+            tracing::warn!(%error, "snapshot pruning failed; run `cce gc` to retry");
+        }
+        if let Err(error) = self.store.gc_artifacts() {
+            tracing::warn!(%error, "artifact garbage collection failed; run `cce gc` to retry");
+        }
         let manifest = self
             .store
             .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
@@ -687,14 +975,20 @@ impl CceEngine {
             retrieval_documents: records.documents.len(),
             skipped_large_files: scanned.skipped_large_files,
             skipped_binary_files: scanned.skipped_binary_files,
+            skipped_sensitive_files: scanned.skipped_sensitive_files,
             manifest,
         })
+    }
+
+    fn model_cache_dir(&self) -> std::path::PathBuf {
+        self.config.data_root.join("models")
     }
 
     fn parse_with_cache(
         &self,
         repository_id: &str,
         file: &ScannedFile,
+        source: &[u8],
         reused: &mut usize,
     ) -> Result<(crate::ParsedFile, ArtifactRecord)> {
         const CACHE_VERSION: u32 = 1;
@@ -728,7 +1022,7 @@ impl CceEngine {
             }
         }
 
-        let parsed = self.parser.parse(file);
+        let parsed = self.parser.parse(file, source);
         let cache = CachedFileAnalysis {
             version: CACHE_VERSION,
             language: file.language.clone(),
@@ -769,7 +1063,7 @@ fn status(
     }
 }
 
-fn entity_id(
+pub(crate) fn entity_id(
     repository_id: &str,
     path: &str,
     start: usize,
@@ -800,8 +1094,74 @@ fn document_id(entity_id: &str, representation: &str, start: usize, end: usize) 
     )
 }
 
-fn relation_id(source: &str, target: &str, kind: &str) -> String {
+pub(crate) fn relation_id(source: &str, target: &str, kind: &str) -> String {
     digest_id("rel", &[source, target, kind])
+}
+
+fn region_id(path: &str, start: usize, end: usize, kind: RegionKind, symbol: &str) -> String {
+    digest_id(
+        "region",
+        &[
+            path,
+            &start.to_string(),
+            &end.to_string(),
+            &format!("{kind:?}"),
+            symbol,
+        ],
+    )
+}
+
+/// Compact file-level retrieval document: path, language, leading
+/// comment/import block, and top-level symbol signatures. This is the L1
+/// routing unit — whole-file bodies are never indexed as documents.
+fn file_descriptor(file: &ScannedFile, text: &str, parsed: &crate::ParsedFile) -> String {
+    const MAX_DESCRIPTOR_BYTES: usize = 2_048;
+    let mut parts = vec![format!(
+        "{} ({})",
+        file.relative_path,
+        file.language.as_deref().unwrap_or("text")
+    )];
+    // Leading comment/import lines carry module intent and dependency facts.
+    let head: String = text
+        .lines()
+        .take(24)
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("//")
+                || trimmed.starts_with('#')
+                || trimmed.starts_with("use ")
+                || trimmed.starts_with("import ")
+                || trimmed.starts_with("from ")
+                || trimmed.starts_with("mod ")
+                || trimmed.starts_with("//!")
+        })
+        .take(12)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !head.is_empty() {
+        parts.push(head);
+    }
+    let signatures = parsed
+        .units
+        .iter()
+        .filter(|unit| unit.parent_unit.is_none())
+        .filter_map(|unit| {
+            unit.signature
+                .as_deref()
+                .map(str::trim)
+                .filter(|signature| !signature.is_empty())
+                .map(str::to_owned)
+                .or_else(|| Some(format!("{:?} {}", unit.kind, unit.name)))
+        })
+        .take(24)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !signatures.is_empty() {
+        parts.push(signatures);
+    }
+    let mut body = parts.join("\n\n");
+    body.truncate(MAX_DESCRIPTOR_BYTES);
+    body
 }
 
 fn digest_id(prefix: &str, components: &[&str]) -> String {
@@ -816,19 +1176,19 @@ fn digest_id(prefix: &str, components: &[&str]) -> String {
 fn address(
     repository_id: &str,
     snapshot_id: &str,
-    file: &ScannedFile,
+    path: &str,
+    text: &str,
     start: usize,
     end: usize,
     symbol_id: Option<&str>,
 ) -> Result<SourceAddress> {
-    let text = file.text()?;
     if start > end
         || end > text.len()
         || !text.is_char_boundary(start)
         || !text.is_char_boundary(end)
     {
         return Err(CceError::InvalidSourceRange {
-            path: file.relative_path.clone(),
+            path: path.to_owned(),
             start_byte: start as u64,
             end_byte: end as u64,
         });
@@ -838,7 +1198,7 @@ fn address(
     let value = SourceAddress::new(
         repository_id,
         snapshot_id,
-        &file.relative_path,
+        path,
         start as u64..end as u64,
         start_line..=end_line,
     )?;
@@ -889,6 +1249,21 @@ fn qualified_name(path: &str, parsed: &crate::ParsedFile, index: usize) -> Strin
     }
     names.reverse();
     format!("{}::{}", path, names.join("::"))
+}
+
+/// Deterministic descriptor for one symbol: kind + qualified name + file +
+/// signature, phrased so both FTS and dense models can bridge
+/// natural-language queries onto identifier-shaped implementations.
+fn symbol_descriptor(path: &str, parsed: &crate::ParsedFile, index: usize) -> String {
+    let unit = &parsed.units[index];
+    let kind = format!("{:?}", unit.kind).to_ascii_lowercase();
+    let qualified = qualified_name(path, parsed, index);
+    let mut descriptor = format!("{kind} {qualified} in {path}");
+    if let Some(signature) = &unit.signature {
+        descriptor.push_str(" — ");
+        descriptor.push_str(signature);
+    }
+    descriptor
 }
 
 fn is_test(file: &ScannedFile, name: &str) -> bool {
@@ -964,51 +1339,11 @@ fn lexical_terms(value: &str) -> Vec<String> {
     terms
 }
 
-fn add_relative_import_relations(
-    snapshot: &SnapshotIdentity,
-    files: &[ScannedFile],
-    file_entities: &HashMap<String, String>,
-    output: &mut Vec<Relation>,
-) {
-    for file in files {
-        let Some(source_id) = file_entities.get(&file.relative_path) else {
-            continue;
-        };
-        let Ok(text) = file.text() else {
-            continue;
-        };
-        for specifier in relative_import_specifiers(text, file.language.as_deref()) {
-            let Some(target_path) =
-                resolve_relative_import(&file.relative_path, &specifier, file_entities)
-            else {
-                continue;
-            };
-            let Some(target_id) = file_entities.get(&target_path) else {
-                continue;
-            };
-            output.push(Relation {
-                id: relation_id(source_id, target_id, "imports"),
-                source_entity_id: source_id.clone(),
-                target_entity_id: target_id.clone(),
-                kind: RelationKind::Imports,
-                origin: RelationOrigin::FrameworkRule,
-                confidence: 0.85,
-                snapshot_id: snapshot.id.clone(),
-                extractor: "cce-relative-import-v1".to_owned(),
-                evidence: Vec::new(),
-                attributes: serde_json::Map::from_iter([(
-                    "specifier".to_owned(),
-                    specifier.into(),
-                )]),
-            });
-        }
-    }
-}
-
 fn add_hierarchical_knowledge(
     store: &MetadataStore,
     snapshot: &SnapshotIdentity,
     files: &[ScannedFile],
+    texts: &HashMap<String, String>,
     file_entities: &HashMap<String, String>,
     repository_entity_id: &str,
     records: &mut SnapshotRecords,
@@ -1040,6 +1375,7 @@ fn add_hierarchical_knowledge(
             qualified_name: Some(group.clone()),
             signature: None,
             language: None,
+            region_id: None,
             address: None,
             capabilities: vec!["deterministic_hierarchy".to_owned()],
             attributes: serde_json::Map::new(),
@@ -1078,12 +1414,16 @@ fn add_hierarchical_knowledge(
                     evidence: Vec::new(),
                     attributes: serde_json::Map::new(),
                 });
+                let text = texts
+                    .get(&file.relative_path)
+                    .ok_or_else(|| CceError::Configuration("file text disappeared".to_owned()))?;
                 let source = address(
                     &snapshot.repository_id,
                     &snapshot.id,
-                    file,
+                    &file.relative_path,
+                    text,
                     0,
-                    file.bytes.len(),
+                    text.len(),
                     Some(file_id),
                 )?;
                 if evidence.len() < 16 {
@@ -1105,6 +1445,7 @@ fn add_hierarchical_knowledge(
             document: RetrievalDocument {
                 id: document_id(&directory_id, "knowledge_page", 0, body.len()),
                 entity_id: directory_id,
+                region_id: None,
                 snapshot_id: snapshot.id.clone(),
                 representation: RetrievalRepresentation::KnowledgePage,
                 body_artifact_digest: artifact.digest,
@@ -1134,6 +1475,7 @@ fn add_hierarchical_knowledge(
         document: RetrievalDocument {
             id: document_id(repository_entity_id, "knowledge_page", 0, body.len()),
             entity_id: repository_entity_id.to_owned(),
+            region_id: None,
             snapshot_id: snapshot.id.clone(),
             representation: RetrievalRepresentation::KnowledgePage,
             body_artifact_digest: artifact.digest,
@@ -1159,73 +1501,6 @@ fn knowledge_group(path: &str) -> String {
         (_, Some(_)) => first.to_owned(),
         _ => "(root)".to_owned(),
     }
-}
-
-fn relative_import_specifiers(text: &str, language: Option<&str>) -> Vec<String> {
-    let pattern = match language {
-        Some("typescript" | "tsx" | "javascript") => {
-            r#"(?m)(?:from\s+|import\s*\(|require\s*\()\s*[\"'](\.{1,2}/[^\"']+)[\"']"#
-        }
-        Some("python") => r"(?m)^\s*from\s+(\.+[A-Za-z0-9_\.]*)\s+import",
-        _ => return Vec::new(),
-    };
-    regex::Regex::new(pattern)
-        .ok()
-        .into_iter()
-        .flat_map(|regex| {
-            regex
-                .captures_iter(text)
-                .filter_map(|capture| capture.get(1).map(|value| value.as_str().to_owned()))
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-fn resolve_relative_import(
-    source_path: &str,
-    specifier: &str,
-    files: &HashMap<String, String>,
-) -> Option<String> {
-    let parent = std::path::Path::new(source_path).parent()?;
-    let normalized_specifier = if specifier.starts_with('.') && !specifier.contains('/') {
-        specifier
-            .replace('.', "../")
-            .trim_end_matches('/')
-            .to_owned()
-    } else {
-        specifier.to_owned()
-    };
-    let base = normalize_components(parent.join(normalized_specifier))?;
-    let extensions = [
-        "",
-        ".ts",
-        ".tsx",
-        ".js",
-        ".jsx",
-        ".py",
-        "/index.ts",
-        "/index.tsx",
-        "/index.js",
-    ];
-    extensions
-        .iter()
-        .map(|extension| format!("{base}{extension}"))
-        .find(|candidate| files.contains_key(candidate))
-}
-
-fn normalize_components(path: std::path::PathBuf) -> Option<String> {
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(value) => parts.push(value.to_string_lossy().to_string()),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                parts.pop()?;
-            }
-            _ => return None,
-        }
-    }
-    Some(parts.join("/"))
 }
 
 #[cfg(test)]

@@ -32,7 +32,10 @@ gix = { version = "0.86", default-features = false, features = ["revision", "sha
 ignore = "0.4"
 parking_lot = "0.12"
 regex = "1.11"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+fastembed = { version = "~6.0.3", default-features = false, features = [
+  "hf-hub-rustls-tls",
+  "ort-download-binaries-rustls-tls",
+] }
 rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid"] }
 schemars = { version = "1.0", features = ["chrono04", "uuid1"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -62,12 +65,41 @@ missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 
 [workspace.lints.clippy]
+# Strict profile: `all` + `pedantic` at warn, with `clippy -D warnings` in CI
+# promoting them to errors. `pedantic` is noisy by design; each allow below is
+# a deliberate trade-off for this codebase, not a blanket exemption.
 all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -2 }
+# --- deliberate pedantic allows -------------------------------------------
+# `if cond {}` blocks are often clearer than `let ... else` / bool chains here.
 collapsible_if = "allow"
+# Public API is documented at the module/type level; per-method # Errors /
+# # Panics sections would duplicate what CceError already communicates.
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# Crate naming (cce_*) legitimately repeats across module paths.
 module_name_repetitions = "allow"
+# #[must_use] is applied where misuse is plausible; flagging every pure getter
+# is noise.
 must_use_candidate = "allow"
+# Score/rank math (usize→f64) and domain-bounded values (confidence f64→f32,
+# line counts usize→u32) are intentionally lossy; explicit try_from is already
+# used where overflow is a correctness concern (e.g. u64→i64 SQLite columns).
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+# Newline counting via iterator is clear and fast enough; no bytecount dep.
+naive_bytecount = "allow"
+# Indexing orchestration functions are deliberately kept as readable linear
+# pipelines; splitting them mechanically would hurt more than help.
+too_many_lines = "allow"
+# Parser kind-mapping arms are grouped by language for readability even when
+# bodies coincide.
+match_same_arms = "allow"
+# Error types and JSON values are idiomatically passed by value here.
+needless_pass_by_value = "allow"
+# `embedder`/`embedded`-style pairs are the natural names in context.
+similar_names = "allow"
 
 [profile.release]
 lto = "thin"

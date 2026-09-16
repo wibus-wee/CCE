@@ -1,52 +1,50 @@
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
 use async_trait::async_trait;
 use cce_core::{CceError, Result};
 use cce_store::DocumentContent;
-use serde::{Deserialize, Serialize};
 
 use crate::DenseBackendConfig;
 
 const MAGIC: &[u8; 8] = b"CCEVEC1\0";
 const FORMAT_VERSION: u32 = 1;
 
+/// Whether an embedding input is an indexed document or a user query. Some
+/// model families (E5) require different prefixes for each role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedRole {
+    Document,
+    Query,
+}
+
 #[async_trait]
 pub trait Embedder: Send + Sync {
     fn profile(&self) -> &str;
     fn production_ready(&self) -> bool;
-    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>>;
+    async fn embed(&self, inputs: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>>;
 }
 
 #[derive(Debug, Clone)]
 pub enum EmbeddingBackend {
     Deterministic(DeterministicEmbedder),
-    OpenAiCompatible(OpenAiCompatibleEmbedder),
+    Local(LocalEmbedder),
 }
 
 impl EmbeddingBackend {
-    pub fn from_config(config: &DenseBackendConfig) -> Result<Option<Self>> {
+    pub fn from_config(
+        config: &DenseBackendConfig,
+        model_cache_dir: &Path,
+    ) -> Result<Option<Self>> {
         match config {
             DenseBackendConfig::Disabled => Ok(None),
             DenseBackendConfig::DeterministicBaseline { dimensions } => Ok(Some(
                 Self::Deterministic(DeterministicEmbedder::new(*dimensions)?),
             )),
-            DenseBackendConfig::OpenAiCompatible {
-                base_url,
+            DenseBackendConfig::Local { model } => Ok(Some(Self::Local(LocalEmbedder::new(
                 model,
-                api_key_environment,
-                dimensions,
-                ..
-            } => {
-                let api_key = std::env::var(api_key_environment).map_err(|_| {
-                    CceError::Configuration(format!(
-                        "embedding API key environment variable {api_key_environment} is not set"
-                    ))
-                })?;
-                Ok(Some(Self::OpenAiCompatible(OpenAiCompatibleEmbedder::new(
-                    base_url.clone(),
-                    model.clone(),
-                    api_key,
-                    *dimensions,
-                )?)))
-            }
+                model_cache_dir,
+            )?))),
         }
     }
 }
@@ -56,21 +54,21 @@ impl Embedder for EmbeddingBackend {
     fn profile(&self) -> &str {
         match self {
             Self::Deterministic(value) => value.profile(),
-            Self::OpenAiCompatible(value) => value.profile(),
+            Self::Local(value) => value.profile(),
         }
     }
 
     fn production_ready(&self) -> bool {
         match self {
             Self::Deterministic(value) => value.production_ready(),
-            Self::OpenAiCompatible(value) => value.production_ready(),
+            Self::Local(value) => value.production_ready(),
         }
     }
 
-    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+    async fn embed(&self, inputs: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>> {
         match self {
-            Self::Deterministic(value) => value.embed(inputs).await,
-            Self::OpenAiCompatible(value) => value.embed(inputs).await,
+            Self::Deterministic(value) => value.embed(inputs, role).await,
+            Self::Local(value) => value.embed(inputs, role).await,
         }
     }
 }
@@ -105,7 +103,7 @@ impl Embedder for DeterministicEmbedder {
         false
     }
 
-    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+    async fn embed(&self, inputs: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>> {
         Ok(inputs
             .iter()
             .map(|input| {
@@ -125,73 +123,70 @@ impl Embedder for DeterministicEmbedder {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct OpenAiCompatibleEmbedder {
-    client: reqwest::Client,
-    endpoint: String,
-    model: String,
-    api_key: String,
-    dimensions: Option<usize>,
+/// Local in-process embedding model served by fastembed/ONNX Runtime.
+///
+/// Model files are downloaded once into `cache_dir` on first use — selecting
+/// `--dense local` is the explicit network opt-in — after which inference is
+/// fully offline.
+#[derive(Clone)]
+pub struct LocalEmbedder {
+    inner: Arc<Mutex<fastembed::TextEmbedding>>,
     profile: String,
+    prefix: Option<(&'static str, &'static str)>,
 }
 
-impl OpenAiCompatibleEmbedder {
-    pub fn new(
-        base_url: String,
-        model: String,
-        api_key: String,
-        dimensions: Option<usize>,
-    ) -> Result<Self> {
-        let base_url = base_url.trim_end_matches('/');
-        let endpoint = if base_url.ends_with("/embeddings") {
-            base_url.to_owned()
-        } else {
-            format!("{base_url}/embeddings")
-        };
-        reqwest::Url::parse(&endpoint)
-            .map_err(|error| CceError::Configuration(format!("invalid embedding URL: {error}")))?;
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .map_err(|error| CceError::Configuration(error.to_string()))?;
-        let profile = format!(
-            "openai-compatible:{model}:{}",
-            dimensions.map_or_else(|| "native".to_owned(), |value| value.to_string())
-        );
-        Ok(Self {
-            client,
-            endpoint,
-            model,
-            api_key,
-            dimensions,
-            profile,
-        })
+impl std::fmt::Debug for LocalEmbedder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalEmbedder")
+            .field("profile", &self.profile)
+            .finish_non_exhaustive()
     }
 }
 
-#[derive(Debug, Serialize)]
-struct EmbeddingRequest<'a> {
-    model: &'a str,
-    input: &'a [String],
-    encoding_format: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dimensions: Option<usize>,
-}
+impl LocalEmbedder {
+    pub fn new(model_code: &str, cache_dir: &Path) -> Result<Self> {
+        let model = fastembed::TextEmbedding::list_supported_models()
+            .into_iter()
+            .find(|info| info.model_code == model_code)
+            .map(|info| info.model)
+            .ok_or_else(|| {
+                CceError::Configuration(format!(
+                    "unknown local embedding model {model_code:?}; run `cce models`"
+                ))
+            })?;
+        let dimensions = fastembed::TextEmbedding::get_model_info(&model)
+            .map(|info| info.dim)
+            .map_err(|error| CceError::Configuration(error.to_string()))?;
+        let options = fastembed::TextInitOptions::new(model)
+            .with_cache_dir(cache_dir.to_path_buf())
+            .with_show_download_progress(true);
+        let session = fastembed::TextEmbedding::try_new(options)
+            .map_err(|error| CceError::Embedding(format!("local model init failed: {error}")))?;
+        // E5-family models require "query: "/"passage: " prefixes; fastembed
+        // does not add them itself.
+        let prefix = model_code
+            .starts_with("intfloat/")
+            .then_some(("query: ", "passage: "));
+        Ok(Self {
+            inner: Arc::new(Mutex::new(session)),
+            profile: format!("local:{model_code}:{dimensions}"),
+            prefix,
+        })
+    }
 
-#[derive(Debug, Deserialize)]
-struct EmbeddingResponse {
-    data: Vec<EmbeddingDatum>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EmbeddingDatum {
-    index: usize,
-    embedding: Vec<f32>,
+    /// List the Hugging Face model codes that can be passed to `--embedding-model`.
+    #[must_use]
+    pub fn supported_model_codes() -> Vec<String> {
+        fastembed::TextEmbedding::list_supported_models()
+            .into_iter()
+            .map(|info| info.model_code)
+            .collect()
+    }
 }
 
 #[async_trait]
-impl Embedder for OpenAiCompatibleEmbedder {
+impl Embedder for LocalEmbedder {
     fn profile(&self) -> &str {
         &self.profile
     }
@@ -200,48 +195,38 @@ impl Embedder for OpenAiCompatibleEmbedder {
         true
     }
 
-    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+    async fn embed(&self, inputs: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .bearer_auth(&self.api_key)
-            .json(&EmbeddingRequest {
-                model: &self.model,
-                input: inputs,
-                encoding_format: "float",
-                dimensions: self.dimensions,
-            })
-            .send()
-            .await
-            .map_err(|error| CceError::Provider(error.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            let message = response.text().await.unwrap_or_default();
-            return Err(CceError::Provider(format!(
-                "embedding provider returned {status}: {}",
-                truncate(&message, 1_024)
-            )));
-        }
-        let mut data = response
-            .json::<EmbeddingResponse>()
-            .await
-            .map_err(|error| CceError::Provider(error.to_string()))?
-            .data;
-        data.sort_by_key(|item| item.index);
-        if data.len() != inputs.len() {
-            return Err(CceError::Provider(format!(
-                "embedding provider returned {} vectors for {} inputs",
-                data.len(),
+        let prefixed = match (self.prefix, role) {
+            (Some((query, _)), EmbedRole::Query) => inputs
+                .iter()
+                .map(|input| format!("{query}{input}"))
+                .collect(),
+            (Some((_, passage)), EmbedRole::Document) => inputs
+                .iter()
+                .map(|input| format!("{passage}{input}"))
+                .collect(),
+            _ => inputs.to_vec(),
+        };
+        let inner = Arc::clone(&self.inner);
+        let mut vectors = tokio::task::spawn_blocking(move || {
+            inner
+                .lock()
+                .map_err(|_| CceError::Embedding("local embedder poisoned".to_owned()))?
+                .embed(prefixed, None)
+                .map_err(|error| CceError::Embedding(format!("local embedding failed: {error}")))
+        })
+        .await
+        .map_err(|error| CceError::Embedding(format!("local embedding task failed: {error}")))??;
+        if vectors.len() != inputs.len() {
+            return Err(CceError::Embedding(format!(
+                "local model returned {} vectors for {} inputs",
+                vectors.len(),
                 inputs.len()
             )));
         }
-        let mut vectors = data
-            .into_iter()
-            .map(|item| item.embedding)
-            .collect::<Vec<_>>();
         validate_and_normalize(&mut vectors)?;
         Ok(vectors)
     }
@@ -280,12 +265,12 @@ impl DenseIndex {
                 .iter()
                 .map(|document| document.text.clone())
                 .collect::<Vec<_>>();
-            let mut embedded = embedder.embed(&inputs).await?;
+            let mut embedded = embedder.embed(&inputs, EmbedRole::Document).await?;
             validate_and_normalize(&mut embedded)?;
             for (document, vector) in batch.iter().zip(embedded) {
                 let expected = *dimensions.get_or_insert(vector.len());
                 if vector.len() != expected {
-                    return Err(CceError::Provider(
+                    return Err(CceError::Embedding(
                         "embedding dimensions changed within an index".to_owned(),
                     ));
                 }
@@ -314,12 +299,15 @@ impl DenseIndex {
                 embedder.profile()
             )));
         }
-        let vectors = embedder.embed(&[query.to_owned()]).await?;
-        let query = vectors.into_iter().next().ok_or_else(|| {
-            CceError::Provider("embedding provider returned no query vector".to_owned())
-        })?;
+        let vectors = embedder
+            .embed(&[query.to_owned()], EmbedRole::Query)
+            .await?;
+        let query = vectors
+            .into_iter()
+            .next()
+            .ok_or_else(|| CceError::Embedding("embedder returned no query vector".to_owned()))?;
         if query.len() != self.dimensions {
-            return Err(CceError::Provider(format!(
+            return Err(CceError::Embedding(format!(
                 "query dimension {} does not match index dimension {}",
                 query.len(),
                 self.dimensions
@@ -473,7 +461,7 @@ fn validate_and_normalize(vectors: &mut [Vec<f32>]) -> Result<()> {
             || vector.is_empty()
             || vector.iter().any(|value| !value.is_finite())
         {
-            return Err(CceError::Provider("invalid embedding vector".to_owned()));
+            return Err(CceError::Embedding("invalid embedding vector".to_owned()));
         }
         normalize(vector);
     }
@@ -503,10 +491,6 @@ fn tokens(value: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_ascii_lowercase)
 }
 
-fn truncate(value: &str, maximum: usize) -> String {
-    value.chars().take(maximum).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +502,7 @@ mod tests {
             DocumentContent {
                 document_id: "a".to_owned(),
                 entity_id: "ea".to_owned(),
+                region_id: None,
                 representation: cce_core::RetrievalRepresentation::RawCode,
                 address: None,
                 evidence: Vec::new(),
@@ -526,6 +511,7 @@ mod tests {
             DocumentContent {
                 document_id: "b".to_owned(),
                 entity_id: "eb".to_owned(),
+                region_id: None,
                 representation: cce_core::RetrievalRepresentation::RawCode,
                 address: None,
                 evidence: Vec::new(),

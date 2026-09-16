@@ -19,6 +19,16 @@ pub enum QueryIntent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum GraphPolicy {
+    None,
+    OutgoingTrace,
+    IncomingImpact,
+    ArchitectureBoundary,
+    DataflowRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum SearchRoute {
     NoRetrieval,
     ExactSymbol,
@@ -37,6 +47,9 @@ pub enum SearchRoute {
 pub enum RetrievalRepresentation {
     RawCode,
     Signature,
+    /// Compact per-file descriptor (path, imports, top-level signatures) used
+    /// for architecture routing instead of whole-file text.
+    FileDescriptor,
     SymbolSummary,
     RoleSummary,
     ModuleSummary,
@@ -54,6 +67,10 @@ pub struct RetrievalDocument {
     pub snapshot_id: String,
     pub representation: RetrievalRepresentation,
     pub body_artifact_digest: String,
+    /// Canonical region this document's content is drawn from, when it maps
+    /// to a concrete source range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<SourceAddress>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,6 +108,9 @@ const fn default_limit() -> usize {
 pub struct SearchHit {
     pub document_id: String,
     pub entity_id: String,
+    /// Canonical region the hit's content was drawn from, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_name: Option<String>,
     pub representation: RetrievalRepresentation,

@@ -1,14 +1,16 @@
-name: cce
+name: cce-search
+# Retrieval stage only: raw SearchResult hits instead of the packed context.
+# Use this adapter to score retrieval without the packing stage masking it.
 command:
   - target/release/cce
   - --json
-  - context
+  - search
   - "{repository}"
   - "{query}"
   - "{intent_args}"
   - "{route_args}"
-  - --budget
-  - "{budget}"
+  - --limit
+  - "50"
 timeout_seconds: 120
 model_identity: none
 model_revision: none

@@ -5,7 +5,7 @@ use std::{
 };
 
 use cce_core::{
-    CceError, CodeEntity, Relation, RepositoryIdentity, Result, RetrievalDocument,
+    CceError, CodeEntity, CodeRegion, Relation, RepositoryIdentity, Result, RetrievalDocument,
     RetrievalRepresentation, SnapshotIdentity, SourceAddress, ViewKind, ViewManifest, ViewState,
     ViewStatus,
 };
@@ -39,6 +39,7 @@ pub struct IndexedDocument {
 pub struct SnapshotRecords {
     pub artifacts: Vec<ArtifactRecord>,
     pub files: Vec<SourceFileRecord>,
+    pub regions: Vec<CodeRegion>,
     pub entities: Vec<CodeEntity>,
     pub relations: Vec<Relation>,
     pub documents: Vec<IndexedDocument>,
@@ -48,6 +49,7 @@ pub struct SnapshotRecords {
 pub struct LexicalHit {
     pub document_id: String,
     pub entity_id: String,
+    pub region_id: Option<String>,
     pub symbol_name: String,
     pub representation: RetrievalRepresentation,
     pub address: Option<SourceAddress>,
@@ -56,10 +58,31 @@ pub struct LexicalHit {
     pub snippet: String,
 }
 
+/// A file's stat fingerprint observed during a repository scan.
+#[derive(Debug, Clone)]
+pub struct ScanCacheEntry {
+    pub path: String,
+    pub size_bytes: u64,
+    pub mtime_ms: i64,
+    pub line_count: u64,
+    pub content_hash: String,
+}
+
+/// Outcome of a garbage-collection pass over snapshots and the artifact store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcReport {
+    pub pruned_snapshots: usize,
+    pub removed_digests: usize,
+    pub removed_orphan_files: usize,
+    pub reclaimed_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct DocumentContent {
     pub document_id: String,
     pub entity_id: String,
+    pub region_id: Option<String>,
     pub representation: RetrievalRepresentation,
     pub address: Option<SourceAddress>,
     pub evidence: Vec<SourceAddress>,
@@ -119,10 +142,10 @@ impl MetadataStore {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(storage_error)?;
-        if version > 2 {
+        if version > 4 {
             return Err(CceError::UnsupportedFormat {
                 found: version,
-                supported: 2,
+                supported: 4,
             });
         }
         if version == 0 {
@@ -134,6 +157,16 @@ impl MetadataStore {
             connection
                 .execute_batch(include_str!("migrations/0002_parse_cache.sql"))
                 .map_err(|error| CceError::Storage(format!("migration 2 failed: {error}")))?;
+        }
+        if version < 3 {
+            connection
+                .execute_batch(include_str!("migrations/0003_scan_cache.sql"))
+                .map_err(|error| CceError::Storage(format!("migration 3 failed: {error}")))?;
+        }
+        if version < 4 {
+            connection
+                .execute_batch(include_str!("migrations/0004_regions.sql"))
+                .map_err(|error| CceError::Storage(format!("migration 4 failed: {error}")))?;
         }
         let artifacts = ArtifactStore::open(data_root)?;
         Ok(Self {
@@ -274,6 +307,9 @@ impl MetadataStore {
             .execute("DELETE FROM entities WHERE snapshot_id=?1", [&snapshot.id])
             .map_err(storage_error)?;
         transaction
+            .execute("DELETE FROM regions WHERE snapshot_id=?1", [&snapshot.id])
+            .map_err(storage_error)?;
+        transaction
             .execute(
                 "DELETE FROM source_files WHERE snapshot_id=?1",
                 [&snapshot.id],
@@ -305,12 +341,38 @@ impl MetadataStore {
                 .map_err(storage_error)?;
         }
 
+        for region in &records.regions {
+            transaction
+                .execute(
+                    "INSERT INTO regions(id, snapshot_id, path, kind, language, symbol_name,
+                     symbol_kind, qualified_name, parent_region_id, start_byte, end_byte,
+                     start_line, end_line)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        region.id,
+                        snapshot.id,
+                        region.path,
+                        json(&region.kind)?,
+                        region.language,
+                        region.symbol_name,
+                        optional_json(region.symbol_kind.as_ref())?,
+                        region.qualified_name,
+                        region.parent_region_id,
+                        u64_to_i64(region.start_byte)?,
+                        u64_to_i64(region.end_byte)?,
+                        i64::from(region.start_line),
+                        i64::from(region.end_line),
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+
         for entity in &records.entities {
             transaction
                 .execute(
                     "INSERT INTO entities(id, snapshot_id, kind, name, qualified_name, signature,
-                     language, address_json, capabilities_json, attributes_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     language, region_id, address_json, capabilities_json, attributes_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         entity.id,
                         snapshot.id,
@@ -319,6 +381,7 @@ impl MetadataStore {
                         entity.qualified_name,
                         entity.signature,
                         entity.language,
+                        entity.region_id,
                         optional_json(entity.address.as_ref())?,
                         json(&entity.capabilities)?,
                         json(&entity.attributes)?,
@@ -353,13 +416,15 @@ impl MetadataStore {
             let document = &indexed.document;
             transaction
                 .execute(
-                    "INSERT INTO retrieval_documents(id, snapshot_id, entity_id, representation,
-                     body_artifact_digest, address_json, embedding_profile, generated_by,
-                     evidence_json, terms_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO retrieval_documents(id, snapshot_id, entity_id, region_id,
+                     representation, body_artifact_digest, address_json, embedding_profile,
+                     generated_by, evidence_json, terms_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         document.id,
                         snapshot.id,
                         document.entity_id,
+                        document.region_id,
                         json(&document.representation)?,
                         document.body_artifact_digest,
                         optional_json(document.address.as_ref())?,
@@ -484,6 +549,164 @@ impl MetadataStore {
             .map_err(storage_error)
     }
 
+    /// Look up a cached content hash for a file whose size and mtime are
+    /// unchanged since the last scan. Heuristic fast path only.
+    pub fn scan_cache_lookup(
+        &self,
+        repository_id: &str,
+        path: &str,
+        size_bytes: u64,
+        mtime_ms: i64,
+    ) -> Result<Option<(String, u64)>> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT content_hash, line_count FROM scan_cache
+                 WHERE repository_id=?1 AND path=?2 AND size_bytes=?3 AND mtime_ms=?4",
+                params![repository_id, path, u64_to_i64(size_bytes)?, mtime_ms],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .map(|(hash, lines)| Ok((hash, u64::try_from(lines).unwrap_or(0))))
+            .transpose()
+    }
+
+    /// Replace the scan cache for a repository with the entries observed in
+    /// the latest scan.
+    pub fn update_scan_cache(&self, repository_id: &str, entries: &[ScanCacheEntry]) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        transaction
+            .execute(
+                "DELETE FROM scan_cache WHERE repository_id=?1",
+                [repository_id],
+            )
+            .map_err(storage_error)?;
+        for entry in entries {
+            transaction
+                .execute(
+                    "INSERT INTO scan_cache(repository_id, path, size_bytes, mtime_ms, line_count, content_hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        repository_id,
+                        entry.path,
+                        u64_to_i64(entry.size_bytes)?,
+                        entry.mtime_ms,
+                        u64_to_i64(entry.line_count)?,
+                        entry.content_hash,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        transaction.commit().map_err(storage_error)
+    }
+
+    /// Delete all snapshots for a repository except the current one and the
+    /// `keep` most recently created completed snapshots. Returns the pruned
+    /// snapshot ids. Callers must hold the index lease.
+    pub fn prune_snapshots(&self, repository_id: &str, keep: usize) -> Result<Vec<String>> {
+        let connection = self.connection.lock();
+        // Query on the held guard — `current_snapshot` would re-lock this
+        // non-reentrant mutex.
+        let current: String = connection
+            .query_row(
+                "SELECT snapshot_id FROM current_snapshots WHERE repository_id=?1",
+                [repository_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| CceError::Storage("repository has no current snapshot".to_owned()))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id FROM snapshots WHERE repository_id=?1 AND id != ?2 AND complete=1
+                 ORDER BY created_at DESC",
+            )
+            .map_err(storage_error)?;
+        let completed = statement
+            .query_map(params![repository_id, current], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(storage_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        let retained = completed.iter().take(keep).cloned().collect::<Vec<_>>();
+        let mut statement = connection
+            .prepare(
+                "SELECT id FROM snapshots WHERE repository_id=?1 AND id != ?2
+                 AND (complete=0 OR id NOT IN (SELECT value FROM json_each(?3)))",
+            )
+            .map_err(storage_error)?;
+        let doomed = statement
+            .query_map(
+                params![
+                    repository_id,
+                    current.clone(),
+                    serde_json::to_string(&retained)?
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(storage_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for snapshot_id in &doomed {
+            connection
+                .execute(
+                    "DELETE FROM documents_fts WHERE snapshot_id=?1",
+                    [snapshot_id],
+                )
+                .map_err(storage_error)?;
+            connection
+                .execute("DELETE FROM snapshots WHERE id=?1", [snapshot_id])
+                .map_err(storage_error)?;
+        }
+        Ok(doomed)
+    }
+
+    /// Remove artifact rows and object files that no committed metadata row
+    /// references. Returns the removed digests and reclaimed byte count.
+    pub fn gc_artifacts(&self) -> Result<GcReport> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT digest FROM artifacts
+                 WHERE digest NOT IN (SELECT artifact_digest FROM source_files)
+                   AND digest NOT IN (SELECT analysis_artifact_digest FROM source_files
+                                      WHERE analysis_artifact_digest IS NOT NULL)
+                   AND digest NOT IN (SELECT body_artifact_digest FROM retrieval_documents)
+                   AND digest NOT IN (SELECT artifact_digest FROM view_status
+                                      WHERE artifact_digest IS NOT NULL)
+                   AND digest NOT IN (SELECT artifact_digest FROM trajectories)",
+            )
+            .map_err(storage_error)?;
+        let unreferenced = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        for digest in &unreferenced {
+            connection
+                .execute("DELETE FROM artifacts WHERE digest=?1", [digest])
+                .map_err(storage_error)?;
+        }
+        let mut statement = connection
+            .prepare("SELECT digest FROM artifacts")
+            .map_err(storage_error)?;
+        let keep = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_error)?
+            .collect::<std::result::Result<std::collections::HashSet<_>, _>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        drop(connection);
+        let mut report = self.artifacts.retain(&keep)?;
+        report.removed_digests = unreferenced.len();
+        Ok(report)
+    }
+
     pub fn view_manifest(&self, repository_id: &str, snapshot_id: &str) -> Result<ViewManifest> {
         let connection = self.connection.lock();
         let mut statement = connection
@@ -531,21 +754,25 @@ impl MetadataStore {
         })
     }
 
+    /// FTS5 retrieval over the snapshot's documents. Runs a strictness
+    /// cascade — all terms exact, then all terms as prefixes, then any prefix
+    /// term — so AND-matched documents always rank ahead of OR fallbacks.
+    /// Results are deduplicated by document id and capped at `limit`.
     pub fn lexical_search(
         &self,
         snapshot_id: &str,
         query: &str,
         limit: usize,
     ) -> Result<Vec<LexicalHit>> {
-        let query = fts_query(query);
-        if query.is_empty() {
+        let terms = fts_terms(query);
+        if terms.is_empty() {
             return Ok(Vec::new());
         }
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(
-                "SELECT f.document_id, f.entity_id, e.name, d.representation, d.address_json,
-                 d.evidence_json,
+                "SELECT f.document_id, f.entity_id, d.region_id, e.name, d.representation,
+                 d.address_json, d.evidence_json,
                  bm25(documents_fts, 0.0, 0.0, 0.0, 3.0, 5.0, 2.0, 1.0) AS rank,
                  snippet(documents_fts, 6, '<mark>', '</mark>', ' … ', 24)
                  FROM documents_fts f JOIN retrieval_documents d
@@ -555,42 +782,61 @@ impl MetadataStore {
                  ORDER BY rank LIMIT ?3",
             )
             .map_err(storage_error)?;
-        let rows = statement
-            .query_map(params![query, snapshot_id, usize_to_i64(limit)?], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, f64>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            })
-            .map_err(storage_error)?;
         let mut hits = Vec::new();
-        for row in rows {
-            let (
-                document_id,
-                entity_id,
-                symbol_name,
-                representation,
-                address,
-                evidence,
-                rank,
-                snippet,
-            ) = row.map_err(storage_error)?;
-            hits.push(LexicalHit {
-                document_id,
-                entity_id,
-                symbol_name,
-                representation: parse_json(&representation)?,
-                address: address.as_deref().map(parse_json).transpose()?,
-                evidence: parse_json(&evidence)?,
-                score: 1.0 / (1.0 + rank.abs()),
-                snippet,
-            });
+        let mut seen = std::collections::HashSet::new();
+        let mut position = 0_usize;
+        for match_query in fts_match_queries(&terms) {
+            if hits.len() >= limit {
+                break;
+            }
+            let rows = statement
+                .query_map(
+                    params![match_query, snapshot_id, usize_to_i64(limit)?],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, f64>(7)?,
+                            row.get::<_, String>(8)?,
+                        ))
+                    },
+                )
+                .map_err(storage_error)?;
+            for row in rows {
+                let (
+                    document_id,
+                    entity_id,
+                    region_id,
+                    symbol_name,
+                    representation,
+                    address,
+                    evidence,
+                    _rank,
+                    snippet,
+                ) = row.map_err(storage_error)?;
+                if !seen.insert(document_id.clone()) {
+                    continue;
+                }
+                position += 1;
+                hits.push(LexicalHit {
+                    document_id,
+                    entity_id,
+                    region_id,
+                    symbol_name,
+                    representation: parse_json(&representation)?,
+                    address: address.as_deref().map(parse_json).transpose()?,
+                    evidence: parse_json(&evidence)?,
+                    // Position within the strictness cascade; per-pass bm25
+                    // ranks are not comparable across different MATCH queries.
+                    score: 1.0 / (1.0 + position as f64),
+                    snippet,
+                });
+            }
         }
         Ok(hits)
     }
@@ -604,8 +850,8 @@ impl MetadataStore {
         let connection = self.connection.lock();
         let mut statement = connection
             .prepare(
-                "SELECT id, kind, name, qualified_name, signature, language, address_json,
-                 capabilities_json, attributes_json FROM entities
+                "SELECT id, kind, name, qualified_name, signature, language, region_id,
+                 address_json, capabilities_json, attributes_json FROM entities
                  WHERE snapshot_id=?1 AND (name=?2 OR qualified_name=?2)
                  ORDER BY CASE WHEN name=?2 THEN 0 ELSE 1 END LIMIT ?3",
             )
@@ -620,45 +866,59 @@ impl MetadataStore {
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(7)?,
                     row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             })
             .map_err(storage_error)?;
-        let mut entities = Vec::new();
-        for row in rows {
-            let (
-                id,
-                kind,
-                name,
-                qualified_name,
-                signature,
-                language,
-                address,
-                capabilities,
-                attributes,
-            ) = row.map_err(storage_error)?;
-            entities.push(CodeEntity {
-                id,
-                kind: parse_json(&kind)?,
-                name,
-                qualified_name,
-                signature,
-                language,
-                address: address.as_deref().map(parse_json).transpose()?,
-                capabilities: parse_json(&capabilities)?,
-                attributes: parse_json(&attributes)?,
-            });
-        }
-        Ok(entities)
+        rows.map(|row| entity_from_cols(row.map_err(storage_error)?))
+            .collect()
+    }
+
+    /// All entities of one kind in a snapshot — e.g. `Package` nodes for the
+    /// architecture map.
+    pub fn entities_by_kind(
+        &self,
+        snapshot_id: &str,
+        kind: &cce_core::EntityKind,
+    ) -> Result<Vec<CodeEntity>> {
+        let kind_json = serde_json::to_string(kind)?;
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, kind, name, qualified_name, signature, language, region_id,
+                 address_json, capabilities_json, attributes_json FROM entities
+                 WHERE snapshot_id=?1 AND kind=?2 ORDER BY name",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![snapshot_id, kind_json], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })
+            .map_err(storage_error)?;
+        rows.map(|row| entity_from_cols(row.map_err(storage_error)?))
+            .collect()
     }
 
     pub fn entity_by_id(&self, snapshot_id: &str, id: &str) -> Result<Option<CodeEntity>> {
         let connection = self.connection.lock();
         let row = connection
             .query_row(
-                "SELECT id, kind, name, qualified_name, signature, language, address_json,
-                 capabilities_json, attributes_json FROM entities WHERE snapshot_id=?1 AND id=?2",
+                "SELECT id, kind, name, qualified_name, signature, language, region_id,
+                 address_json, capabilities_json, attributes_json FROM entities
+                 WHERE snapshot_id=?1 AND id=?2",
                 params![snapshot_id, id],
                 |row| {
                     Ok((
@@ -669,39 +929,80 @@ impl MetadataStore {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
-                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(7)?,
                         row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
                     ))
                 },
             )
             .optional()
             .map_err(storage_error)?;
-        row.map(
-            |(
+        row.map(entity_from_cols).transpose()
+    }
+
+    /// Regions of one kind for a snapshot — the canonical code-range join
+    /// target shared by documents, entities, and citations.
+    pub fn regions_for_path(&self, snapshot_id: &str, path: &str) -> Result<Vec<CodeRegion>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, path, kind, language, symbol_name, symbol_kind, qualified_name,
+                 parent_region_id, start_byte, end_byte, start_line, end_line
+                 FROM regions WHERE snapshot_id=?1 AND path=?2
+                 ORDER BY start_byte, end_byte",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![snapshot_id, path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            })
+            .map_err(storage_error)?;
+        let mut regions = Vec::new();
+        for row in rows {
+            let (
                 id,
+                path,
                 kind,
-                name,
-                qualified_name,
-                signature,
                 language,
-                address,
-                capabilities,
-                attributes,
-            )| {
-                Ok(CodeEntity {
-                    id,
-                    kind: parse_json(&kind)?,
-                    name,
-                    qualified_name,
-                    signature,
-                    language,
-                    address: address.as_deref().map(parse_json).transpose()?,
-                    capabilities: parse_json(&capabilities)?,
-                    attributes: parse_json(&attributes)?,
-                })
-            },
-        )
-        .transpose()
+                symbol_name,
+                symbol_kind,
+                qualified_name,
+                parent_region_id,
+                start_byte,
+                end_byte,
+                start_line,
+                end_line,
+            ) = row.map_err(storage_error)?;
+            regions.push(CodeRegion {
+                id,
+                snapshot_id: snapshot_id.to_owned(),
+                path,
+                kind: parse_json(&kind)?,
+                language,
+                symbol_name,
+                symbol_kind: symbol_kind.as_deref().map(parse_json).transpose()?,
+                qualified_name,
+                parent_region_id,
+                start_byte: u64::try_from(start_byte).unwrap_or(0),
+                end_byte: u64::try_from(end_byte).unwrap_or(0),
+                start_line: u32::try_from(start_line).unwrap_or(0),
+                end_line: u32::try_from(end_line).unwrap_or(0),
+            });
+        }
+        Ok(regions)
     }
 
     pub fn relations_for_entity(
@@ -743,31 +1044,72 @@ impl MetadataStore {
             .map_err(storage_error)?;
         let mut relations = Vec::new();
         for row in rows {
-            let (
-                id,
-                source_entity_id,
-                target_entity_id,
-                kind,
-                origin,
-                confidence,
-                extractor,
-                evidence,
-                attributes,
-            ) = row.map_err(storage_error)?;
-            relations.push(Relation {
-                id,
-                source_entity_id,
-                target_entity_id,
-                kind: parse_json(&kind)?,
-                origin: parse_json(&origin)?,
-                confidence: confidence as f32,
-                snapshot_id: snapshot_id.to_owned(),
-                extractor,
-                evidence: parse_json(&evidence)?,
-                attributes: parse_json(&attributes)?,
-            });
+            relations.push(relation_from_cols(
+                row.map_err(storage_error)?,
+                snapshot_id,
+            )?);
         }
         Ok(relations)
+    }
+
+    /// All relations of one kind in a snapshot — e.g. `BuildDependsOn` for
+    /// the package architecture map.
+    pub fn relations_by_kind(
+        &self,
+        snapshot_id: &str,
+        kind: &cce_core::RelationKind,
+        limit: usize,
+    ) -> Result<Vec<Relation>> {
+        let kind_json = serde_json::to_string(kind)?;
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, source_entity_id, target_entity_id, kind, origin, confidence,
+                 extractor, evidence_json, attributes_json FROM relations
+                 WHERE snapshot_id=?1 AND kind=?2 ORDER BY confidence DESC LIMIT ?3",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![snapshot_id, kind_json, usize_to_i64(limit)?],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, f64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .map_err(storage_error)?;
+        let mut relations = Vec::new();
+        for row in rows {
+            relations.push(relation_from_cols(
+                row.map_err(storage_error)?,
+                snapshot_id,
+            )?);
+        }
+        Ok(relations)
+    }
+
+    /// Total edge count touching an entity — used to penalize hub nodes
+    /// during graph expansion.
+    pub fn entity_relation_degree(&self, snapshot_id: &str, entity_id: &str) -> Result<usize> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM relations
+                 WHERE snapshot_id=?1 AND (source_entity_id=?2 OR target_entity_id=?2)",
+                params![snapshot_id, entity_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_error)
+            .map(|count| usize::try_from(count).unwrap_or(0))
     }
 
     pub fn source_text(&self, address: &SourceAddress) -> Result<String> {
@@ -800,8 +1142,8 @@ impl MetadataStore {
             let connection = self.connection.lock();
             let mut statement = connection
                 .prepare(
-                    "SELECT id, entity_id, representation, address_json, body_artifact_digest,
-                     evidence_json
+                    "SELECT id, entity_id, region_id, representation, address_json,
+                     body_artifact_digest, evidence_json
                      FROM retrieval_documents WHERE snapshot_id=?1 ORDER BY id",
                 )
                 .map_err(storage_error)?;
@@ -810,10 +1152,11 @@ impl MetadataStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 })
                 .map_err(storage_error)?
@@ -822,7 +1165,15 @@ impl MetadataStore {
         };
         rows.into_iter()
             .map(
-                |(document_id, entity_id, representation, address_json, digest, evidence_json)| {
+                |(
+                    document_id,
+                    entity_id,
+                    region_id,
+                    representation,
+                    address_json,
+                    digest,
+                    evidence_json,
+                )| {
                     let address: Option<SourceAddress> =
                         address_json.as_deref().map(parse_json).transpose()?;
                     let text = if let Some(address) = &address {
@@ -835,6 +1186,7 @@ impl MetadataStore {
                     Ok(DocumentContent {
                         document_id,
                         entity_id,
+                        region_id,
                         representation: parse_json(&representation)?,
                         address,
                         evidence: parse_json(&evidence_json)?,
@@ -875,6 +1227,89 @@ fn parse_json<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
     serde_json::from_str(value).map_err(Into::into)
 }
 
+#[allow(clippy::type_complexity)]
+type EntityCols = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
+fn entity_from_cols(
+    (
+        id,
+        kind,
+        name,
+        qualified_name,
+        signature,
+        language,
+        region_id,
+        address,
+        capabilities,
+        attributes,
+    ): EntityCols,
+) -> Result<CodeEntity> {
+    Ok(CodeEntity {
+        id,
+        kind: parse_json(&kind)?,
+        name,
+        qualified_name,
+        signature,
+        language,
+        region_id,
+        address: address.as_deref().map(parse_json).transpose()?,
+        capabilities: parse_json(&capabilities)?,
+        attributes: parse_json(&attributes)?,
+    })
+}
+
+#[allow(clippy::type_complexity)]
+type RelationCols = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    f64,
+    String,
+    String,
+    String,
+);
+
+fn relation_from_cols(
+    (
+        id,
+        source_entity_id,
+        target_entity_id,
+        kind,
+        origin,
+        confidence,
+        extractor,
+        evidence,
+        attributes,
+    ): RelationCols,
+    snapshot_id: &str,
+) -> Result<Relation> {
+    Ok(Relation {
+        id,
+        source_entity_id,
+        target_entity_id,
+        kind: parse_json(&kind)?,
+        origin: parse_json(&origin)?,
+        confidence: confidence as f32,
+        snapshot_id: snapshot_id.to_owned(),
+        extractor,
+        evidence: parse_json(&evidence)?,
+        attributes: parse_json(&attributes)?,
+    })
+}
+
 fn storage_error(error: rusqlite::Error) -> CceError {
     let recovery = matches!(
         error.sqlite_error_code(),
@@ -912,15 +1347,38 @@ fn usize_to_i64(value: usize) -> Result<i64> {
         .map_err(|_| CceError::Storage(format!("value {value} exceeds SQLite INTEGER")))
 }
 
-fn fts_query(query: &str) -> String {
+fn fts_terms(query: &str) -> Vec<String> {
     query
         .split(|character: char| !character.is_alphanumeric() && character != '_')
         .filter(|term| !term.is_empty())
         .filter(|term| !is_query_stopword(term))
         .take(32)
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" OR ")
+        .map(|term| term.replace('"', "\"\""))
+        .collect()
+}
+
+/// Strictness cascade for one lexical query: exact AND, prefix AND, prefix
+/// OR. Prefixes keep partial identifier matches ("fresh" → "freshness")
+/// reachable while exact AND still wins the top ranks.
+fn fts_match_queries(terms: &[String]) -> Vec<String> {
+    let quoted = |term: &str| format!("\"{term}\"");
+    vec![
+        terms
+            .iter()
+            .map(|term| quoted(term))
+            .collect::<Vec<_>>()
+            .join(" AND "),
+        terms
+            .iter()
+            .map(|term| format!("{}*", quoted(term)))
+            .collect::<Vec<_>>()
+            .join(" AND "),
+        terms
+            .iter()
+            .map(|term| format!("{}*", quoted(term)))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    ]
 }
 
 fn is_query_stopword(token: &str) -> bool {
@@ -964,14 +1422,17 @@ mod tests {
     }
 
     #[test]
-    fn fts_query_is_bounded_and_quoted() {
+    fn fts_terms_strip_stopwords_and_queries_cascade() {
+        let terms = fts_terms("Where is the snapshot freshness decided?");
+        assert_eq!(terms, ["snapshot", "freshness", "decided"]);
+        let queries = fts_match_queries(&terms);
         assert_eq!(
-            fts_query("resumeAttempt cursor"),
-            "\"resumeAttempt\" OR \"cursor\""
-        );
-        assert_eq!(
-            fts_query("Where is the snapshot freshness decided?"),
-            "\"snapshot\" OR \"freshness\" OR \"decided\""
+            queries,
+            [
+                "\"snapshot\" AND \"freshness\" AND \"decided\"",
+                "\"snapshot\"* AND \"freshness\"* AND \"decided\"*",
+                "\"snapshot\"* OR \"freshness\"* OR \"decided\"*",
+            ]
         );
     }
 }

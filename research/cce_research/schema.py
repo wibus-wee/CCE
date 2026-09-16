@@ -17,6 +17,19 @@ Intent = Literal[
     "precise_dataflow",
 ]
 
+Route = Literal[
+    "no_retrieval",
+    "exact_symbol",
+    "lexical",
+    "dense_raw",
+    "dense_summary",
+    "hybrid",
+    "structural",
+    "knowledge",
+    "history",
+    "reranked",
+]
+
 
 class LineRange(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -43,6 +56,19 @@ class Provenance(BaseModel):
     construction_method: str
 
 
+class GoldFact(BaseModel):
+    """An atomic claim the case's evidence must support. A fact counts as
+    supported when any retrieved range overlaps one of `evidence` ranges or
+    carries one of `symbols` — deterministic, no LLM judge required.
+    This distinguishes "found the file" from "found the answer"."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    claim: str
+    evidence: list[LineRange] = Field(default_factory=list)
+    symbols: list[str] = Field(default_factory=list)
+
+
 class BenchmarkCase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -55,8 +81,30 @@ class BenchmarkCase(BaseModel):
     gold_symbols: list[str] = Field(default_factory=list)
     gold_ranges: list[LineRange] = Field(default_factory=list)
     supporting_ranges: list[LineRange] = Field(default_factory=list)
+    # Atomic facts the evidence must support (claim-level recall). Finer
+    # than file recall: the right file at the wrong lines still fails.
+    gold_facts: list[GoldFact] = Field(default_factory=list)
+    # Paths an adjudicator has reviewed and marked NOT relevant. Retrieved
+    # items outside gold ∪ supporting ∪ judged are "unjudged" — they feed
+    # `unjudged_rate` and the adjudication queue instead of counting as
+    # false positives (gold sets are never complete; pooling lesson).
+    judged_files: list[str] = Field(default_factory=list)
     no_context: bool = False
     budget_tokens: int = Field(default=8192, ge=256, le=128_000)
+    # When false the adapter must not pass the intent to the system; the
+    # system's own classifier decides and `predicted_intent` is scored against
+    # `intent`. This is how planner/classifier quality is measured.
+    supply_intent: bool = True
+    # Non-empty routes override the planner's route selection (ablation rows).
+    routes: list[Route] = Field(default_factory=list)
+    # Derived-case lineage: `derived_from` is the parent case_id,
+    # `derivation` names the transform (e.g. "ablate:structural",
+    # "variant:inflection", "permute:3").
+    derived_from: str | None = None
+    derivation: str | None = None
+    # Optional extraction key for downstream answer probes: the string a
+    # correct consumer must be able to produce from the pack.
+    answer_key: str | None = None
     provenance: Provenance
     tags: list[str] = Field(default_factory=list)
 
@@ -84,6 +132,13 @@ class CaseResult(BaseModel):
     dataset_revision: str
     retrieved: list[RetrievedRange]
     abstained: bool = False
+    # Plan actually executed, as reported by the system. `predicted_intent` is
+    # what the planner resolved (supplied or classified); `plan_routes` and
+    # `graph_policy` record the routing decision so misrouting is attributable.
+    predicted_intent: str | None = None
+    plan_routes: list[str] = Field(default_factory=list)
+    graph_policy: str | None = None
+    missing_capabilities: list[str] = Field(default_factory=list)
     index_ms: float | None = Field(default=None, ge=0)
     query_ms: float = Field(ge=0)
     peak_memory_bytes: int | None = Field(default=None, ge=0)
