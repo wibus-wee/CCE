@@ -19,8 +19,14 @@ use serde::{Deserialize, Serialize};
 /// work and never touches the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DetectState {
-    /// Resolved executable or artifact path, plus a display string.
-    Ready { tool: PathBuf, detail: String },
+    /// Resolved executable or artifact path, plus a display string. `note`
+    /// carries detection context worth surfacing as `ProviderReport.message`
+    /// (e.g. which project root a monorepo index run will use).
+    Ready {
+        tool: PathBuf,
+        detail: String,
+        note: Option<String>,
+    },
     /// The repo needs this provider but the tool is absent.
     Missing { remediation: String },
     /// The provider does not apply to this repository.
@@ -132,9 +138,10 @@ pub(crate) fn detect_all(repo_root: &Path) -> Vec<ProviderReport> {
         .map(|provider| {
             let mut report = ProviderReport::new(provider.id());
             match provider.detect(repo_root) {
-                DetectState::Ready { detail, .. } => {
+                DetectState::Ready { detail, note, .. } => {
                     report.state = ProviderState::Ready;
                     report.tool = Some(detail);
+                    report.message = note;
                 }
                 DetectState::Missing { remediation } => {
                     report.state = ProviderState::Missing;
@@ -162,9 +169,10 @@ pub(crate) fn produce(
     for provider in registry() {
         let mut report = ProviderReport::new(provider.id());
         let tool = match provider.detect(repo_root) {
-            DetectState::Ready { tool, detail } => {
+            DetectState::Ready { tool, detail, note } => {
                 report.state = ProviderState::Ready;
                 report.tool = Some(detail);
+                report.message = note;
                 tool
             }
             DetectState::Missing { remediation } => {
@@ -213,6 +221,7 @@ impl Provider for ScipFile {
             DetectState::Ready {
                 tool: candidate,
                 detail: "index.scip (repo)".to_owned(),
+                note: None,
             }
         } else {
             DetectState::NotApplicable {
@@ -260,6 +269,7 @@ impl Provider for ScipRustAnalyzer {
             |tool| DetectState::Ready {
                 detail: tool.display().to_string(),
                 tool,
+                note: None,
             },
         )
     }
@@ -329,7 +339,28 @@ impl Provider for ScipRustAnalyzer {
 }
 
 /// `scip-typescript` for repositories with a `tsconfig.json`.
+///
+/// Monorepos carry many `tsconfig.json` files; v1 indexes a single project
+/// root. The repository root wins when its tsconfig names inputs; a
+/// solution-style tsconfig (`"files": []` with no `include`) declares no
+/// sources of its own, so detection prefers the largest workspace candidate
+/// (npm/yarn `workspaces` globs, `pnpm-workspace.yaml` `packages:`, plus the
+/// conventional `apps/*`, `packages/*`, `plugins/*`, `libs/*`). A root
+/// solution file remains the last resort when no candidate exists —
+/// scip-typescript still recurses into its `references`.
 struct ScipTypeScript;
+
+/// The TypeScript project root a detect/run pair agreed on.
+#[derive(Debug)]
+struct TsProject {
+    /// Directory passed as the `index <dir>` argument (absolute when the
+    /// repository root is absolute).
+    dir: PathBuf,
+    /// Repo-relative display form (`.` for the root itself).
+    display: String,
+    /// Why this root won — surfaced verbatim as `ProviderReport.message`.
+    note: String,
+}
 
 impl Provider for ScipTypeScript {
     fn id(&self) -> &'static str {
@@ -337,29 +368,60 @@ impl Provider for ScipTypeScript {
     }
 
     fn detect(&self, repo_root: &Path) -> DetectState {
-        if !repo_root.join("tsconfig.json").is_file() {
+        let Some(project) = select_ts_project(repo_root) else {
             return DetectState::NotApplicable {
-                reason: "no tsconfig.json at repository root".to_owned(),
+                reason: "no tsconfig.json at the repository root or in workspace \
+                         directories"
+                    .to_owned(),
             };
-        }
+        };
         // Prefer the project's own devDependency so the indexer matches the
-        // project's TypeScript version.
-        let local = repo_root.join("node_modules/.bin/scip-typescript");
-        if local.is_file() {
-            return DetectState::Ready {
-                detail: "node_modules/.bin/scip-typescript".to_owned(),
-                tool: local,
-            };
+        // project's TypeScript version. pnpm/npm/yarn place the bin shim next
+        // to the manifest that declares it, so probe the selected project
+        // root first, then the repository root.
+        for base in [project.dir.as_path(), repo_root] {
+            let local = base.join("node_modules/.bin/scip-typescript");
+            if local.is_file() {
+                return DetectState::Ready {
+                    detail: local
+                        .strip_prefix(repo_root)
+                        .unwrap_or(&local)
+                        .display()
+                        .to_string(),
+                    tool: local,
+                    note: Some(project.note),
+                };
+            }
+            if base == repo_root {
+                break;
+            }
         }
         on_path("scip-typescript").map_or_else(
-            || DetectState::Missing {
-                remediation: "scip-typescript is not installed; run `npm i -D \
-                              @sourcegraph/scip-typescript` in the repository"
-                    .to_owned(),
+            || {
+                let install = if repo_root.join("pnpm-workspace.yaml").is_file()
+                    || repo_root.join("pnpm-lock.yaml").is_file()
+                {
+                    "pnpm add -D @sourcegraph/scip-typescript"
+                } else {
+                    "npm i -D @sourcegraph/scip-typescript"
+                };
+                let where_ = if project.display == "." {
+                    "in the repository root".to_owned()
+                } else {
+                    format!("in `{}`", project.display)
+                };
+                DetectState::Missing {
+                    remediation: format!(
+                        "scip-typescript is not installed; run `{install}` {where_} \
+                         (a repo-local devDependency matches the project's \
+                         TypeScript version)"
+                    ),
+                }
             },
             |tool| DetectState::Ready {
                 detail: tool.display().to_string(),
                 tool,
+                note: Some(project.note),
             },
         )
     }
@@ -373,22 +435,53 @@ impl Provider for ScipTypeScript {
     ) -> Result<ProviderOutput> {
         let started = Instant::now();
         std::fs::create_dir_all(work_dir).map_err(|error| CceError::io(work_dir, error))?;
-        let produced = work_dir.join("index.scip");
-        // scip-typescript indexes the project at cwd; `--output` exists on
-        // current versions. On an unknown-flag failure retry without it and
-        // collect ./index.scip from the repo root.
+        // The project root is recomputed rather than threaded through
+        // `Ready`: selection is deterministic over the same tree, so detect
+        // and run cannot disagree unless the repo changed underneath us.
+        let project = select_ts_project(repo_root).ok_or_else(|| {
+            CceError::Configuration(
+                "tsconfig.json project root vanished between detect and run".to_owned(),
+            )
+        })?;
+        // scip-typescript emits `relative_path` relative to `--cwd`. Pinning
+        // it (and the process cwd) to the repository root keeps document
+        // paths repo-relative (`apps/server/src/index.ts`) so they join the
+        // engine's file index even when the project sits in a workspace
+        // subdirectory. `--output` is made absolute for the same reason.
+        let cwd = std::path::absolute(repo_root).map_err(|error| CceError::io(repo_root, error))?;
+        let produced = std::path::absolute(work_dir.join("index.scip"))
+            .map_err(|error| CceError::io(work_dir, error))?;
+        let project_arg =
+            std::path::absolute(&project.dir).map_err(|error| CceError::io(&project.dir, error))?;
+        let (cwd, output_path, project_arg) = (
+            cwd.to_string_lossy().into_owned(),
+            produced.to_string_lossy().into_owned(),
+            project_arg.to_string_lossy().into_owned(),
+        );
         let output = run_command(
             tool,
-            &["index", "--output", &produced.to_string_lossy()],
+            &[
+                "index",
+                "--cwd",
+                &cwd,
+                "--output",
+                &output_path,
+                &project_arg,
+            ],
             repo_root,
             timeout,
         )?;
         if !produced.is_file() {
-            let fallback = run_command(tool, &["index"], repo_root, timeout)?;
-            let strays = repo_root.join("index.scip");
-            if strays.is_file() {
-                std::fs::rename(&strays, &produced)
-                    .map_err(|error| CceError::io(&strays, error))?;
+            // Unknown-flag or old-version failure: retry bare. `--cwd`
+            // defaults to the process cwd — already the repo root — so
+            // document paths stay repo-relative and the artifact lands in
+            // `<repo>/index.scip` for relocation into the work dir.
+            let fallback = run_command(tool, &["index", &project_arg], repo_root, timeout)?;
+            for strays in [repo_root.join("index.scip"), project.dir.join("index.scip")] {
+                if strays.is_file() {
+                    std::fs::rename(&strays, &produced)
+                        .map_err(|error| CceError::io(&strays, error))?;
+                }
             }
             if fallback.timed_out {
                 return Err(CceError::Configuration(format!(
@@ -417,6 +510,226 @@ impl Provider for ScipTypeScript {
             duration: started.elapsed(),
         })
     }
+}
+
+/// Choose the single TypeScript project root v1 will index. `None` means no
+/// `tsconfig.json` exists anywhere detection looks — the provider is not
+/// applicable.
+fn select_ts_project(repo_root: &Path) -> Option<TsProject> {
+    let root_tsconfig = repo_root.join("tsconfig.json");
+    let candidates = workspace_project_dirs(repo_root);
+    if root_tsconfig.is_file() && !tsconfig_indexes_nothing(&root_tsconfig) {
+        let note = if candidates.is_empty() {
+            "project root: repository root".to_owned()
+        } else {
+            format!(
+                "project root: repository root ({} workspace tsconfig.json \
+                 project(s) not indexed — v1 runs a single project)",
+                candidates.len()
+            )
+        };
+        return Some(TsProject {
+            dir: repo_root.to_path_buf(),
+            display: ".".to_owned(),
+            note,
+        });
+    }
+    let root_gap = if root_tsconfig.is_file() {
+        "repository tsconfig.json is a solution file with no inputs"
+    } else {
+        "no tsconfig.json at the repository root"
+    };
+    let mut ranked: Vec<(usize, PathBuf)> = candidates
+        .iter()
+        .map(|dir| (count_ts_sources(dir), dir.clone()))
+        .collect();
+    // Most sources first; path order breaks ties deterministically.
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    if let Some((sources, dir)) = ranked.into_iter().next() {
+        let display = dir
+            .strip_prefix(repo_root)
+            .unwrap_or(&dir)
+            .display()
+            .to_string();
+        return Some(TsProject {
+            dir,
+            note: format!(
+                "project root `{display}`: largest of {} workspace \
+                 tsconfig.json candidate(s) ({sources} TS sources; {root_gap})",
+                candidates.len()
+            ),
+            display,
+        });
+    }
+    // A hollow root tsconfig is still an explicit TypeScript signal — let
+    // the tool run and report its own diagnostic rather than guess.
+    root_tsconfig.is_file().then(|| TsProject {
+        dir: repo_root.to_path_buf(),
+        display: ".".to_owned(),
+        note: format!("project root: repository root ({root_gap})"),
+    })
+}
+
+/// Directories holding a `tsconfig.json` under the repository's declared
+/// workspace globs (`package.json` `workspaces`, `pnpm-workspace.yaml`
+/// `packages:`) plus the conventional `apps/*`, `packages/*`, `plugins/*`,
+/// `libs/*` roots. Sorted and deduplicated; the repository root is never
+/// included.
+fn workspace_project_dirs(repo_root: &Path) -> Vec<PathBuf> {
+    let mut globs = npm_workspace_globs(repo_root);
+    globs.extend(pnpm_workspace_globs(repo_root));
+    globs.extend(
+        ["apps/*", "packages/*", "plugins/*", "libs/*"]
+            .iter()
+            .map(|glob| (*glob).to_owned()),
+    );
+    let mut dirs = std::collections::BTreeSet::new();
+    for pattern in &globs {
+        let pattern = pattern.trim().trim_end_matches('/');
+        // `foo/*` and `foo/**` both enumerate the immediate subdirectories
+        // of `foo`; deeper glob shapes are not expanded in v1.
+        if let Some(parent) = pattern
+            .strip_suffix("/*")
+            .or_else(|| pattern.strip_suffix("/**"))
+        {
+            if let Ok(entries) = std::fs::read_dir(repo_root.join(parent)) {
+                for entry in entries.flatten() {
+                    let dir = entry.path();
+                    if dir.is_dir() && dir.join("tsconfig.json").is_file() {
+                        dirs.insert(dir);
+                    }
+                }
+            }
+        } else if !pattern.contains('*') {
+            let dir = repo_root.join(pattern);
+            if dir.is_dir() && dir.join("tsconfig.json").is_file() {
+                dirs.insert(dir);
+            }
+        }
+    }
+    dirs.into_iter().collect()
+}
+
+/// `workspaces` globs from `package.json` — either the bare array form or
+/// the `{ "packages": [...] }` object form.
+fn npm_workspace_globs(repo_root: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(repo_root.join("package.json")) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(workspaces) = value.get("workspaces") else {
+        return Vec::new();
+    };
+    let list = workspaces
+        .as_array()
+        .or_else(|| workspaces.get("packages").and_then(|v| v.as_array()));
+    list.map_or_else(Vec::new, |items| {
+        items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .filter(|item| !item.starts_with('!'))
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+/// `packages:` globs from `pnpm-workspace.yaml`, parsed line-wise — pulling
+/// in a YAML dependency for one top-level list is not worth it.
+fn pnpm_workspace_globs(repo_root: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(repo_root.join("pnpm-workspace.yaml")) else {
+        return Vec::new();
+    };
+    let mut globs = Vec::new();
+    let mut in_packages = false;
+    for line in text.lines() {
+        if line.starts_with([' ', '\t']) {
+            if in_packages {
+                if let Some(item) = line.trim().strip_prefix('-') {
+                    let pattern = item.trim().trim_matches(['\'', '"']);
+                    if !pattern.is_empty() && !pattern.starts_with('!') {
+                        globs.push(pattern.to_owned());
+                    }
+                }
+            }
+        } else {
+            in_packages = line.trim_end() == "packages:";
+        }
+    }
+    globs
+}
+
+/// A tsconfig declaring no compilation inputs of its own: `"files": []`
+/// with no `include`. `references` are deliberately not counted — they make
+/// the file worth a last-resort run (scip-typescript recurses them) but a
+/// workspace project's own tsconfig carries the compiler options its
+/// sources were written against, so it makes the better primary root.
+fn tsconfig_indexes_nothing(tsconfig: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(tsconfig) else {
+        return false;
+    };
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+        let non_empty = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|a| !a.is_empty())
+        };
+        let files_empty = value
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
+        return files_empty && !non_empty("include");
+    }
+    // tsconfig permits comments and trailing commas; when the strict parse
+    // fails, a textual check still recognizes the solution-file shape.
+    let files_empty =
+        regex::Regex::new(r#""files"\s*:\s*\[\s*\]"#).is_ok_and(|re| re.is_match(&text));
+    let has_include =
+        regex::Regex::new(r#""include"\s*:\s*\[\s*[^\]]"#).is_ok_and(|re| re.is_match(&text));
+    files_empty && !has_include
+}
+
+/// `.ts`-family source files under `dir`, bounded — used only to rank
+/// workspace candidates, never as a gate. JavaScript is not counted:
+/// generated bundles (`storybook-static`, vendored dists) would drown the
+/// signal. Hidden and vendored trees are skipped; symlinks not followed.
+fn count_ts_sources(dir: &Path) -> usize {
+    const SKIP_DIRS: [&str; 6] = ["node_modules", "dist", "build", "out", "coverage", "target"];
+    const MAX_VISITED: usize = 50_000;
+    let mut sources = 0;
+    let mut visited = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MAX_VISITED {
+                return sources;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_ref()) {
+                    stack.push(entry.path());
+                }
+            } else if kind.is_file()
+                && matches!(
+                    entry.path().extension().and_then(|ext| ext.to_str()),
+                    Some("ts" | "tsx" | "mts" | "cts")
+                )
+            {
+                sources += 1;
+            }
+        }
+    }
+    sources
 }
 
 // --- subprocess plumbing -----------------------------------------------------
@@ -596,6 +909,143 @@ mod tests {
             ScipTypeScript.detect(dir.path()),
             DetectState::NotApplicable { .. }
         ));
+    }
+
+    /// Write a `tsconfig.json` and `n` source files under `root/rel`.
+    fn ts_project(root: &Path, rel: &str, tsconfig: &str, sources: usize) {
+        let dir = root.join(rel);
+        std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+        std::fs::write(dir.join("tsconfig.json"), tsconfig).expect("write tsconfig");
+        for i in 0..sources {
+            std::fs::write(dir.join("src").join(format!("f{i}.ts")), "export {}\n")
+                .expect("write source");
+        }
+    }
+
+    const REAL_TSCONFIG: &str = r#"{ "include": ["src/**/*"] }"#;
+    const SOLUTION_TSCONFIG: &str =
+        r#"{ "references": [{ "path": "./tsconfig.app.json" }], "files": [] }"#;
+    const HOLLOW_TSCONFIG: &str = r#"{ "files": [] }"#;
+
+    #[test]
+    fn typescript_prefers_real_root_tsconfig() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ts_project(dir.path(), ".", REAL_TSCONFIG, 1);
+        ts_project(dir.path(), "apps/web", REAL_TSCONFIG, 50);
+        let project = select_ts_project(dir.path()).expect("a project root");
+        assert_eq!(project.dir, dir.path());
+    }
+
+    #[test]
+    fn typescript_root_solution_file_yields_to_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ts_project(dir.path(), ".", SOLUTION_TSCONFIG, 0);
+        ts_project(dir.path(), "apps/web", REAL_TSCONFIG, 50);
+        let project = select_ts_project(dir.path()).expect("a project root");
+        // A solution file declares no inputs; the workspace's own tsconfig
+        // carries the compiler options its sources were written against.
+        assert_eq!(project.dir, dir.path().join("apps/web"));
+        assert!(project.note.contains("solution file"));
+    }
+
+    #[test]
+    fn typescript_picks_largest_workspace_when_root_hollow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ts_project(dir.path(), ".", HOLLOW_TSCONFIG, 0);
+        ts_project(dir.path(), "apps/web", REAL_TSCONFIG, 30);
+        ts_project(dir.path(), "apps/server", REAL_TSCONFIG, 60);
+        let project = select_ts_project(dir.path()).expect("a project root");
+        assert_eq!(project.dir, dir.path().join("apps/server"));
+        assert_eq!(project.display, "apps/server");
+        assert!(project.note.contains("solution file"));
+    }
+
+    #[test]
+    fn typescript_picks_largest_workspace_when_root_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ts_project(dir.path(), "plugins/a", REAL_TSCONFIG, 3);
+        ts_project(dir.path(), "plugins/b", REAL_TSCONFIG, 9);
+        let project = select_ts_project(dir.path()).expect("a project root");
+        assert_eq!(project.dir, dir.path().join("plugins/b"));
+    }
+
+    #[test]
+    fn typescript_honors_package_json_workspaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{ "workspaces": ["modules/*"] }"#,
+        )
+        .expect("write package.json");
+        ts_project(dir.path(), "modules/only", REAL_TSCONFIG, 4);
+        let project = select_ts_project(dir.path()).expect("a project root");
+        assert_eq!(project.dir, dir.path().join("modules/only"));
+    }
+
+    #[test]
+    fn typescript_honors_pnpm_workspace_yaml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'modules/*'\n  - '!modules/excluded'\nother: true\n",
+        )
+        .expect("write pnpm-workspace.yaml");
+        ts_project(dir.path(), "modules/only", REAL_TSCONFIG, 4);
+        let project = select_ts_project(dir.path()).expect("a project root");
+        assert_eq!(project.dir, dir.path().join("modules/only"));
+    }
+
+    #[test]
+    fn typescript_hollow_root_without_candidates_still_applies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ts_project(dir.path(), ".", HOLLOW_TSCONFIG, 0);
+        // The provider stays applicable and lets the tool report the empty
+        // project rather than claiming not_applicable.
+        let project = select_ts_project(dir.path()).expect("a project root");
+        assert_eq!(project.dir, dir.path());
+    }
+
+    #[test]
+    fn typescript_detect_reports_missing_tool_with_note() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ts_project(dir.path(), ".", HOLLOW_TSCONFIG, 0);
+        ts_project(dir.path(), "apps/web", REAL_TSCONFIG, 5);
+        match ScipTypeScript.detect(dir.path()) {
+            // Tool absent on the test machine → remediation names the
+            // selected root; present → the note documents the choice.
+            DetectState::Missing { remediation } => {
+                assert!(remediation.contains("apps/web"));
+            }
+            DetectState::Ready { note, .. } => {
+                assert!(note.is_some_and(|n| n.contains("apps/web")));
+            }
+            DetectState::NotApplicable { reason } => {
+                panic!("unexpected not_applicable: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn typescript_solution_tsconfig_declares_no_inputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tsconfig = dir.path().join("tsconfig.json");
+        std::fs::write(&tsconfig, HOLLOW_TSCONFIG).expect("write");
+        assert!(tsconfig_indexes_nothing(&tsconfig));
+        // `references` do not rescue primary-root selection.
+        std::fs::write(&tsconfig, SOLUTION_TSCONFIG).expect("write");
+        assert!(tsconfig_indexes_nothing(&tsconfig));
+        std::fs::write(&tsconfig, REAL_TSCONFIG).expect("write");
+        assert!(!tsconfig_indexes_nothing(&tsconfig));
+        std::fs::write(&tsconfig, r#"{ "files": ["src/a.ts"] }"#).expect("write");
+        assert!(!tsconfig_indexes_nothing(&tsconfig));
+        // JSONC flavor: comments and trailing commas defeat serde_json but
+        // not the textual fallback.
+        std::fs::write(
+            &tsconfig,
+            "{\n  // nothing to compile\n  \"files\": [],\n}\n",
+        )
+        .expect("write");
+        assert!(tsconfig_indexes_nothing(&tsconfig));
     }
 
     #[test]

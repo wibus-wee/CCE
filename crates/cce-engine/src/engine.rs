@@ -1883,28 +1883,7 @@ fn deterministic_role_summary(file: &ScannedFile, parsed: &crate::ParsedFile) ->
 }
 
 fn lexical_terms(value: &str) -> Vec<String> {
-    let mut terms = Vec::new();
-    let mut current = String::new();
-    let mut previous_lower = false;
-    for character in value.chars() {
-        if character.is_alphanumeric() {
-            if previous_lower && character.is_uppercase() && !current.is_empty() {
-                terms.push(current.to_ascii_lowercase());
-                current.clear();
-            }
-            previous_lower = character.is_lowercase();
-            current.push(character);
-        } else if !current.is_empty() {
-            terms.push(current.to_ascii_lowercase());
-            current.clear();
-            previous_lower = false;
-        }
-    }
-    if !current.is_empty() {
-        terms.push(current.to_ascii_lowercase());
-    }
-    terms.sort();
-    terms.dedup();
+    let mut terms = cce_core::split_identifier_terms(value);
     terms.truncate(128);
     terms
 }

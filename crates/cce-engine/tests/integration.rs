@@ -790,7 +790,12 @@ async fn history_diff_content_is_indexed_and_retrievable() {
     // The extracted changed line is reachable through lexical search.
     let hits = engine
         .store()
-        .lexical_search(&report.snapshot.id, "second_lineage_marker", 10, &cce_core::QueryFilters::default())
+        .lexical_search(
+            &report.snapshot.id,
+            "second_lineage_marker",
+            10,
+            &cce_core::QueryFilters::default(),
+        )
         .expect("lexical search");
     assert!(
         hits.iter()
@@ -834,7 +839,12 @@ async fn sensitive_files_stay_out_of_history_documents() {
     }
     let hits = engine
         .store()
-        .lexical_search(&report.snapshot.id, "hunter2 CCE_HISTORY_SECRET", 10, &cce_core::QueryFilters::default())
+        .lexical_search(
+            &report.snapshot.id,
+            "hunter2 CCE_HISTORY_SECRET",
+            10,
+            &cce_core::QueryFilters::default(),
+        )
         .expect("lexical search");
     assert!(hits.is_empty(), "secret must not be searchable: {hits:?}");
 }
