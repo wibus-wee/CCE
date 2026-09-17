@@ -673,6 +673,7 @@ async fn worktree_grep_is_fresh_and_policy_aware() {
             filters: cce_core::QueryFilters {
                 path_prefix: Some("src/".to_owned()),
                 language: None,
+                hit_type: None,
             },
             limit: 50,
             ignore_case: false,
@@ -877,6 +878,69 @@ async fn commit_documents_stay_off_the_lexical_route() {
             .iter()
             .map(|hit| (hit.route, hit.representation.clone()))
             .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn type_diff_greps_stored_commit_patches() {
+    let repo = history_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // `compute_second` exists in current source AND in the stored patch of
+    // the second commit; the diff route must return it as a commit hit.
+    let mut request = search_request("type:diff compute_second", true);
+    let result = engine.search(request.clone()).await.expect("type:diff");
+    assert!(
+        result.hits.iter().any(|hit| {
+            hit.route == cce_core::SearchRoute::Diff
+                && hit.representation == RetrievalRepresentation::CommitDiff
+                && hit
+                    .address
+                    .as_ref()
+                    .is_some_and(|address| address.path == "src/lib.rs")
+                && hit.snippet.contains("+    compute_second()")
+        }),
+        "type:diff should surface the src/lib.rs hunk, got {:?}",
+        result
+            .hits
+            .iter()
+            .map(|hit| (hit.route, hit.snippet.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        result
+            .missing_capabilities
+            .iter()
+            .any(|message| message.contains("diff search scans stored commit patches")),
+        "coverage bound must be reported"
+    );
+
+    // The same scan through the explicit route override.
+    request = search_request("compute_first", true);
+    request.routes = vec![cce_core::SearchRoute::Diff];
+    let routed = engine.search(request).await.expect("route diff");
+    assert!(
+        routed
+            .hits
+            .iter()
+            .any(|hit| hit.route == cce_core::SearchRoute::Diff),
+        "--route diff must reach the patch scanner"
+    );
+
+    // `type:commit` restricts retrieval to history documents: the marker
+    // function name lives in the second commit's message.
+    let commits = engine
+        .search(search_request("type:commit second_lineage_marker", true))
+        .await
+        .expect("type:commit");
+    assert!(
+        commits
+            .hits
+            .iter()
+            .all(|hit| hit.route == cce_core::SearchRoute::History),
+        "type:commit leaked a non-history route: {:?}",
+        commits.hits.iter().map(|hit| hit.route).collect::<Vec<_>>()
     );
 }
 

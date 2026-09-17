@@ -6,6 +6,7 @@ mod atlas;
 mod config;
 mod context;
 mod dense;
+mod diff;
 mod engine;
 mod grep;
 mod history;
@@ -33,6 +34,7 @@ pub use config::{
 };
 pub use context::{ContextPacker, ContextRequest};
 pub use dense::{DenseIndex, DenseSearchHit, EmbedRole, Embedder, EmbeddingBackend, LocalEmbedder};
+pub use diff::DEFAULT_DIFF_LIMIT;
 pub use engine::{CceEngine, IndexReport};
 pub use grep::{DEFAULT_GREP_LIMIT, GrepHit, GrepReport, GrepRequest};
 pub use parser::{ParsedFile, ParsedUnit, SourceParser};

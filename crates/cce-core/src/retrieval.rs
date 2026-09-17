@@ -67,6 +67,8 @@ pub enum SearchRoute {
     Knowledge,
     /// Retrieval over commit/history documents.
     History,
+    /// Query-time regex over stored commit patches (`type:diff`).
+    Diff,
     /// Result ordering produced by the reranker stage.
     Reranked,
 }
@@ -178,19 +180,26 @@ pub struct QueryFilters {
     /// Entity language (`lang:rust`) matched exactly, case-insensitive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Result kind override (`type:diff`, `type:commit`, `type:file`).
+    /// `diff` routes the query to a regex scan over stored commit patches,
+    /// `commit` restricts retrieval to the history route, `file` is the
+    /// default.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub hit_type: Option<String>,
 }
 
 impl QueryFilters {
     /// Whether any filter is set.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.path_prefix.is_none() && self.language.is_none()
+        self.path_prefix.is_none() && self.language.is_none() && self.hit_type.is_none()
     }
 }
 
-/// Extracts `lang:`/`path:` tokens from a query string, returning the
-/// cleaned query text and the structured filters. Unknown `key:` tokens
-/// stay in the query text untouched.
+/// Extracts `lang:`/`path:`/`type:` tokens into structured filters.
+///
+/// Returns the cleaned query text and the filters. Unknown `key:` tokens
+/// (and unknown `type:` values) stay in the query text untouched.
 #[must_use]
 pub fn parse_query_filters(query: &str) -> (String, QueryFilters) {
     let mut filters = QueryFilters::default();
@@ -207,6 +216,9 @@ pub fn parse_query_filters(query: &str) -> (String, QueryFilters) {
         match key {
             "lang" => filters.language = Some(value.to_ascii_lowercase()),
             "path" => filters.path_prefix = Some(value.to_owned()),
+            "type" if matches!(value, "diff" | "commit" | "file") => {
+                filters.hit_type = Some(value.to_owned());
+            }
             _ => kept.push(token),
         }
     }

@@ -128,6 +128,15 @@ enum Command {
         #[arg(long, default_value_t = cce_engine::DEFAULT_GREP_LIMIT)]
         limit: usize,
     },
+    /// Regex over stored commit patches — Sourcegraph `type:diff`. Results
+    /// are historical evidence bounded by the history index (most recent
+    /// 512 commits), not the current worktree.
+    Diff {
+        repository: PathBuf,
+        pattern: String,
+        #[arg(long, default_value_t = cce_engine::DEFAULT_DIFF_LIMIT)]
+        limit: usize,
+    },
     /// Probe external code-intelligence providers (SCIP toolchains).
     Providers {
         #[arg(default_value = ".")]
@@ -201,6 +210,8 @@ enum RouteArgument {
     Knowledge,
     #[value(name = "history")]
     History,
+    #[value(name = "diff")]
+    Diff,
     #[value(name = "reranked")]
     Reranked,
 }
@@ -217,6 +228,7 @@ impl From<RouteArgument> for SearchRoute {
             RouteArgument::Structural => Self::Structural,
             RouteArgument::Knowledge => Self::Knowledge,
             RouteArgument::History => Self::History,
+            RouteArgument::Diff => Self::Diff,
             RouteArgument::Reranked => Self::Reranked,
         }
     }
@@ -337,6 +349,7 @@ async fn main() -> anyhow::Result<()> {
                 filters: cce_core::QueryFilters {
                     path_prefix: path.clone(),
                     language: lang.clone().map(|value| value.to_lowercase()),
+                    hit_type: None,
                 },
                 limit: *limit,
                 ignore_case: *ignore_case,
@@ -350,6 +363,40 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if report.truncated {
                     eprintln!("… truncated at {} matches", report.matches.len());
+                }
+            }
+        }
+        Command::Diff {
+            repository,
+            pattern,
+            limit,
+        } => {
+            let engine = engine(&arguments, repository)?;
+            let result = engine
+                .search(SearchRequest {
+                    repository_id: String::new(),
+                    snapshot_id: String::new(),
+                    query: pattern.clone(),
+                    intent: None,
+                    limit: *limit,
+                    require_fresh: true,
+                    routes: vec![SearchRoute::Diff],
+                    filters: cce_core::QueryFilters::default(),
+                })
+                .await?;
+            if arguments.json {
+                print_value(&result)?;
+            } else {
+                for hit in &result.hits {
+                    let path = hit
+                        .address
+                        .as_ref()
+                        .map_or("?", |address| address.path.as_str());
+                    let commit = hit.symbol_name.as_deref().unwrap_or("commit");
+                    println!("{commit} {path}:");
+                    for line in hit.snippet.lines() {
+                        println!("    {line}");
+                    }
                 }
             }
         }

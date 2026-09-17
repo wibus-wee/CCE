@@ -101,6 +101,14 @@ side. Historical payload obeys the same exclusions as the scan: sensitive
 names are withheld entirely and `.cceignore`/`.gitignore`-matched paths
 contribute a path note but no content or evidence.
 
+The stored patches are themselves searchable (`type:diff`, `cce diff`,
+`POST /v1/diff`): a query-time regex runs over every `CommitPatch` in the
+snapshot — the same scan semantics as Sourcegraph, no new index — and hits
+group per (commit, file) with post-image/pre-image line numbers. Coverage
+is bounded by `HISTORY_COMMIT_LIMIT` and reported in
+`missing_capabilities`; `type:commit` restricts retrieval to history
+documents instead.
+
 #### Core API
 
 Implemented (single-repo scope):

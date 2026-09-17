@@ -1577,8 +1577,8 @@ fn graph_view_status(
 }
 
 /// Commits walked for history extraction (message summary and diff
-/// content), newest first.
-const HISTORY_COMMIT_LIMIT: usize = 512;
+/// content), newest first; also the coverage bound reported by diff search.
+pub(crate) const HISTORY_COMMIT_LIMIT: usize = 512;
 
 fn status(
     snapshot: &SnapshotIdentity,

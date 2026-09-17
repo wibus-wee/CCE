@@ -121,6 +121,24 @@ impl CceEngine {
             plan.reasons
                 .push("caller supplied an explicit retrieval route override".to_owned());
         }
+        // `type:` changes what the query means rather than which hits rank:
+        // `diff` is a query-time regex over stored commit patches, `commit`
+        // restricts retrieval to history documents, `file` is the default.
+        match request.filters.hit_type.as_deref() {
+            Some("diff") => {
+                plan.routes = vec![SearchRoute::Diff];
+                plan.required_views = required_views_for_routes(&plan.routes);
+                plan.reasons
+                    .push("type:diff pinned the diff route".to_owned());
+            }
+            Some("commit") => {
+                plan.routes = vec![SearchRoute::History];
+                plan.required_views = required_views_for_routes(&plan.routes);
+                plan.reasons
+                    .push("type:commit restricted retrieval to the history route".to_owned());
+            }
+            _ => {}
+        }
         let manifest = resolved.manifest;
         let mut missing_capabilities = missing_views(&manifest, &plan);
         if !verified_fresh {
@@ -275,6 +293,30 @@ impl CceEngine {
                         )],
                     },
                     1.25 / (RRF_K + rank as f64),
+                );
+            }
+        }
+
+        if plan.routes.contains(&SearchRoute::Diff) {
+            missing_capabilities.push(format!(
+                "diff search scans stored commit patches; coverage is bounded by history indexing ({} most recent commits)",
+                crate::engine::HISTORY_COMMIT_LIMIT
+            ));
+            for (offset, hit) in crate::diff::diff_grep(
+                self.store(),
+                &request.snapshot_id,
+                &request.repository_id,
+                &request.query,
+                request.limit.saturating_mul(2),
+            )?
+            .into_iter()
+            .enumerate()
+            {
+                let rank = offset + 1;
+                add_candidate(
+                    &mut candidates,
+                    SearchHit { rank, ..hit },
+                    1.0 / (RRF_K + rank as f64),
                 );
             }
         }
@@ -827,7 +869,7 @@ fn required_views_for_routes(routes: &[SearchRoute]) -> Vec<ViewKind> {
             SearchRoute::Hybrid => &[ViewKind::Lexical, ViewKind::Dense],
             SearchRoute::Structural => &[ViewKind::Graph],
             SearchRoute::Knowledge => &[ViewKind::Knowledge],
-            SearchRoute::History => &[ViewKind::History],
+            SearchRoute::History | SearchRoute::Diff => &[ViewKind::History],
             SearchRoute::Reranked => &[],
         };
         for view in candidates {

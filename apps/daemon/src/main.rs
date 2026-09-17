@@ -112,6 +112,21 @@ const fn default_grep_limit() -> usize {
     cce_engine::DEFAULT_GREP_LIMIT
 }
 
+/// `POST /v1/diff` request: a query-time regex over stored commit patches
+/// (Sourcegraph `type:diff`); bounded by history indexing, not the worktree.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiffInput {
+    /// Rust regex pattern matched against `+`/`-` patch lines.
+    pattern: String,
+    #[serde(default = "default_diff_limit")]
+    limit: usize,
+}
+
+const fn default_diff_limit() -> usize {
+    cce_engine::DEFAULT_DIFF_LIMIT
+}
+
 #[derive(Debug, Serialize)]
 struct Health {
     status: &'static str,
@@ -198,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/refs/{name}", get(references))
         .route("/v1/providers", get(providers))
         .route("/v1/grep", post(grep))
+        .route("/v1/diff", post(diff))
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
         .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
@@ -311,10 +327,31 @@ async fn grep(
         filters: cce_core::QueryFilters {
             path_prefix: input.path_prefix,
             language: input.language.map(|value| value.to_lowercase()),
+            hit_type: None,
         },
         limit: input.limit.clamp(1, 5_000),
         ignore_case: input.ignore_case,
     })?))
+}
+
+async fn diff(
+    State(engine): State<Arc<CceEngine>>,
+    Json(input): Json<DiffInput>,
+) -> Result<Json<cce_engine::SearchResult>, ApiError> {
+    Ok(Json(
+        engine
+            .search(SearchRequest {
+                repository_id: String::new(),
+                snapshot_id: String::new(),
+                query: input.pattern,
+                intent: None,
+                limit: input.limit.clamp(1, 500),
+                require_fresh: true,
+                routes: vec![SearchRoute::Diff],
+                filters: cce_core::QueryFilters::default(),
+            })
+            .await?,
+    ))
 }
 
 async fn shutdown_signal() {
