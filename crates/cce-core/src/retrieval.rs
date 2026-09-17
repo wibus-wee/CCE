@@ -44,6 +44,9 @@ pub enum GraphPolicy {
     ArchitectureBoundary,
     /// Requires evidence-backed dataflow edges; refused when unavailable.
     DataflowRequired,
+    /// Undirected expansion under inferred intent: runs as a corroborating
+    /// tail route — fusion, not policy, decides whether expanded hits rank.
+    Opportunistic,
 }
 
 /// Which retrieval channel produced (or should produce) a result.

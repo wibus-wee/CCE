@@ -42,7 +42,7 @@ impl QueryPlanner {
             return union_plan(
                 guessed,
                 vec![
-                    "intent not supplied; conservative union recall without graph expansion"
+                    "intent not supplied; union recall with corroboration-damped expansion"
                         .to_owned(),
                     format!("keyword classifier guessed {guessed:?} (label only, not routed on)"),
                 ],
@@ -156,6 +156,10 @@ impl QueryPlanner {
 /// Safe default: every cheap retrieval channel runs and reciprocal-rank
 /// fusion sorts it out. Knowledge/History are opportunistic — they only
 /// contribute when those documents exist, so they are not required views.
+/// Structural joins them the same way: `Opportunistic` expansion runs
+/// undirected edge walks whose propagated scores are two orders of
+/// magnitude below a rank-1 topical hit, so expanded evidence can only
+/// rank when it corroborates — never flood the head on a guessed intent.
 fn union_plan(intent: QueryIntent, reasons: Vec<String>) -> QueryPlan {
     QueryPlan {
         intent,
@@ -167,8 +171,9 @@ fn union_plan(intent: QueryIntent, reasons: Vec<String>) -> QueryPlan {
             SearchRoute::Hybrid,
             SearchRoute::Knowledge,
             SearchRoute::History,
+            SearchRoute::Structural,
         ],
-        graph_policy: GraphPolicy::None,
+        graph_policy: GraphPolicy::Opportunistic,
         required_views: vec![ViewKind::Symbols, ViewKind::Lexical, ViewKind::Dense],
         reasons,
     }
@@ -345,14 +350,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inferred_intent_labels_without_routing() {
+    fn inferred_intent_gets_opportunistic_union() {
         // The classifier may label the query, but an inferred intent must
-        // never escalate into narrow routes or graph expansion.
+        // never escalate into *directional* expansion — it gets the
+        // undirected corroboration arm whose scores are too small to lead.
         let plan = QueryPlanner::new().plan("改 Attempt.status 会影响哪些 UI？", None);
         assert_eq!(plan.intent, QueryIntent::Impact);
-        assert_eq!(plan.graph_policy, GraphPolicy::None);
+        assert_eq!(plan.graph_policy, GraphPolicy::Opportunistic);
         assert!(plan.routes.contains(&SearchRoute::Lexical));
-        assert!(!plan.routes.contains(&SearchRoute::Structural));
+        assert!(plan.routes.contains(&SearchRoute::Structural));
     }
 
     #[test]
@@ -375,9 +381,9 @@ mod tests {
     }
 
     #[test]
-    fn routes_plain_behavior_without_graph() {
+    fn routes_plain_behavior_with_opportunistic_graph() {
         let plan = QueryPlanner::new().plan("用户退出之后消息仍然恢复", None);
-        assert_eq!(plan.graph_policy, GraphPolicy::None);
+        assert_eq!(plan.graph_policy, GraphPolicy::Opportunistic);
     }
 
     #[test]

@@ -419,11 +419,24 @@ impl CceEngine {
         // expansion picks its seeds so both stages see the enriched head.
         self.prf_expansion_pass(&request, &plan, &mut candidates, verified_fresh)?;
 
+        // Opportunistic expansion is not a required view (union plans must
+        // not demand it); check the graph view at run time and report the
+        // skip explicitly instead of silently expanding nothing.
+        let opportunistic_blocked = plan.graph_policy == GraphPolicy::Opportunistic
+            && !manifest
+                .views
+                .get(&ViewKind::Graph)
+                .is_some_and(|view| matches!(view.state, ViewState::Ready | ViewState::Partial));
+        if opportunistic_blocked {
+            missing_capabilities
+                .push("opportunistic graph expansion skipped: graph view is not ready".to_owned());
+        }
         if plan.routes.contains(&SearchRoute::Structural)
             && !matches!(
                 plan.graph_policy,
                 GraphPolicy::None | GraphPolicy::ArchitectureBoundary
             )
+            && !opportunistic_blocked
         {
             // Typed expansion: the intent selects which edge kinds and
             // direction are evidence. Seed score decays per hop and hub
@@ -835,11 +848,13 @@ impl CceEngine {
 /// Which edges count as evidence for each graph policy. The intent chooses
 /// the vocabulary of the expansion, not just its direction.
 ///
-/// `ChangedWith` is deliberately absent: a co-change edge is stored once
-/// per pair with the smaller entity id as source, so a one-directional arm
-/// would only find it from the larger-id side. Co-change evidence feeds
-/// ranking through the partner bonus in `apply_structural_features`, which
-/// looks it up in both directions instead.
+/// `ChangedWith` appears only in the `Opportunistic` arm: a co-change edge
+/// is stored once per pair with the smaller entity id as source, so a
+/// one-directional arm would only find it from the larger-id side — but
+/// `Opportunistic` walks `Both`, which sees the symmetric edge from either
+/// endpoint. Directional arms keep co-change evidence in the partner bonus
+/// of `apply_structural_features`, which also looks it up in both
+/// directions.
 const fn expansion_policy(
     policy: GraphPolicy,
 ) -> (RelationDirection, &'static [cce_core::RelationKind]) {
@@ -860,6 +875,15 @@ const fn expansion_policy(
                 RelationKind::References,
                 RelationKind::Tests,
                 RelationKind::Implements,
+            ],
+        ),
+        GraphPolicy::Opportunistic => (
+            RelationDirection::Both,
+            &[
+                RelationKind::Calls,
+                RelationKind::References,
+                RelationKind::Imports,
+                RelationKind::ChangedWith,
             ],
         ),
         GraphPolicy::DataflowRequired | GraphPolicy::None | GraphPolicy::ArchitectureBoundary => (
