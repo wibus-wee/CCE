@@ -167,6 +167,17 @@ impl CceEngine {
             request.query = query;
             request.filters = filters;
         }
+        // A pure/mixed-CJK query has no Latin anchor into English source
+        // vocabulary, so the lexical route expands it through a curated
+        // glossary. The expansion stays local to the lexical passes: dense
+        // embeddings handle CJK natively, and exact-symbol mines
+        // `entity_tokens`, which glossary words would only pollute.
+        let glossary_terms = cjk_glossary_terms(&request.query);
+        let lexical_query = if glossary_terms.is_empty() {
+            request.query.clone()
+        } else {
+            format!("{} {}", request.query, glossary_terms.join(" "))
+        };
         let verified_fresh = resolved.verified_fresh;
         let mut plan = QueryPlanner::new().plan(&request.query, request.intent);
         if !request.routes.is_empty() {
@@ -253,7 +264,7 @@ impl CceEngine {
                 .store()
                 .lexical_search(
                     &request.snapshot_id,
-                    &request.query,
+                    &lexical_query,
                     request.limit.saturating_mul(3),
                     &request.filters,
                 )?
@@ -287,7 +298,14 @@ impl CceEngine {
                         evidence: hit.evidence,
                         snippet: hit.snippet,
                         verified_current: verified_fresh,
-                        explanation: vec!["SQLite FTS5 identifier/path/source match".to_owned()],
+                        explanation: {
+                            let mut notes =
+                                vec!["SQLite FTS5 identifier/path/source match".to_owned()];
+                            if !glossary_terms.is_empty() {
+                                notes.push(format!("CJK glossary: +{}", glossary_terms.join(" ")));
+                            }
+                            notes
+                        },
                     },
                     1.0 / (RRF_K + rank as f64),
                 );
@@ -455,7 +473,14 @@ impl CceEngine {
         // Pseudo-relevance feedback: the fused head's discriminative terms
         // expand the query for one more lexical pass, before graph
         // expansion picks its seeds so both stages see the enriched head.
-        self.prf_expansion_pass(&request, &plan, &mut candidates, verified_fresh)?;
+        self.prf_expansion_pass(
+            &request,
+            &plan,
+            &lexical_query,
+            &glossary_terms,
+            &mut candidates,
+            verified_fresh,
+        )?;
 
         // Opportunistic expansion is not a required view (union plans must
         // not demand it); check the graph view at run time and report the
@@ -608,60 +633,7 @@ impl CceEngine {
             &mut candidates,
         )?;
 
-        // Multiple retrieval documents can describe one source region (raw
-        // chunk + symbol summary); the hit list presents regions, so the
-        // first — best-scored — document per region wins and later ones only
-        // contribute their routes. Per-file cap keeps cross-file coverage;
-        // hits beyond it stay in `candidates` for expansion seeds.
-        let mut hits: Vec<SearchHit> = Vec::new();
-        let mut per_file = HashMap::<String, usize>::new();
-        let mut seen_regions = HashMap::<String, usize>::new();
-        let mut language_cache = HashMap::<String, Option<String>>::new();
-        for candidate in ranked_candidates(&candidates) {
-            let mut hit = candidate.hit.clone();
-            if !self.hit_matches_filters(
-                &hit,
-                &request.filters,
-                &request.snapshot_id,
-                &mut language_cache,
-            )? {
-                continue;
-            }
-            hit.score = candidate.fused_score;
-            let region_key = hit.region_id.clone().unwrap_or_else(|| {
-                hit.address.as_ref().map_or_else(
-                    || hit.document_id.clone(),
-                    |address| {
-                        format!(
-                            "{}:{}:{}",
-                            address.path, address.start_byte, address.end_byte
-                        )
-                    },
-                )
-            });
-            if let Some(&kept) = seen_regions.get(&region_key) {
-                if let Some(kept_hit) = hits.get_mut(kept) {
-                    for route in &hit.contributing_routes {
-                        if !kept_hit.contributing_routes.contains(route) {
-                            kept_hit.contributing_routes.push(*route);
-                        }
-                    }
-                }
-                continue;
-            }
-            if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
-                let count = per_file.entry(path.clone()).or_default();
-                if *count >= 3 {
-                    continue;
-                }
-                *count += 1;
-            }
-            seen_regions.insert(region_key, hits.len());
-            hits.push(hit);
-            if hits.len() >= request.limit {
-                break;
-            }
-        }
+        let mut hits = self.select_hits(&request, &candidates)?;
 
         // Cross-encoder rerank: the fused order is a coarse prior from
         // route-level rank fusion. A pairwise reranker re-scores the head
@@ -764,6 +736,75 @@ impl CceEngine {
         })
     }
 
+    /// Fold fused candidates into the presented hit list.
+    ///
+    /// Multiple retrieval documents can describe one source region (raw
+    /// chunk + symbol summary); the hit list presents regions, so the
+    /// first — best-scored — document per region wins and later ones only
+    /// contribute their routes. The per-file cap is windowed by list
+    /// position (`per_file_cap`): the head users actually read enforces
+    /// cross-file diversity, the tail relaxes to the historical flat cap.
+    /// A hit skipped on the cap is dropped, not deferred — the file's
+    /// other documents can still fill later slots on their own merits once
+    /// the window relaxes — and everything skipped stays in `candidates`
+    /// for expansion seeds.
+    fn select_hits(
+        &self,
+        request: &SearchRequest,
+        candidates: &HashMap<String, Candidate>,
+    ) -> Result<Vec<SearchHit>> {
+        let mut hits: Vec<SearchHit> = Vec::new();
+        let mut per_file = HashMap::<String, usize>::new();
+        let mut seen_regions = HashMap::<String, usize>::new();
+        let mut language_cache = HashMap::<String, Option<String>>::new();
+        for candidate in ranked_candidates(candidates) {
+            let mut hit = candidate.hit.clone();
+            if !self.hit_matches_filters(
+                &hit,
+                &request.filters,
+                &request.snapshot_id,
+                &mut language_cache,
+            )? {
+                continue;
+            }
+            hit.score = candidate.fused_score;
+            let region_key = hit.region_id.clone().unwrap_or_else(|| {
+                hit.address.as_ref().map_or_else(
+                    || hit.document_id.clone(),
+                    |address| {
+                        format!(
+                            "{}:{}:{}",
+                            address.path, address.start_byte, address.end_byte
+                        )
+                    },
+                )
+            });
+            if let Some(&kept) = seen_regions.get(&region_key) {
+                if let Some(kept_hit) = hits.get_mut(kept) {
+                    for route in &hit.contributing_routes {
+                        if !kept_hit.contributing_routes.contains(route) {
+                            kept_hit.contributing_routes.push(*route);
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
+                let count = per_file.entry(path.clone()).or_default();
+                if *count >= per_file_cap(hits.len()) {
+                    continue;
+                }
+                *count += 1;
+            }
+            seen_regions.insert(region_key, hits.len());
+            hits.push(hit);
+            if hits.len() >= request.limit {
+                break;
+            }
+        }
+        Ok(hits)
+    }
+
     /// Pseudo-relevance feedback (RM3-style): treat the fused topical head
     /// as relevant, mine its discriminative terms, and run ONE extra FTS5
     /// query with the expanded text so vocabulary-mismatched documents in
@@ -780,6 +821,8 @@ impl CceEngine {
         &self,
         request: &SearchRequest,
         plan: &QueryPlan,
+        lexical_query: &str,
+        glossary_terms: &[String],
         candidates: &mut HashMap<String, Candidate>,
         verified_fresh: bool,
     ) -> Result<()> {
@@ -797,11 +840,13 @@ impl CceEngine {
             })
             .take(PRF_FEEDBACK_DOCS)
             .collect();
-        let terms = prf_expansion_terms(&request.query, &seeds);
+        // The glossary-expanded text is the term vocabulary too: anchors
+        // already in the lexical query are not re-mined as feedback terms.
+        let terms = prf_expansion_terms(lexical_query, &seeds);
         if terms.is_empty() {
             return Ok(());
         }
-        let expanded = format!("{} {}", request.query, terms.join(" "));
+        let expanded = format!("{} {}", lexical_query, terms.join(" "));
         for (offset, hit) in self
             .store()
             .lexical_search(
@@ -839,7 +884,13 @@ impl CceEngine {
                     evidence: hit.evidence,
                     snippet: hit.snippet,
                     verified_current: verified_fresh,
-                    explanation: vec![format!("PRF expansion: +{}", terms.join(" "))],
+                    explanation: {
+                        let mut notes = vec![format!("PRF expansion: +{}", terms.join(" "))];
+                        if !glossary_terms.is_empty() {
+                            notes.push(format!("CJK glossary: +{}", glossary_terms.join(" ")));
+                        }
+                        notes
+                    },
                 },
                 PRF_ATTENUATION / (RRF_K + rank as f64),
             );
@@ -1315,6 +1366,23 @@ fn ranked_candidates(candidates: &HashMap<String, Candidate>) -> Vec<&Candidate>
     ranked
 }
 
+/// Per-file cap by filled list length: the head enforces file diversity —
+/// 1 hit per file inside the top 5, 2 inside the top 10 — then relaxes to
+/// the historical flat cap of 3 for the tail. Measured on the v5.3
+/// bundle, this windowing is what lifts recall@5 without moving anything
+/// else. `filled` is `hits.len()` at the moment a candidate is judged, so
+/// a skipped hit is dropped, not deferred; when few files carry hits the
+/// head starves and the list just fills with what remains.
+const fn per_file_cap(filled: usize) -> usize {
+    if filled < 5 {
+        1
+    } else if filled < 10 {
+        2
+    } else {
+        3
+    }
+}
+
 const fn representation_weight(representation: &RetrievalRepresentation) -> f64 {
     match representation {
         RetrievalRepresentation::RoleSummary
@@ -1437,6 +1505,106 @@ fn is_identifier_like(token: &str) -> bool {
         || token
             .chars()
             .any(|character| character.is_ascii_uppercase())
+}
+
+/// Curated CJK→English glossary for the lexical route. Source vocabulary
+/// is English, so a query phrased in CJK terms indexes as one monolithic
+/// unicode61 token with no anchor into the documents it asks about — the
+/// documented pure-CJK boundary. Translating the domain terms it does
+/// contain ("置信度" → "confidence") hands the FTS cascade Latin anchors
+/// without a model. Keys stay sorted by codepoint; each maps to
+/// space-separated English synonyms emitted in order.
+static CJK_GLOSSARY: &[(&str, &str)] = &[
+    ("上下文", "context"),
+    ("仓库", "repository"),
+    ("令牌", "token"),
+    ("依赖", "dependency"),
+    ("修复", "fix repair"),
+    ("关系", "relation relationship"),
+    ("函数", "function"),
+    ("包", "package"),
+    ("历史", "history"),
+    ("合并", "merge fuse"),
+    ("向量", "vector embedding"),
+    ("守护", "daemon"),
+    ("实体", "entity"),
+    ("实现", "implement"),
+    ("导入", "import"),
+    ("属性", "attribute"),
+    ("嵌入", "embedding"),
+    ("差异", "diff"),
+    ("引用", "reference"),
+    ("快照", "snapshot"),
+    ("忽略", "ignore"),
+    ("扫描", "scan"),
+    ("排序", "rank score"),
+    ("接口", "interface api"),
+    ("提交", "commit"),
+    ("文件", "file"),
+    ("文档", "document"),
+    ("服务", "service"),
+    ("权限", "permission"),
+    ("构建", "build"),
+    ("架构", "architecture"),
+    ("标记", "mark tag status"),
+    ("检索", "retrieval search"),
+    ("模块", "module"),
+    ("模式", "schema"),
+    ("测试", "test"),
+    ("清单", "manifest"),
+    ("目录", "directory"),
+    ("符号", "symbol"),
+    ("类型", "type"),
+    ("索引", "index"),
+    ("组件", "component"),
+    ("缓存", "cache"),
+    ("置信度", "confidence"),
+    ("能力", "capability"),
+    ("范围", "range"),
+    ("行", "line"),
+    ("视图", "view"),
+    ("解析", "parse"),
+    ("证据", "evidence"),
+    ("调用", "call"),
+    ("路径", "path"),
+    ("路由", "route"),
+    ("边界", "boundary"),
+    ("迁移", "migration"),
+    ("过期", "stale"),
+    ("锁定", "lock"),
+    ("陈旧", "stale"),
+    ("预算", "budget"),
+];
+
+/// Cap on emitted glossary anchors: enough to bridge the vocabulary gap
+/// without flooding the FTS term budget (32 terms) or drowning the
+/// query's own vocabulary.
+const CJK_GLOSSARY_LIMIT: usize = 10;
+
+/// English anchors for the CJK domain terms actually present in `query`,
+/// in sorted-table order, deduplicated, capped at `CJK_GLOSSARY_LIMIT`.
+/// Empty when the query has no CJK or no covered terms — the lexical
+/// query is then used verbatim.
+fn cjk_glossary_terms(query: &str) -> Vec<String> {
+    if !query.chars().any(has_cjk) {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut terms = Vec::new();
+    for &(cjk, english) in CJK_GLOSSARY {
+        if !query.contains(cjk) {
+            continue;
+        }
+        for word in english.split_whitespace() {
+            if terms.len() >= CJK_GLOSSARY_LIMIT {
+                return terms;
+            }
+            if seen.insert(word) {
+                terms.push(word.to_owned());
+            }
+        }
+    }
+    terms
 }
 
 /// Mine expansion terms from the feedback documents: identifier-split each
@@ -1633,6 +1801,132 @@ mod tests {
             },
             fused_score,
         }
+    }
+
+    /// Same-file candidates need distinct byte ranges or region dedup
+    /// collapses them before the per-file cap is even consulted.
+    fn candidate_at(document_id: &str, path: &str, byte_start: u64, fused_score: f64) -> Candidate {
+        let mut candidate = candidate(document_id, path, fused_score);
+        candidate.hit.address = Some(
+            SourceAddress::new(
+                "repo_test",
+                "snap_test",
+                path,
+                byte_start..byte_start + 1,
+                1..=1,
+            )
+            .expect("address"),
+        );
+        candidate
+    }
+
+    /// A hit without a source path bypasses per-file accounting entirely.
+    fn candidate_pathless(document_id: &str, fused_score: f64) -> Candidate {
+        let mut candidate = candidate(document_id, "src/nowhere.rs", fused_score);
+        candidate.hit.address = None;
+        candidate
+    }
+
+    #[test]
+    fn windowed_per_file_cap_diversifies_top_five() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        let mut candidates = HashMap::new();
+        // One file owns the three best-scored candidates; under the flat
+        // 3-per-file cap it would sweep the head.
+        for (suffix, score) in [("1", 0.9), ("2", 0.8), ("3", 0.7)] {
+            let id = format!("a{suffix}");
+            candidates.insert(
+                id.clone(),
+                candidate_at(
+                    &id,
+                    "src/a.rs",
+                    suffix.parse::<u64>().expect("u64") * 10,
+                    score,
+                ),
+            );
+        }
+        for (name, score) in [("b", 0.6), ("c", 0.5), ("d", 0.4), ("e", 0.3)] {
+            candidates.insert(
+                name.to_owned(),
+                candidate_at(name, &format!("src/{name}.rs"), 0, score),
+            );
+        }
+
+        let hits = engine
+            .select_hits(&request("query", 5), &candidates)
+            .expect("select hits");
+        assert_eq!(hits.len(), 5);
+        let paths = hits
+            .iter()
+            .filter_map(|hit| hit.address.as_ref().map(|address| address.path.as_str()))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            paths.len(),
+            5,
+            "top-5 must show five distinct files: {paths:?}"
+        );
+        // The capped file keeps only its best hit, still ranked first.
+        assert_eq!(
+            hits.first()
+                .and_then(|hit| hit.address.as_ref())
+                .map(|a| a.path.as_str()),
+            Some("src/a.rs")
+        );
+    }
+
+    #[test]
+    fn windowed_per_file_cap_fills_limit_with_what_remains() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        let mut candidates = HashMap::new();
+        for (file, scores) in [
+            ("src/a.rs", [0.95_f64, 0.8, 0.65, 0.5]),
+            ("src/b.rs", [0.9_f64, 0.75, 0.6, 0.45]),
+        ] {
+            for (index, score) in scores.into_iter().enumerate() {
+                let id = format!("{file}:{index}");
+                candidates.insert(
+                    id.clone(),
+                    candidate_at(&id, file, index as u64 * 10, score),
+                );
+            }
+        }
+
+        // Only two files carry hits: the top-5 window caps each at one and
+        // the starved head is accepted — the list fills with what remains.
+        let starved = engine
+            .select_hits(&request("query", 5), &candidates)
+            .expect("select hits");
+        assert_eq!(starved.len(), 2);
+
+        // Hits without a source path are uncapped, so the same two files
+        // still fill up to the limit — and once the list crosses 5 the cap
+        // relaxes, letting a file's next document in on its own merits.
+        for (index, score) in [0.85_f64, 0.7, 0.55, 0.4].into_iter().enumerate() {
+            let id = format!("pathless:{index}");
+            candidates.insert(id.clone(), candidate_pathless(&id, score));
+        }
+        let filled = engine
+            .select_hits(&request("query", 6), &candidates)
+            .expect("select hits");
+        assert_eq!(filled.len(), 6);
+        let count_of = |path: &str| {
+            filled
+                .iter()
+                .filter(|hit| {
+                    hit.address
+                        .as_ref()
+                        .is_some_and(|address| address.path == path)
+                })
+                .count()
+        };
+        assert_eq!(
+            count_of("src/a.rs"),
+            2,
+            "cap relaxes to 2 past the top-5 window"
+        );
+        assert_eq!(count_of("src/b.rs"), 1);
     }
 
     #[test]
@@ -2120,5 +2414,278 @@ mod tests {
     #[test]
     fn prf_terms_empty_without_seeds() {
         assert!(prf_expansion_terms("anything", &[]).is_empty());
+    }
+
+    #[test]
+    fn cjk_glossary_english_query_expands_nothing() {
+        assert!(cjk_glossary_terms("where is snapshot freshness decided").is_empty());
+        // CJK text without covered vocabulary expands nothing either.
+        assert!(cjk_glossary_terms("今天天气怎么样呢").is_empty());
+    }
+
+    #[test]
+    fn cjk_glossary_pure_cjk_query_gets_english_anchors() {
+        // The benchmark's worst case: every domain term translates.
+        let terms = cjk_glossary_terms("为什么函数调用关系的置信度低于导入关系");
+        for anchor in ["confidence", "call", "import", "relation", "function"] {
+            assert!(
+                terms.contains(&anchor.to_owned()),
+                "missing anchor {anchor} in {terms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cjk_glossary_mixed_query_dedups_translations() {
+        // 陈旧 and 过期 both translate to "stale"; the anchor is emitted
+        // once, and the query's own Latin anchor stays in the query text
+        // (the glossary only appends translations, never rewrites).
+        let terms = cjk_glossary_terms("search 偶发返回陈旧过期结果 stale");
+        assert_eq!(terms.iter().filter(|term| *term == "stale").count(), 1);
+        assert!(terms.contains(&"stale".to_owned()));
+    }
+
+    #[test]
+    fn cjk_glossary_terms_capped_in_table_order() {
+        // Emission order follows the sorted table, not the query's term
+        // order, and the output is capped at CJK_GLOSSARY_LIMIT anchors.
+        let query = "预算 锁定 过期 迁移 边界 路由 路径 调用 证据 解析 视图 行 范围 能力 \
+                     置信度 缓存 组件 索引 类型 符号 目录 清单 测试 模式 模块 检索 标记 \
+                     架构 构建 权限 服务 文档 文件 提交 接口 排序 扫描 忽略 快照 引用 差异 \
+                     嵌入 属性 导入 实现 实体 守护 向量 合并 历史 包 函数 关系 修复 依赖 \
+                     令牌 仓库 上下文";
+        let terms = cjk_glossary_terms(query);
+        assert_eq!(terms.len(), CJK_GLOSSARY_LIMIT);
+        // 上下文 is the first sorted key present in the query.
+        assert_eq!(terms.first(), Some(&"context".to_owned()));
+        let mut unique = terms.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), terms.len(), "anchors must be deduplicated");
+    }
+
+    // `body_artifact_digest` has a foreign key into `artifacts`, so the
+    // body is really stored and its record registered with the snapshot.
+    fn indexed_document(
+        store: &MetadataStore,
+        document_id: &str,
+        entity_id: &str,
+        path: &str,
+        name: &str,
+        body: &str,
+    ) -> (cce_store::IndexedDocument, cce_store::ArtifactRecord) {
+        let artifact = store
+            .artifacts()
+            .put_bytes(cce_store::ArtifactKind::Source, body.as_bytes())
+            .expect("store document body");
+        (
+            cce_store::IndexedDocument {
+                document: cce_core::RetrievalDocument {
+                    id: document_id.to_owned(),
+                    entity_id: entity_id.to_owned(),
+                    snapshot_id: "snap_test".to_owned(),
+                    representation: RetrievalRepresentation::RawCode,
+                    body_artifact_digest: artifact.digest.clone(),
+                    region_id: None,
+                    address: Some(
+                        SourceAddress::new("repo_test", "snap_test", path, 0..1, 1..=1)
+                            .expect("address"),
+                    ),
+                    embedding_profile: None,
+                    generated_by: None,
+                    evidence: Vec::new(),
+                    terms: Vec::new(),
+                },
+                path: path.to_owned(),
+                name: name.to_owned(),
+                body: body.to_owned(),
+            },
+            artifact,
+        )
+    }
+
+    fn engine_at(directory: &tempfile::TempDir) -> CceEngine {
+        let mut config = crate::EngineConfig::for_repository(directory.path());
+        config.data_root = directory.path().join("data");
+        CceEngine::open(config).expect("engine")
+    }
+
+    fn request(query: &str, limit: usize) -> SearchRequest {
+        SearchRequest {
+            repository_id: String::new(),
+            snapshot_id: String::new(),
+            query: query.to_owned(),
+            intent: None,
+            limit,
+            require_fresh: false,
+            routes: vec![SearchRoute::Lexical],
+            filters: cce_core::QueryFilters::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_expands_pure_cjk_query_through_glossary() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        let anchor = RepositoryScanner::new(engine.config().clone())
+            .identify()
+            .expect("anchor");
+        engine
+            .store()
+            .register_repository(&anchor.identity)
+            .expect("register repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_glossary".to_owned(),
+            repository_id: anchor.identity.id.clone(),
+            base_revision: None,
+            workspace_overlay_hash: String::new(),
+            index_profile_hash: String::new(),
+            created_at: chrono::Utc::now(),
+            file_count: 1,
+            source_bytes: 0,
+        };
+        engine
+            .store()
+            .begin_snapshot(&snapshot)
+            .expect("begin snapshot");
+        let (relations_doc, relations_artifact) = indexed_document(
+            engine.store(),
+            "doc:relations",
+            "file:src/relations.rs",
+            "src/relations.rs",
+            "relations",
+            "call relation confidence is lower than import relation confidence",
+        );
+        let (unrelated_doc, unrelated_artifact) = indexed_document(
+            engine.store(),
+            "doc:unrelated",
+            "file:src/unrelated.rs",
+            "src/unrelated.rs",
+            "unrelated",
+            "banana hammock yogurt carousel",
+        );
+        let records = SnapshotRecords {
+            artifacts: vec![relations_artifact, unrelated_artifact],
+            entities: vec![file("src/relations.rs"), file("src/unrelated.rs")],
+            documents: vec![relations_doc, unrelated_doc],
+            ..SnapshotRecords::default()
+        };
+        engine
+            .store()
+            .commit_snapshot(&snapshot, &records)
+            .expect("commit records");
+
+        // Without the glossary the CJK monolith cannot reach English
+        // source at all — the documented pure-CJK boundary.
+        let raw = engine
+            .store()
+            .lexical_search(
+                &snapshot.id,
+                "为什么函数调用关系的置信度低于导入关系",
+                10,
+                &cce_core::QueryFilters::default(),
+            )
+            .expect("raw lexical");
+        assert!(raw.is_empty(), "CJK monolith must not match: {raw:?}");
+
+        let result = engine
+            .search(request("为什么函数调用关系的置信度低于导入关系", 10))
+            .await
+            .expect("search");
+        let paths = result
+            .hits
+            .iter()
+            .filter_map(|hit| hit.address.as_ref().map(|address| address.path.as_str()))
+            .collect::<Vec<_>>();
+        assert!(
+            paths.contains(&"src/relations.rs"),
+            "glossary expansion must surface the gold file: {paths:?}"
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .flat_map(|hit| hit.explanation.iter())
+                .any(|line| line.contains("CJK glossary: +")),
+            "hits must record the applied glossary anchors"
+        );
+        assert!(
+            !paths.contains(&"src/unrelated.rs"),
+            "unrelated vocabulary must stay unfound: {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_english_query_and_pinned_routes_skip_glossary() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        let anchor = RepositoryScanner::new(engine.config().clone())
+            .identify()
+            .expect("anchor");
+        engine
+            .store()
+            .register_repository(&anchor.identity)
+            .expect("register repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_glossary2".to_owned(),
+            repository_id: anchor.identity.id.clone(),
+            base_revision: None,
+            workspace_overlay_hash: String::new(),
+            index_profile_hash: String::new(),
+            created_at: chrono::Utc::now(),
+            file_count: 1,
+            source_bytes: 0,
+        };
+        engine
+            .store()
+            .begin_snapshot(&snapshot)
+            .expect("begin snapshot");
+        let (relations_doc, relations_artifact) = indexed_document(
+            engine.store(),
+            "doc:relations",
+            "file:src/relations.rs",
+            "src/relations.rs",
+            "relations",
+            "call relation confidence is lower than import relation confidence",
+        );
+        let records = SnapshotRecords {
+            artifacts: vec![relations_artifact],
+            entities: vec![file("src/relations.rs")],
+            documents: vec![relations_doc],
+            ..SnapshotRecords::default()
+        };
+        engine
+            .store()
+            .commit_snapshot(&snapshot, &records)
+            .expect("commit records");
+
+        // English query: no glossary, but the same document still ranks.
+        let english = engine
+            .search(request(
+                "why is call confidence lower than import confidence",
+                10,
+            ))
+            .await
+            .expect("english search");
+        assert!(!english.hits.is_empty());
+        assert!(
+            !english
+                .hits
+                .iter()
+                .flat_map(|hit| hit.explanation.iter())
+                .any(|line| line.contains("CJK glossary")),
+            "english query must not record glossary anchors"
+        );
+
+        // `type:commit` pins the plan to the history route, which owns no
+        // documents here — the glossary never applies off the lexical route.
+        let pinned = engine
+            .search(request(
+                "为什么函数调用关系的置信度低于导入关系 type:commit",
+                10,
+            ))
+            .await
+            .expect("pinned search");
+        assert!(pinned.hits.is_empty());
     }
 }
