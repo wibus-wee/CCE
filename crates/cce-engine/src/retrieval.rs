@@ -405,14 +405,36 @@ impl CceEngine {
 
         apply_structural_features(&request.query, &mut candidates);
 
-        // Region granularity means one file can hold several of the best
-        // spans; cap per-file hits so top-N keeps cross-file coverage. Hits
-        // beyond the cap stay in `candidates` for expansion seeds.
-        let mut hits = Vec::new();
+        // Multiple retrieval documents can describe one source region (raw
+        // chunk + symbol summary); the hit list presents regions, so the
+        // first — best-scored — document per region wins and later ones only
+        // contribute their routes. Per-file cap keeps cross-file coverage;
+        // hits beyond it stay in `candidates` for expansion seeds.
+        let mut hits: Vec<SearchHit> = Vec::new();
         let mut per_file = HashMap::<String, usize>::new();
+        let mut seen_regions = HashMap::<String, usize>::new();
         for candidate in ranked_candidates(&candidates) {
             let mut hit = candidate.hit.clone();
             hit.score = candidate.fused_score;
+            let region_key = hit.region_id.clone().unwrap_or_else(|| {
+                hit.address.as_ref().map_or_else(
+                    || hit.document_id.clone(),
+                    |address| {
+                        format!(
+                            "{}:{}:{}",
+                            address.path, address.start_byte, address.end_byte
+                        )
+                    },
+                )
+            });
+            if let Some(&kept) = seen_regions.get(&region_key) {
+                for route in &hit.contributing_routes {
+                    if !hits[kept].contributing_routes.contains(route) {
+                        hits[kept].contributing_routes.push(*route);
+                    }
+                }
+                continue;
+            }
             if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
                 let count = per_file.entry(path.clone()).or_default();
                 if *count >= 3 {
@@ -420,6 +442,7 @@ impl CceEngine {
                 }
                 *count += 1;
             }
+            seen_regions.insert(region_key, hits.len());
             hits.push(hit);
             if hits.len() >= request.limit {
                 break;
