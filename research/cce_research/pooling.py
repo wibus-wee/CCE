@@ -38,6 +38,14 @@ class QueueEntry:
     routes: tuple[str, ...] = field(compare=False)
 
 
+@dataclass
+class _Accum:
+    best_rank: int
+    occurrences: int
+    bundles: set[str]
+    routes: set[str]
+
+
 def adjudication_queue(
     cases: list[BenchmarkCase],
     bundles: list[tuple[str, list[CaseResult]]],
@@ -50,8 +58,8 @@ def adjudication_queue(
     supporting, and already-judged paths are excluded.
     """
     by_case = {case.case_id: case for case in cases}
-    seen: dict[tuple[str, str], dict[str, object]] = defaultdict(
-        lambda: {"best_rank": depth + 1, "bundles": set(), "routes": set(), "occurrences": 0}
+    seen: dict[tuple[str, str], _Accum] = defaultdict(
+        lambda: _Accum(best_rank=depth + 1, occurrences=0, bundles=set(), routes=set())
     )
     for bundle_name, results in bundles:
         for result in results:
@@ -63,21 +71,18 @@ def adjudication_queue(
                 if item.path in judged:
                     continue
                 entry = seen[(result.case_id, item.path)]
-                entry["occurrences"] = int(entry["occurrences"]) + 1
-                entry["best_rank"] = min(int(entry["best_rank"]), index)
-                bundles_set = entry["bundles"]
-                routes_set = entry["routes"]
-                assert isinstance(bundles_set, set) and isinstance(routes_set, set)
-                bundles_set.add(bundle_name)
-                routes_set.add(item.route)
+                entry.occurrences += 1
+                entry.best_rank = min(entry.best_rank, index)
+                entry.bundles.add(bundle_name)
+                entry.routes.add(item.route)
     queue = [
         QueueEntry(
             case_id=case_id,
             path=path,
-            best_rank=int(data["best_rank"]),
-            occurrences=int(data["occurrences"]),
-            bundles=tuple(sorted(data["bundles"])),
-            routes=tuple(sorted(data["routes"])),
+            best_rank=data.best_rank,
+            occurrences=data.occurrences,
+            bundles=tuple(sorted(data.bundles)),
+            routes=tuple(sorted(data.routes)),
         )
         for (case_id, path), data in seen.items()
     ]

@@ -20,10 +20,9 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from statistics import mean, pstdev
 from typing import TYPE_CHECKING
-
-from pathlib import Path
 
 from .metrics import case_observations
 from .schema import BenchmarkCase, CaseResult, Provenance
@@ -69,7 +68,6 @@ def position_sensitivity(
     """Mean and per-case spread (population stdev over permutations) of each
     order-sensitive metric. High spread = the metric mostly reflects pack
     ordering, not content."""
-    case_by_id = {case.case_id: case for case in cases}
     per_metric_values: dict[str, list[float]] = {name: [] for name in metrics}
     per_metric_spreads: dict[str, list[float]] = {name: [] for name in metrics}
     for case in cases:
@@ -177,7 +175,8 @@ def run_staleness_probe(
         )
         if report.stale_marker_survives:
             report.notes.append(
-                "old token still retrieves the marker after rewrite — index may be serving stale content"
+                "old token still retrieves the marker after rewrite — index may be "
+                "serving stale content"
             )
     finally:
         marker.unlink(missing_ok=True)

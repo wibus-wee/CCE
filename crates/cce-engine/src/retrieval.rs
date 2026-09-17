@@ -455,16 +455,42 @@ impl CceEngine {
 
         // Cross-encoder rerank: the fused order is a coarse prior from
         // route-level rank fusion. A pairwise reranker re-scores the head
-        // of the list against the raw query text and reorders it; hits
-        // beyond the pool keep fused order. Configured-but-failed rerankers
-        // degrade to fused order with an explicit missing-capability note.
-        if hits.len() > 1 && self.config().reranker_model.is_some() {
+        // of the list against the raw query text and reorders it.
+        //
+        // Only topical hits are scored: graph-expansion routes
+        // (structural/knowledge/history) answer "what is connected", not
+        // "what matches the query text" — judging them on topical
+        // relevance punishes blast-radius evidence and collapsed impact
+        // and trace recall in benchmark v5.1. Non-topical hits keep their
+        // fused slots; topical hits are permuted among their own slots.
+        //
+        // Configured-but-failed rerankers degrade to fused order with an
+        // explicit missing-capability note.
+        const TOPICAL: [SearchRoute; 5] = [
+            SearchRoute::Lexical,
+            SearchRoute::DenseRaw,
+            SearchRoute::DenseSummary,
+            SearchRoute::ExactSymbol,
+            SearchRoute::Hybrid,
+        ];
+        let topical: Vec<usize> = hits
+            .iter()
+            .enumerate()
+            .filter(|(_, hit)| {
+                hit.contributing_routes
+                    .iter()
+                    .any(|route| TOPICAL.contains(route))
+            })
+            .map(|(index, _)| index)
+            .take(RERANK_POOL)
+            .collect();
+        if topical.len() > 1 && self.config().reranker_model.is_some() {
             match self.reranker().await {
                 Ok(Some(reranker)) => {
-                    let pool = hits.len().min(RERANK_POOL);
-                    let documents = hits[..pool]
+                    let documents = topical
                         .iter()
-                        .map(|hit| {
+                        .map(|&index| {
+                            let hit = &hits[index];
                             let location = hit.address.as_ref().map_or_else(
                                 || {
                                     hit.symbol_name
@@ -483,28 +509,30 @@ impl CceEngine {
                         })
                         .collect::<Vec<_>>();
                     match reranker.rerank(&request.query, &documents).await {
-                            Ok(order) => {
-                                let mut reranked = Vec::with_capacity(pool);
-                                for (index, score) in order {
-                                    let mut hit = hits[index].clone();
-                                    hit.explanation.push(format!(
-                                        "cross-encoder rerank by {}: fused {:.4} -> rerank {:.4}",
-                                        reranker.model_code(),
-                                        hit.score,
-                                        score
-                                    ));
-                                    hit.score = f64::from(score);
-                                    if !hit.contributing_routes.contains(&SearchRoute::Reranked) {
-                                        hit.contributing_routes.push(SearchRoute::Reranked);
-                                    }
-                                    reranked.push(hit);
+                        Ok(order) => {
+                            let mut reranked = Vec::with_capacity(order.len());
+                            for (index, score) in order {
+                                let mut hit = hits[topical[index]].clone();
+                                hit.explanation.push(format!(
+                                    "cross-encoder rerank by {}: fused {:.4} -> rerank {:.4}",
+                                    reranker.model_code(),
+                                    hit.score,
+                                    score
+                                ));
+                                hit.score = f64::from(score);
+                                if !hit.contributing_routes.contains(&SearchRoute::Reranked) {
+                                    hit.contributing_routes.push(SearchRoute::Reranked);
                                 }
-                                hits.splice(..pool, reranked);
+                                reranked.push(hit);
                             }
-                            Err(error) => missing_capabilities.push(format!(
-                                "reranker configured but scoring failed: {error}; fused ranking order used"
-                            )),
+                            for (slot, hit) in topical.iter().zip(reranked) {
+                                hits[*slot] = hit;
+                            }
                         }
+                        Err(error) => missing_capabilities.push(format!(
+                            "reranker configured but scoring failed: {error}; fused ranking order used"
+                        )),
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => missing_capabilities.push(format!(

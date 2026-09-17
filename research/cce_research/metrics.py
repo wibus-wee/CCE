@@ -219,7 +219,7 @@ def ndcg(case: BenchmarkCase, retrieved: list[RetrievedRange]) -> float:
     for candidate in retrieved:
         gain = 0.0
         for gold_index, gold in enumerate(case.gold_ranges):
-            key = (candidate.path, gold_index)
+            key: tuple[str, int | None] = (candidate.path, gold_index)
             if key not in scored and overlaps(gold, candidate):
                 scored.add(key)
                 gain = 1.0

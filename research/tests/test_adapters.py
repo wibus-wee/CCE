@@ -69,6 +69,29 @@ def test_embedding_model_without_dense_is_rejected(tmp_path: Path) -> None:
         Adapter.load(_write_adapter(tmp_path, embedding_model="intfloat/multilingual-e5-base"))
 
 
+def test_reranker_adapter_appends_equals_form_and_identity(tmp_path: Path) -> None:
+    adapter = Adapter.load(
+        _write_adapter(
+            tmp_path,
+            dense="local",
+            embedding_model="jinaai/jina-embeddings-v2-base-code",
+            reranker="rozgo/bge-reranker-v2-m3",
+        )
+    )
+    command = adapter.build_command(_case(), Path("/repo"))
+    # `=` form: an optional-value flag must not consume a trailing token.
+    assert command[-1] == "--reranker=rozgo/bge-reranker-v2-m3"
+    assert (
+        adapter.model_identity
+        == "local:jinaai/jina-embeddings-v2-base-code+rerank:rozgo/bge-reranker-v2-m3"
+    )
+
+
+def test_reranker_only_identity(tmp_path: Path) -> None:
+    adapter = Adapter.load(_write_adapter(tmp_path, reranker="BAAI/bge-reranker-base"))
+    assert adapter.model_identity == "rerank:BAAI/bge-reranker-base"
+
+
 def test_dense_flags_do_not_disturb_template_expansion(tmp_path: Path) -> None:
     adapter = Adapter.load(
         _write_adapter(

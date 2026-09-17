@@ -303,7 +303,8 @@ def test_path_component_longest_prefix_wins() -> None:
     assert path_component("crates/cce-store/nested/x.rs", component_map) == "nested"
     assert path_component("crates/cce-store/src/a.rs", component_map) == "cce-store"
     assert path_component("README.md", component_map) == "root"
-    assert path_component("other/a.rs", {k: v for k, v in component_map.items() if k != "root"}) is None
+    without_root = {k: v for k, v in component_map.items() if k != "root"}
+    assert path_component("other/a.rs", without_root) is None
 
 
 def test_component_metrics_use_map() -> None:

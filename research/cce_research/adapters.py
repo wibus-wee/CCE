@@ -150,6 +150,8 @@ def start_daemon(adapter: Adapter, repository_root: Path) -> DaemonSession:
         command += ["--embedding-model", adapter.embedding_model]
     if adapter.embedding_dimensions is not None:
         command += ["--embedding-dimensions", str(adapter.embedding_dimensions)]
+    if adapter.reranker:
+        command.append(f"--reranker={adapter.reranker}")
     environment = os.environ.copy()
     environment.update(adapter.environment)
     log_path = _daemon_log_path(adapter.name)
@@ -196,6 +198,7 @@ class Adapter:
     dense: str | None = None
     embedding_model: str | None = None
     embedding_dimensions: int | None = None
+    reranker: str | None = None
     session: str = "subprocess"
     # Live daemon sessions keyed by resolved repository path. Mutable
     # process state on an otherwise frozen value object — excluded from
@@ -223,9 +226,15 @@ class Adapter:
             raise ValueError(
                 f"{path}: embedding_model/embedding_dimensions require a dense backend"
             )
+        reranker = raw.get("reranker")
         model_identity = str(raw.get("model_identity", "none"))
         if model_identity == "none" and embedding_model:
             model_identity = f"local:{embedding_model}"
+        if reranker:
+            suffix = f"rerank:{reranker}"
+            model_identity = (
+                suffix if model_identity == "none" else f"{model_identity}+{suffix}"
+            )
         return cls(
             name=str(raw["name"]),
             command=[str(item) for item in raw["command"]],
@@ -236,6 +245,7 @@ class Adapter:
             dense=str(dense) if dense else None,
             embedding_model=str(embedding_model) if embedding_model else None,
             embedding_dimensions=embedding_dimensions,
+            reranker=str(reranker) if reranker else None,
             session=session,
         )
 
@@ -272,6 +282,10 @@ class Adapter:
             command.extend(["--embedding-model", self.embedding_model])
         if self.embedding_dimensions is not None:
             command.extend(["--embedding-dimensions", str(self.embedding_dimensions)])
+        if self.reranker:
+            # `=` form: an optional-value flag must not consume a trailing
+            # token as its value.
+            command.append(f"--reranker={self.reranker}")
         return command
 
     def start_session(self, repository_root: Path) -> None:

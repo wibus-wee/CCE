@@ -94,9 +94,8 @@ def compare_results(
     guardrails = {name.strip() for name in guardrail.split(",") if name.strip()}
     table = Table("Metric", "Delta", "95% CI", "p(perm)", "d", "MDE", "N", "Sig")
     for name, metric in deltas.items():
-        flag = "[red]![/red]" if name in guardrails and metric.significant and metric.delta < 0 else (
-            "*" if metric.significant else ""
-        )
+        regressed = name in guardrails and metric.significant and metric.delta < 0
+        flag = "[red]![/red]" if regressed else ("*" if metric.significant else "")
         table.add_row(
             name,
             f"{metric.delta:+.4f}",

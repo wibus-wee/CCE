@@ -1,0 +1,21 @@
+name: cce-daemon-dense-jina-rerank
+# Full context-pack stage over a warm daemon: jina-v2-base-code dense
+# embeddings plus the bge-reranker-v2-m3 cross-encoder head pass.
+session: daemon
+command:
+  - target/release/cce
+  - --json
+  - context
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --budget
+  - "{budget}"
+timeout_seconds: 240
+model_revision: none
+dense: local
+embedding_model: jinaai/jina-embeddings-v2-base-code
+reranker: rozgo/bge-reranker-v2-m3
+environment:
+  CCE_DATA_DIR: .cce-benchmark

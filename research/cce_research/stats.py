@@ -137,7 +137,7 @@ def compare_metrics(
     pvalues: dict[str, float] = {}
     for name in shared:
         left, right = baseline[name], candidate[name]
-        deltas = [r - l for l, r in zip(left, right, strict=True)]
+        deltas = [right_v - left_v for left_v, right_v in zip(left, right, strict=True)]
         value, low, high = bootstrap_ci(deltas, seed=seed)
         p = permutation_pvalue(left, right, seed=seed)
         raw[name] = Comparison(

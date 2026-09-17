@@ -125,4 +125,10 @@ First ladder result (cce-self-v5, n=29, search stage): dense beats sparse decisi
 
 Second ladder result (cce-self-v5.1, n=29, daemon session, enriched symbol descriptors): **jina-v2-base-code beats e5-small with significance** — nDCG@10 +0.09 (p=.0005, Holm-significant), recall@5 +0.10 (p=.006), MRR +0.07 — at a small recall@20 tail cost (−0.06, ns). On the CJK vocabulary-gap case the gold symbol went from absent-at-50 to rank 1. `jinaai/jina-embeddings-v2-base-code` is now `DEFAULT_LOCAL_EMBEDDING_MODEL`. Next lever for the remaining claim-level gap is a reranker stage.
 
+### Reranker comparison
+
+`reranker: <model>` in an adapter YAML enables the local cross-encoder pass (`cce models` lists reranker codes; the flag travels to daemon startup and subprocess fallback commands in `--reranker=<model>` form). The reranker only reorders hits carrying topical routes (lexical/dense/exact/hybrid); graph-expansion hits (structural/knowledge/history) keep fused slots because they answer "what is connected", not "what matches the query text" — scoring them topically destroyed impact/trace recall in the first measurement. `model_identity` gains a `+rerank:<model>` suffix.
+
+First reranker result (cce-self-v5.1 adjudicated head, jina-daemon baseline vs `rozgo/bge-reranker-v2-m3`): **no measured benefit at high cost** — nDCG@10 −0.11, recall@5 −0.07, MRR −0.10 (all ns after adjudicating the promoted head items; initial unjudged@5 +0.22 was adjudication-pool staleness, resolved by judging 111 promoted items: 8 relevant, 103 irrelevant). The dominant failure is prose preference: a general passage-ranking cross-encoder promotes README/docs/plans over code symbols on code-intent queries. Cost is +5.8s/query (50-pair scoring on CPU). The stage stays opt-in via `--reranker`; it is not recommended by default. A code-aware reranker model or richer reranker input formatting is the open question if this lever is revisited.
+
 Published bundles must replace `WORKTREE` with an immutable commit and record CPU, memory, operating system, model endpoint/revision, cold versus warm cache state, and lockfile digests.
