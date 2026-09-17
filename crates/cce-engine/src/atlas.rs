@@ -79,7 +79,7 @@ pub struct ImpactedEntity {
 impl CceEngine {
     /// Package-level map of the repository: hard build boundaries and the
     /// declared dependency direction between them.
-    pub async fn codebase_map(&self) -> Result<CodebaseMap> {
+    pub fn codebase_map(&self) -> Result<CodebaseMap> {
         let snapshot_id = self.current_snapshot_id()?;
         let packages = self
             .store()
@@ -165,7 +165,7 @@ impl CceEngine {
 
     /// Explain one named component: package or symbol entity, its members,
     /// declared dependencies, dependents, and tests.
-    pub async fn explain_component(&self, name: &str) -> Result<ComponentExplanation> {
+    pub fn explain_component(&self, name: &str) -> Result<ComponentExplanation> {
         let snapshot_id = self.current_snapshot_id()?;
         let entity = self
             .store()
@@ -258,7 +258,7 @@ impl CceEngine {
 
     /// Blast radius of a symbol or file: everything reaching it through
     /// impact edges within two hops, cheapest evidence first.
-    pub async fn impact_analysis(&self, query: &str) -> Result<ImpactReport> {
+    pub fn impact_analysis(&self, query: &str) -> Result<ImpactReport> {
         let snapshot_id = self.current_snapshot_id()?;
         let seeds = self.store().entity_by_name(&snapshot_id, query, 8)?;
         let mut impacted: HashMap<String, ImpactedEntity> = HashMap::new();
@@ -268,6 +268,7 @@ impl CceEngine {
             RelationKind::Tests,
             RelationKind::Implements,
             RelationKind::BuildDependsOn,
+            RelationKind::RouteHandledBy,
         ];
         let mut caveats = Vec::new();
         if seeds.is_empty() {

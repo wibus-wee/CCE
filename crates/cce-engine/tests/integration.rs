@@ -249,10 +249,7 @@ async fn typed_relations_carry_provenance_and_confidence() {
     engine.index().await.expect("index");
 
     // Calls edge: alpha::helper calls beta::beta_fn (tree-sitter provenance).
-    let impact = engine
-        .impact_analysis("beta_fn")
-        .await
-        .expect("impact analysis");
+    let impact = engine.impact_analysis("beta_fn").expect("impact analysis");
     assert!(
         impact
             .impacted
@@ -267,10 +264,7 @@ async fn typed_relations_carry_provenance_and_confidence() {
     );
 
     // Tests edge: test_helper_works targets helper.
-    let impact = engine
-        .impact_analysis("helper")
-        .await
-        .expect("impact on helper");
+    let impact = engine.impact_analysis("helper").expect("impact on helper");
     assert!(
         impact
             .impacted
@@ -279,10 +273,7 @@ async fn typed_relations_carry_provenance_and_confidence() {
     );
 
     // References edge: alpha::verify names beta::Token in a type position.
-    let impact = engine
-        .impact_analysis("Token")
-        .await
-        .expect("impact on Token");
+    let impact = engine.impact_analysis("Token").expect("impact on Token");
     assert!(
         impact.impacted.iter().any(|entity| entity.name == "verify"
             && entity.via == "References"
@@ -302,7 +293,7 @@ async fn package_graph_comes_from_build_manifests() {
     let engine = engine(repo.path());
     engine.index().await.expect("index");
 
-    let map = engine.codebase_map().await.expect("codebase map");
+    let map = engine.codebase_map().expect("codebase map");
     let alpha = map
         .packages
         .iter()
@@ -318,10 +309,7 @@ async fn package_graph_comes_from_build_manifests() {
     assert_eq!(beta.dependents, vec!["alpha".to_owned()]);
     assert_eq!(map.provenance, "build_system manifests (deterministic)");
 
-    let explanation = engine
-        .explain_component("alpha")
-        .await
-        .expect("explain alpha");
+    let explanation = engine.explain_component("alpha").expect("explain alpha");
     assert_eq!(explanation.kind, "Package");
     assert!(
         explanation
@@ -357,9 +345,9 @@ async fn atlas_on_unindexed_repository_is_an_explicit_error() {
     let engine = engine(repo.path());
 
     for outcome in [
-        engine.codebase_map().await.map(|_| ()),
-        engine.explain_component("anything").await.map(|_| ()),
-        engine.impact_analysis("anything").await.map(|_| ()),
+        engine.codebase_map().map(|_| ()),
+        engine.explain_component("anything").map(|_| ()),
+        engine.impact_analysis("anything").map(|_| ()),
     ] {
         let error = outcome.expect_err("atlas must fail without an index");
         assert!(

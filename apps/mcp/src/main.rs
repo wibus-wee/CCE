@@ -217,16 +217,16 @@ async fn call_tool(engine: &CceEngine, params: &Value) -> Result<Value, (i32, St
             )
             .map_err(|error| (-32603, error.to_string()))?
         }
-        "cce_map" => serde_json::to_value(engine.codebase_map().await.map_err(tool_error)?)
+        "cce_map" => serde_json::to_value(engine.codebase_map().map_err(tool_error)?)
             .map_err(|error| (-32603, error.to_string()))?,
         "cce_explain" => {
             let name = required_string(&arguments, "name")?;
-            serde_json::to_value(engine.explain_component(&name).await.map_err(tool_error)?)
+            serde_json::to_value(engine.explain_component(&name).map_err(tool_error)?)
                 .map_err(|error| (-32603, error.to_string()))?
         }
         "cce_impact" => {
             let name = required_string(&arguments, "name")?;
-            serde_json::to_value(engine.impact_analysis(&name).await.map_err(tool_error)?)
+            serde_json::to_value(engine.impact_analysis(&name).map_err(tool_error)?)
                 .map_err(|error| (-32603, error.to_string()))?
         }
         _ => return Err((-32602, format!("unknown tool: {name}"))),

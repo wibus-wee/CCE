@@ -258,15 +258,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Map { repository } => {
             let engine = engine(&arguments, repository)?;
-            print_value(&engine.codebase_map().await?)?;
+            print_value(&engine.codebase_map()?)?;
         }
         Command::Explain { repository, name } => {
             let engine = engine(&arguments, repository)?;
-            print_value(&engine.explain_component(name).await?)?;
+            print_value(&engine.explain_component(name)?)?;
         }
         Command::Impact { repository, name } => {
             let engine = engine(&arguments, repository)?;
-            print_value(&engine.impact_analysis(name).await?)?;
+            print_value(&engine.impact_analysis(name)?)?;
         }
         Command::Models => {
             for code in cce_engine::LocalEmbedder::supported_model_codes() {

@@ -25,7 +25,7 @@ atlas correctness bug found during the audit.
 | 003 | Dataset cce-self-v5: vocab-gap, budget-curve, dataflow cases | P1 | S | — | TODO |
 | 004 | Embedding model ladder: paired e5-small / Qwen3-0.6B / e5-base | P1 | S | 001, 003 | TODO |
 | 005 | Task→Component Recall@K metric (package-granularity L0) | P1 | S | — (annotates 003's cases) | TODO |
-| 006 | Framework landmark extractor: axum route bindings | P2 | S | — (best after 003) | TODO |
+| 006 | Framework landmark extractor: axum route bindings | P2 | S | — (best after 003) | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 

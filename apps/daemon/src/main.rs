@@ -210,21 +210,21 @@ async fn context(
 async fn codebase_map(
     State(engine): State<Arc<CceEngine>>,
 ) -> Result<Json<cce_engine::CodebaseMap>, ApiError> {
-    Ok(Json(engine.codebase_map().await?))
+    Ok(Json(engine.codebase_map()?))
 }
 
 async fn explain(
     State(engine): State<Arc<CceEngine>>,
     Path(name): Path<String>,
 ) -> Result<Json<cce_engine::ComponentExplanation>, ApiError> {
-    Ok(Json(engine.explain_component(&name).await?))
+    Ok(Json(engine.explain_component(&name)?))
 }
 
 async fn impact(
     State(engine): State<Arc<CceEngine>>,
     Path(name): Path<String>,
 ) -> Result<Json<cce_engine::ImpactReport>, ApiError> {
-    Ok(Json(engine.impact_analysis(&name).await?))
+    Ok(Json(engine.impact_analysis(&name)?))
 }
 
 async fn shutdown_signal() {

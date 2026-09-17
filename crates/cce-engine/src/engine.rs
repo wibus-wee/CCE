@@ -662,6 +662,19 @@ impl CceEngine {
         records.entities.extend(emission.entities);
         records.relations.extend(emission.relations);
 
+        // Framework landmarks: axum route bindings emit Route entities and
+        // RouteHandledBy edges (FrameworkRule provenance, 0.85 confidence).
+        let route_bindings = crate::landmarks::axum_routes(&scanned.files, &texts_by_path);
+        let emission = crate::landmarks::emit(
+            &route_bindings,
+            &scanned.identity.id,
+            &scanned.snapshot.id,
+            &file_regions,
+            &name_index,
+        );
+        records.entities.extend(emission.entities);
+        records.relations.extend(emission.relations);
+
         add_hierarchical_knowledge(
             &self.store,
             &scanned.snapshot,

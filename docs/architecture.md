@@ -47,7 +47,7 @@ flowchart TD
 
 Every relation stores its origin, confidence, evidence, extractor version, and valid snapshot. Query policies may require a minimum trust level.
 
-Path containment is a deterministic structural fact recorded with extractor identity. Tree-sitter facts are syntax-level. Relative imports are framework-derived and intentionally remain below compiler/SCIP facts. Package boundaries come from build manifests (`Cargo.toml` workspaces, `package.json` workspaces) and carry `build_system` provenance at full confidence — `BuildDependsOn` edges are declared facts, while `Calls`/`References` from Tree-sitter stay below compiler truth. Knowledge and commit-message documents participate in retrieval but cannot create authoritative call or dataflow edges.
+Path containment is a deterministic structural fact recorded with extractor identity. Tree-sitter facts are syntax-level. Relative imports are framework-derived and intentionally remain below compiler/SCIP facts. Package boundaries come from build manifests (`Cargo.toml` workspaces, `package.json` workspaces) and carry `build_system` provenance at full confidence — `BuildDependsOn` edges are declared facts, while `Calls`/`References` from Tree-sitter stay below compiler truth. Axum `.route("path", method(handler))` bindings emit `Route` entities and `RouteHandledBy` edges as `framework_rule` facts at 0.85 confidence with call-site evidence (`cce-landmark-axum-v1`). Knowledge and commit-message documents participate in retrieval but cannot create authoritative call or dataflow edges.
 
 ## Architecture Atlas
 
