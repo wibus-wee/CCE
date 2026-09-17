@@ -819,14 +819,18 @@ fn apply_structural_features(
         .collect();
     // Co-change partners of the top-3 files. The edge is stored once per
     // pair (smaller entity id as source), so only a Both-direction lookup
-    // sees it from either endpoint.
+    // sees it from either endpoint — and since `ChangedWith` caps at 0.7
+    // while structural edges carry up to 1.0, the confidence-ordered fetch
+    // limit must cover the file's whole degree or the co-change rows are
+    // crowded out entirely.
     let mut co_changed = HashMap::<String, f32>::new();
     for path in &top_paths {
         let Some(file) = file_entity(store, snapshot_id, path)? else {
             continue;
         };
+        let degree = store.entity_relation_degree(snapshot_id, &file.id)?;
         for relation in
-            store.relations_for_entity(snapshot_id, &file.id, RelationDirection::Both, 16)?
+            store.relations_for_entity(snapshot_id, &file.id, RelationDirection::Both, degree)?
         {
             if relation.kind != cce_core::RelationKind::ChangedWith {
                 continue;
@@ -1194,6 +1198,21 @@ mod tests {
         }
     }
 
+    fn references(source: &str, target: &str) -> cce_core::Relation {
+        cce_core::Relation {
+            id: format!("rel:{source}:{target}"),
+            source_entity_id: source.to_owned(),
+            target_entity_id: target.to_owned(),
+            kind: RelationKind::References,
+            origin: RelationOrigin::TreeSitter,
+            confidence: 1.0,
+            snapshot_id: "snap_test".to_owned(),
+            extractor: "test".to_owned(),
+            evidence: Vec::new(),
+            attributes: serde_json::Map::new(),
+        }
+    }
+
     fn candidate(document_id: &str, path: &str, fused_score: f64) -> Candidate {
         Candidate {
             hit: SearchHit {
@@ -1222,10 +1241,16 @@ mod tests {
     #[test]
     fn co_change_partner_receives_bonus() {
         // The edge is stored once with the smaller id as source; the bonus
-        // must still find it from the larger-id endpoint.
+        // must still find it from the larger-id endpoint. Twenty 1.0-
+        // confidence references crowd the co-change edge out of any naive
+        // confidence-ordered head fetch — the fetch must span the degree.
+        let mut relations = vec![changed_with("file:src/a.rs", "file:src/b.rs", 0.6)];
+        for index in 0..20 {
+            relations.push(references("file:src/a.rs", &format!("dummy:{index}")));
+        }
         let records = SnapshotRecords {
             entities: vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")],
-            relations: vec![changed_with("file:src/a.rs", "file:src/b.rs", 0.6)],
+            relations,
             ..SnapshotRecords::default()
         };
         let (_dir, store, snapshot_id) = store_with(&records);
