@@ -1153,10 +1153,15 @@ impl CceEngine {
                     report.scip_reference_edges = outcome.relations.len();
                     merge_relations(&mut records.relations, outcome.relations);
                     if outcome.foreign_documents > 0 {
-                        report.message = Some(format!(
+                        let skipped = format!(
                             "{} documents skipped — not part of this snapshot",
                             outcome.foreign_documents
-                        ));
+                        );
+                        // Keep the detection note (e.g. chosen project root).
+                        report.message = Some(match report.message.take() {
+                            Some(note) => format!("{note}; {skipped}"),
+                            None => skipped,
+                        });
                     }
                 }
                 Err(error) => {
@@ -1169,11 +1174,20 @@ impl CceEngine {
         Ok(reports)
     }
 
-    /// Live provider probe — detection only, runs nothing.
     /// Detect-state report for every known provider (no execution).
     #[must_use]
     pub fn providers(&self) -> Vec<crate::providers::ProviderReport> {
         crate::providers::detect_all(&self.config.repository_root)
+    }
+
+    /// Worktree regex search honoring ignore/sensitive policy; always
+    /// fresh, independent of the snapshot.
+    ///
+    /// # Errors
+    /// `Configuration` on an invalid pattern; scan/I/O errors.
+    pub fn grep(&self, request: &crate::GrepRequest) -> Result<crate::GrepReport> {
+        let scanner = RepositoryScanner::new(self.config.clone());
+        crate::grep::grep(&scanner, &self.store, request)
     }
 
     fn model_cache_dir(&self) -> std::path::PathBuf {
@@ -1272,7 +1286,9 @@ fn scip_ranges(
 
 /// Merge provider-derived relations into pending records. Relation ids are
 /// pure functions of (source, target, kind), so a same-id provider edge
-/// replaces the lower-trust row in place; new edges append.
+/// replaces the lower-trust row in place; new edges append. One artifact can
+/// also carry the same id twice — distinct tool symbols may resolve to the
+/// same entity pair — so `incoming` is deduped first (evidence merged).
 fn merge_relations(existing: &mut Vec<Relation>, incoming: Vec<Relation>) -> usize {
     let positions: HashMap<&str, usize> = existing
         .iter()
@@ -1280,11 +1296,18 @@ fn merge_relations(existing: &mut Vec<Relation>, incoming: Vec<Relation>) -> usi
         .map(|(index, relation)| (relation.id.as_str(), index))
         .collect();
     let mut replaces = Vec::new();
-    let mut appends = Vec::new();
+    let mut appends: Vec<Relation> = Vec::new();
+    let mut appended: HashMap<String, usize> = HashMap::new();
     for relation in incoming {
-        match positions.get(relation.id.as_str()) {
-            Some(&index) => replaces.push((index, relation)),
-            None => appends.push(relation),
+        if let Some(&index) = positions.get(relation.id.as_str()) {
+            replaces.push((index, relation));
+        } else if let Some(&index) = appended.get(relation.id.as_str()) {
+            if let Some(slot) = appends.get_mut(index) {
+                slot.evidence.extend(relation.evidence);
+            }
+        } else {
+            appended.insert(relation.id.clone(), appends.len());
+            appends.push(relation);
         }
     }
     let replaced = replaces.len();

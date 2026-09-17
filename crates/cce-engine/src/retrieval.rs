@@ -105,6 +105,14 @@ impl CceEngine {
         let resolved = self.resolve_index(request.require_fresh).await?;
         request.repository_id.clone_from(&resolved.repository_id);
         request.snapshot_id.clone_from(&resolved.snapshot_id);
+        // `lang:`/`path:` tokens become structured filters and leave the
+        // query text; an explicitly-set `filters` field wins and the query
+        // is used verbatim.
+        if request.filters.is_empty() {
+            let (query, filters) = cce_core::parse_query_filters(&request.query);
+            request.query = query;
+            request.filters = filters;
+        }
         let verified_fresh = resolved.verified_fresh;
         let mut plan = QueryPlanner::new().plan(&request.query, request.intent);
         if !request.routes.is_empty() {
@@ -175,6 +183,7 @@ impl CceEngine {
                     &request.snapshot_id,
                     &request.query,
                     request.limit.saturating_mul(3),
+                    &request.filters,
                 )?
                 .into_iter()
                 .enumerate()
@@ -224,6 +233,7 @@ impl CceEngine {
                 &request.snapshot_id,
                 &request.query,
                 request.limit.saturating_mul(5),
+                &request.filters,
             )?;
             for (offset, hit) in hits
                 .into_iter()
@@ -443,8 +453,17 @@ impl CceEngine {
         let mut hits: Vec<SearchHit> = Vec::new();
         let mut per_file = HashMap::<String, usize>::new();
         let mut seen_regions = HashMap::<String, usize>::new();
+        let mut language_cache = HashMap::<String, Option<String>>::new();
         for candidate in ranked_candidates(&candidates) {
             let mut hit = candidate.hit.clone();
+            if !self.hit_matches_filters(
+                &hit,
+                &request.filters,
+                &request.snapshot_id,
+                &mut language_cache,
+            )? {
+                continue;
+            }
             hit.score = candidate.fused_score;
             let region_key = hit.region_id.clone().unwrap_or_else(|| {
                 hit.address.as_ref().map_or_else(
@@ -580,6 +599,52 @@ impl CceEngine {
             missing_capabilities,
             latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         })
+    }
+
+    /// Post-fusion check for `path:`/`lang:` filters on routes that cannot
+    /// push them into SQL (exact-symbol, dense, graph expansion). A hit
+    /// without a source path fails a `path:` filter; language resolves
+    /// through the entity, cached per entity id.
+    fn hit_matches_filters(
+        &self,
+        hit: &SearchHit,
+        filters: &cce_core::QueryFilters,
+        snapshot_id: &str,
+        language_cache: &mut HashMap<String, Option<String>>,
+    ) -> Result<bool> {
+        if filters.is_empty() {
+            return Ok(true);
+        }
+        if let Some(prefix) = &filters.path_prefix {
+            let matches_path = hit
+                .address
+                .as_ref()
+                .is_some_and(|address| address.path.starts_with(prefix.as_str()))
+                || hit
+                    .evidence
+                    .iter()
+                    .any(|address| address.path.starts_with(prefix.as_str()));
+            if !matches_path {
+                return Ok(false);
+            }
+        }
+        if let Some(language) = &filters.language {
+            let entity_language = if let Some(cached) = language_cache.get(&hit.entity_id) {
+                cached.clone()
+            } else {
+                let resolved = self
+                    .store()
+                    .entity_by_id(snapshot_id, &hit.entity_id)?
+                    .and_then(|entity| entity.language)
+                    .map(|value| value.to_ascii_lowercase());
+                language_cache.insert(hit.entity_id.clone(), resolved.clone());
+                resolved
+            };
+            if entity_language.as_deref() != Some(language.as_str()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 

@@ -156,6 +156,57 @@ pub struct SearchRequest {
     /// Route allowlist; empty means planner chooses.
     #[serde(default)]
     pub routes: Vec<SearchRoute>,
+    /// Structured hit filters. `key:value` tokens in `query`
+    /// (`lang:rust`, `path:crates/…`) are parsed into this field; callers
+    /// may also set it directly, in which case the query is not parsed.
+    #[serde(default)]
+    pub filters: QueryFilters,
+}
+
+/// Conjunctive hit filters parsed from `key:value` query tokens or set
+/// directly by API callers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryFilters {
+    /// Repository-relative path prefix (`path:crates/cce-engine`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    /// Entity language (`lang:rust`) matched exactly, case-insensitive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+impl QueryFilters {
+    /// Whether any filter is set.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.path_prefix.is_none() && self.language.is_none()
+    }
+}
+
+/// Extracts `lang:`/`path:` tokens from a query string, returning the
+/// cleaned query text and the structured filters. Unknown `key:` tokens
+/// stay in the query text untouched.
+#[must_use]
+pub fn parse_query_filters(query: &str) -> (String, QueryFilters) {
+    let mut filters = QueryFilters::default();
+    let mut kept = Vec::new();
+    for token in query.split_whitespace() {
+        let Some((key, value)) = token.split_once(':') else {
+            kept.push(token);
+            continue;
+        };
+        if value.is_empty() {
+            kept.push(token);
+            continue;
+        }
+        match key {
+            "lang" => filters.language = Some(value.to_ascii_lowercase()),
+            "path" => filters.path_prefix = Some(value.to_owned()),
+            _ => kept.push(token),
+        }
+    }
+    (kept.join(" "), filters)
 }
 
 const fn default_limit() -> usize {

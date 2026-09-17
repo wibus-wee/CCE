@@ -102,11 +102,18 @@ Implemented (single-repo scope):
 in-process). `cce index --no-providers` / `CCE_NO_PROVIDERS` skips the
 provider phase.
 
+| `POST /v1/grep` | worktree regex honoring ignore + sensitive-file policy; always fresh, `freshness: "worktree"` |
+
+Query filters: `lang:`/`path:` tokens in any search query parse into
+`SearchRequest.filters` (or are set directly by API callers); lexical
+pushes them into the FTS join, other routes filter post-fusion. The FTS
+`name` column stores identifier split/fold forms so camelCase, snake_case,
+and folded spellings converge.
+
 Planned next:
 
 | endpoint | backing |
 |---|---|
-| `POST /v1/grep` | worktree regex honoring ignore + sensitive-file policy; always fresh, marked unverified vs the snapshot |
 | `GET /v1/jobs` | in-flight and last index/provider job for this repo |
 
 ## Hub (central service — later)

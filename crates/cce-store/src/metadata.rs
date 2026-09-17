@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -536,7 +537,7 @@ impl MetadataStore {
                         snapshot.id,
                         document.entity_id,
                         indexed.path,
-                        indexed.name,
+                        identifier_fts_forms(&indexed.name),
                         document.terms.join(" "),
                         indexed.body,
                     ],
@@ -882,13 +883,9 @@ impl MetadataStore {
         })
     }
 
-    /// FTS5 retrieval over the snapshot's documents. Runs a strictness
-    /// cascade — all terms exact, then all terms as prefixes, then prefix
-    /// pairs — so AND-matched documents always rank ahead of fallbacks, and
-    /// a fallback hit must cover at least two distinct query terms to count
-    /// as evidence. Results are deduplicated by document id and capped at
-    /// `limit`.
     /// FTS5 query with code-switching cascade (see `fts_match_queries`).
+    /// `filters` pushes `path:`/`lang:` constraints into the SQL join so
+    /// `limit` is honored against the filtered set rather than post-trimmed.
     ///
     /// # Errors
     /// Storage error on query failure.
@@ -897,25 +894,37 @@ impl MetadataStore {
         snapshot_id: &str,
         query: &str,
         limit: usize,
+        filters: &cce_core::QueryFilters,
     ) -> Result<Vec<LexicalHit>> {
         let terms = fts_terms(query);
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let connection = self.connection.lock();
-        let mut statement = connection
-            .prepare(
-                "SELECT f.document_id, f.entity_id, d.region_id, e.name, d.representation,
+        let mut sql = "SELECT f.document_id, f.entity_id, d.region_id, e.name, d.representation,
                  d.address_json, d.evidence_json,
                  bm25(documents_fts, 0.0, 0.0, 0.0, 3.0, 5.0, 2.0, 1.0) AS rank,
                  snippet(documents_fts, 6, '<mark>', '</mark>', ' … ', 24)
                  FROM documents_fts f JOIN retrieval_documents d
                  ON d.snapshot_id=f.snapshot_id AND d.id=f.document_id
                  JOIN entities e ON e.snapshot_id=f.snapshot_id AND e.id=f.entity_id
-                 WHERE documents_fts MATCH ?1 AND f.snapshot_id=?2
-                 ORDER BY rank LIMIT ?3",
-            )
-            .map_err(storage_error)?;
+                 WHERE documents_fts MATCH ?1 AND f.snapshot_id=?2"
+            .to_owned();
+        let mut filter_params: Vec<String> = Vec::new();
+        if let Some(prefix) = filters.path_prefix.as_ref() {
+            filter_params.push(format!("{}%", like_escape(prefix)));
+            let _ = write!(
+                sql,
+                " AND f.path LIKE ?{} ESCAPE '\\'",
+                2 + filter_params.len()
+            );
+        }
+        if let Some(language) = filters.language.as_ref() {
+            filter_params.push(language.clone());
+            let _ = write!(sql, " AND lower(e.language) = ?{}", 2 + filter_params.len());
+        }
+        let _ = write!(sql, " ORDER BY rank LIMIT ?{}", 3 + filter_params.len());
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(&sql).map_err(storage_error)?;
         let mut hits = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut position = 0_usize;
@@ -923,23 +932,29 @@ impl MetadataStore {
             if hits.len() >= limit {
                 break;
             }
+            let limit_i64 = usize_to_i64(limit)?;
+            let mut bound: Vec<Box<dyn rusqlite::types::ToSql>> =
+                vec![Box::new(match_query), Box::new(snapshot_id.to_owned())];
+            bound.extend(
+                filter_params
+                    .iter()
+                    .map(|value| -> Box<dyn rusqlite::types::ToSql> { Box::new(value.clone()) }),
+            );
+            bound.push(Box::new(limit_i64));
             let rows = statement
-                .query_map(
-                    params![match_query, snapshot_id, usize_to_i64(limit)?],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, Option<String>>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, f64>(7)?,
-                            row.get::<_, String>(8)?,
-                        ))
-                    },
-                )
+                .query_map(rusqlite::params_from_iter(bound.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, f64>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })
                 .map_err(storage_error)?;
             for row in rows {
                 let (
@@ -1600,6 +1615,31 @@ fn fts_match_queries(terms: &[String]) -> Vec<String> {
         );
     }
     queries
+}
+
+/// Escapes `LIKE` metacharacters so `path:` filters stay literal prefixes
+/// under `ESCAPE '\'`.
+fn like_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// Expands an identifier for the FTS `name` column: raw spelling plus its
+/// split-word and folded forms, so `set view status`, `setViewStatus`,
+/// `setviewstatus`, and `set_view_status` all reach the same name.
+fn identifier_fts_forms(name: &str) -> String {
+    let mut forms = name.to_owned();
+    let splits = cce_core::split_identifier_terms(name);
+    if !splits.is_empty() {
+        let _ = write!(forms, " {}", splits.join(" "));
+    }
+    let folded = cce_core::folded_identifier(name);
+    if folded != name.to_ascii_lowercase() {
+        let _ = write!(forms, " {folded}");
+    }
+    forms
 }
 
 fn is_query_stopword(token: &str) -> bool {

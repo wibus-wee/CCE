@@ -192,6 +192,7 @@ async fn call_tool(engine: &CceEngine, params: &Value) -> Result<Value, (i32, St
                         limit,
                         require_fresh: true,
                         routes: Vec::new(),
+                        filters: cce_core::QueryFilters::default(),
                     })
                     .await
                     .map_err(tool_error)?,
@@ -225,6 +226,7 @@ async fn call_tool(engine: &CceEngine, params: &Value) -> Result<Value, (i32, St
                             .clamp(1, 200),
                         require_fresh: true,
                         routes: Vec::new(),
+                        filters: cce_core::QueryFilters::default(),
                     })
                     .await
                     .map_err(tool_error)?,

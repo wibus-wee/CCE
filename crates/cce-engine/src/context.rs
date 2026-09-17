@@ -186,6 +186,7 @@ impl CceEngine {
                 limit: request.max_candidates,
                 require_fresh: request.require_fresh,
                 routes: request.routes,
+                filters: cce_core::QueryFilters::default(),
             })
             .await?;
         let mut pack = ContextPacker::new().pack(&search, request.budget_tokens);

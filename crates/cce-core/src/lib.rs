@@ -22,11 +22,11 @@ pub use manifest::{Capability, ViewKind, ViewManifest, ViewState, ViewStatus};
 pub use region::{CodeRegion, RegionKind};
 pub use relation::{Relation, RelationKind, RelationOrigin};
 pub use retrieval::{
-    GraphPolicy, QueryIntent, RetrievalDocument, RetrievalRepresentation, SearchHit, SearchRequest,
-    SearchRoute,
+    GraphPolicy, QueryFilters, QueryIntent, RetrievalDocument, RetrievalRepresentation, SearchHit,
+    SearchRequest, SearchRoute, parse_query_filters,
 };
 pub use snapshot::{IndexProfile, RepositoryIdentity, SnapshotIdentity};
-pub use text::has_cjk;
+pub use text::{folded_identifier, has_cjk, split_identifier_terms};
 
 /// On-disk data format version; bumped when the metadata/artifact layout
 /// changes incompatibly.

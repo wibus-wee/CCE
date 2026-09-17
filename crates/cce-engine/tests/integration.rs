@@ -45,6 +45,7 @@ fn search_request(query: &str, require_fresh: bool) -> SearchRequest {
         limit: 10,
         require_fresh,
         routes: Vec::new(),
+        filters: cce_core::QueryFilters::default(),
     }
 }
 
@@ -537,4 +538,151 @@ async fn atlas_on_unindexed_repository_is_an_explicit_error() {
             "expected ViewUnavailable, got {error:?}"
         );
     }
+}
+
+/// `lang:`/`path:` tokens become structured filters applied conjunctively
+/// across routes, and the expanded FTS name forms let camelCase or folded
+/// spellings reach `snake_case` identifiers.
+#[tokio::test]
+async fn query_filters_and_identifier_forms() {
+    let repo = workspace_fixture();
+    write(repo.path(), "docs/notes.md", "beta_fn is mentioned here\n");
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // Folded spelling reaches the snake_case entity name.
+    let folded = engine
+        .search(search_request("betafn", true))
+        .await
+        .expect("folded search");
+    assert!(
+        folded
+            .hits
+            .iter()
+            .any(|hit| hit.symbol_name.as_deref() == Some("beta_fn")),
+        "folded query must reach beta_fn, got {:?}",
+        folded
+            .hits
+            .iter()
+            .map(|hit| hit.symbol_name.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // camelCase spelling likewise.
+    let camel = engine
+        .search(search_request("betaFn", true))
+        .await
+        .expect("camel search");
+    assert!(
+        camel
+            .hits
+            .iter()
+            .any(|hit| hit.symbol_name.as_deref() == Some("beta_fn")),
+        "camelCase query must reach beta_fn"
+    );
+
+    // path: confines every hit to the prefix — alpha's lib.rs legitimately
+    // matches "beta_fn" because it calls the function.
+    let confined = engine
+        .search(search_request("beta_fn path:crates/alpha", true))
+        .await
+        .expect("path-filtered search");
+    assert!(
+        confined.hits.iter().all(|hit| hit
+            .address
+            .as_ref()
+            .is_some_and(|address| { address.path.starts_with("crates/alpha") })),
+        "path:crates/alpha must confine hits, got {:?}",
+        confined
+            .hits
+            .iter()
+            .map(|hit| hit.address.as_ref().map(|address| address.path.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        confined
+            .hits
+            .iter()
+            .all(|hit| hit.symbol_name.as_deref() != Some("beta_fn")),
+        "the beta_fn definition lives in the beta crate"
+    );
+    assert_eq!(
+        confined.request.filters.path_prefix.as_deref(),
+        Some("crates/alpha")
+    );
+    assert_eq!(confined.request.query, "beta_fn");
+
+    let included = engine
+        .search(search_request("beta_fn path:crates/beta", true))
+        .await
+        .expect("path-filtered search");
+    assert!(
+        included
+            .hits
+            .iter()
+            .any(|hit| hit.symbol_name.as_deref() == Some("beta_fn"))
+    );
+
+    // lang: filters on the entity's detected language.
+    let rust_only = engine
+        .search(search_request("beta_fn lang:rust", true))
+        .await
+        .expect("lang-filtered search");
+    assert!(!rust_only.hits.is_empty());
+    let python_only = engine
+        .search(search_request("beta_fn lang:python", true))
+        .await
+        .expect("lang-filtered search");
+    assert!(python_only.hits.is_empty());
+}
+
+/// Worktree grep never touches the snapshot or the sensitive-file policy:
+/// `.env` content must not come back even when it matches the pattern.
+#[tokio::test]
+async fn worktree_grep_is_fresh_and_policy_aware() {
+    let repo = fixture_repo();
+    write(repo.path(), ".env", "CCE_GREP_SECRET=do-not-return\n");
+    write(repo.path(), "src/extra.rs", "fn marked_target() {}\n");
+    let engine = engine(repo.path());
+
+    let report = engine
+        .grep(&cce_engine::GrepRequest {
+            pattern: "marked_target|CCE_GREP_SECRET".to_owned(),
+            filters: cce_core::QueryFilters::default(),
+            limit: 50,
+            ignore_case: false,
+        })
+        .expect("grep");
+    assert!(
+        report
+            .matches
+            .iter()
+            .any(|hit| hit.path == "src/extra.rs" && hit.line == 1)
+    );
+    assert!(
+        report.matches.iter().all(|hit| hit.path != ".env"),
+        "sensitive files must never produce grep hits: {:?}",
+        report.matches
+    );
+    assert_eq!(report.freshness, "worktree");
+
+    // path: filter equivalent.
+    let filtered = engine
+        .grep(&cce_engine::GrepRequest {
+            pattern: "resume_attempt".to_owned(),
+            filters: cce_core::QueryFilters {
+                path_prefix: Some("src/".to_owned()),
+                language: None,
+            },
+            limit: 50,
+            ignore_case: false,
+        })
+        .expect("filtered grep");
+    assert!(
+        filtered
+            .matches
+            .iter()
+            .all(|hit| hit.path.starts_with("src/"))
+    );
+    assert!(!filtered.matches.is_empty());
 }

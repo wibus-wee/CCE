@@ -77,10 +77,37 @@ struct SearchInput {
     /// Route pins for ablation-style queries; empty follows the planner.
     #[serde(default)]
     routes: Vec<SearchRoute>,
+    /// Structured `lang:`/`path:` filters; when unset the daemon parses
+    /// them out of the query text like the CLI does.
+    #[serde(default)]
+    filters: cce_core::QueryFilters,
 }
 
 const fn default_search_limit() -> usize {
     20
+}
+
+/// `POST /v1/grep` request: a worktree regex, not an index query.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GrepInput {
+    /// Rust regex pattern.
+    pattern: String,
+    /// Optional path-prefix filter.
+    #[serde(default)]
+    path_prefix: Option<String>,
+    /// Optional language filter.
+    #[serde(default)]
+    language: Option<String>,
+    /// ASCII case-insensitive matching.
+    #[serde(default)]
+    ignore_case: bool,
+    #[serde(default = "default_grep_limit")]
+    limit: usize,
+}
+
+const fn default_grep_limit() -> usize {
+    cce_engine::DEFAULT_GREP_LIMIT
 }
 
 #[derive(Debug, Serialize)]
@@ -168,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/def/{name}", get(definitions))
         .route("/v1/refs/{name}", get(references))
         .route("/v1/providers", get(providers))
+        .route("/v1/grep", post(grep))
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
         .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
@@ -217,6 +245,7 @@ async fn search(
                 limit: input.limit.clamp(1, 200),
                 require_fresh: true,
                 routes: input.routes,
+                filters: input.filters,
             })
             .await?,
     ))
@@ -269,6 +298,21 @@ async fn providers(
     State(engine): State<Arc<CceEngine>>,
 ) -> Result<Json<Vec<cce_engine::ProviderReport>>, ApiError> {
     Ok(Json(engine.providers()))
+}
+
+async fn grep(
+    State(engine): State<Arc<CceEngine>>,
+    Json(input): Json<GrepInput>,
+) -> Result<Json<cce_engine::GrepReport>, ApiError> {
+    Ok(Json(engine.grep(&cce_engine::GrepRequest {
+        pattern: input.pattern,
+        filters: cce_core::QueryFilters {
+            path_prefix: input.path_prefix,
+            language: input.language.map(|value| value.to_lowercase()),
+        },
+        limit: input.limit.clamp(1, 5_000),
+        ignore_case: input.ignore_case,
+    })?))
 }
 
 async fn shutdown_signal() {

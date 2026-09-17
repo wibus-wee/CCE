@@ -7,6 +7,7 @@ mod config;
 mod context;
 mod dense;
 mod engine;
+mod grep;
 mod history;
 mod ignore;
 mod landmarks;
@@ -33,6 +34,7 @@ pub use config::{
 pub use context::{ContextPacker, ContextRequest};
 pub use dense::{DenseIndex, DenseSearchHit, EmbedRole, Embedder, EmbeddingBackend, LocalEmbedder};
 pub use engine::{CceEngine, IndexReport};
+pub use grep::{DEFAULT_GREP_LIMIT, GrepHit, GrepReport, GrepRequest};
 pub use parser::{ParsedFile, ParsedUnit, SourceParser};
 pub use planner::{QueryPlan, QueryPlanner};
 pub use providers::{ProviderReport, ProviderState};

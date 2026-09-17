@@ -108,6 +108,23 @@ enum Command {
     Def { repository: PathBuf, name: String },
     /// Inbound references/calls/implementations for a symbol, origin-tagged.
     Refs { repository: PathBuf, name: String },
+    /// Brute-force regex over the live worktree — always fresh, never reads
+    /// the snapshot. Honors ignore rules and the sensitive-file policy.
+    Grep {
+        repository: PathBuf,
+        pattern: String,
+        /// Path-prefix filter (`path:` equivalent).
+        #[arg(long)]
+        path: Option<String>,
+        /// Language filter (`lang:` equivalent).
+        #[arg(long)]
+        lang: Option<String>,
+        /// ASCII case-insensitive matching.
+        #[arg(long, short = 'i')]
+        ignore_case: bool,
+        #[arg(long, default_value_t = cce_engine::DEFAULT_GREP_LIMIT)]
+        limit: usize,
+    },
     /// Probe external code-intelligence providers (SCIP toolchains).
     Providers {
         #[arg(default_value = ".")]
@@ -258,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
                     limit: *limit,
                     require_fresh: true,
                     routes: routes.iter().map(|route| (*route).into()).collect(),
+                    filters: cce_core::QueryFilters::default(),
                 })
                 .await?;
             print_value(&result)?;
@@ -301,6 +319,36 @@ async fn main() -> anyhow::Result<()> {
         Command::Refs { repository, name } => {
             let engine = engine(&arguments, repository)?;
             print_value(&engine.references(name)?)?;
+        }
+        Command::Grep {
+            repository,
+            pattern,
+            path,
+            lang,
+            ignore_case,
+            limit,
+        } => {
+            let engine = engine(&arguments, repository)?;
+            let request = cce_engine::GrepRequest {
+                pattern: pattern.clone(),
+                filters: cce_core::QueryFilters {
+                    path_prefix: path.clone(),
+                    language: lang.clone().map(|value| value.to_lowercase()),
+                },
+                limit: *limit,
+                ignore_case: *ignore_case,
+            };
+            let report = engine.grep(&request)?;
+            if arguments.json {
+                print_value(&report)?;
+            } else {
+                for hit in &report.matches {
+                    println!("{}:{}:{}: {}", hit.path, hit.line, hit.column, hit.text);
+                }
+                if report.truncated {
+                    eprintln!("… truncated at {} matches", report.matches.len());
+                }
+            }
         }
         Command::Providers { repository } => {
             let engine = engine(&arguments, repository)?;

@@ -148,6 +148,13 @@ impl EngineConfig {
     #[must_use]
     pub fn profile(&self) -> IndexProfile {
         let mut options = std::collections::BTreeMap::new();
+        // Bumping this forces fresh snapshots when the FTS document
+        // materialization changes (e.g. identifier split/fold forms in the
+        // name column) without a config change on the user's side.
+        options.insert(
+            "lexical_tokenizer".to_owned(),
+            "identifier-forms-v1".to_owned(),
+        );
         options.insert(
             "max_file_bytes".to_owned(),
             self.index.max_file_bytes.to_string(),
