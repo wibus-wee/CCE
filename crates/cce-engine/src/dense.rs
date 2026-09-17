@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -288,6 +289,12 @@ pub struct DenseIndex {
 impl DenseIndex {
     /// Embed all documents and build the index.
     ///
+    /// `reusable` maps a document-text digest to an already-computed vector
+    /// (typically decoded from the previous snapshot's dense artifact).
+    /// Documents whose text hash hits reuse their vector verbatim — same
+    /// text under the same model yields the same embedding — so a worktree
+    /// edit only pays the embedder for documents that actually changed.
+    ///
     /// # Errors
     /// `Embedding` on model failure or inconsistent dimensions;
     /// `Configuration` when `batch_size` is 0.
@@ -295,6 +302,7 @@ impl DenseIndex {
         documents: &[DocumentContent],
         embedder: &impl Embedder,
         batch_size: usize,
+        reusable: Option<&HashMap<String, Vec<f32>>>,
     ) -> Result<Self> {
         if batch_size == 0 {
             return Err(CceError::Configuration(
@@ -302,32 +310,55 @@ impl DenseIndex {
             ));
         }
         let mut ids = Vec::with_capacity(documents.len());
-        let mut vectors = Vec::new();
-        let mut dimensions = None;
-        for batch in documents.chunks(batch_size) {
+        let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(documents.len());
+        let mut pending = Vec::new();
+        for (position, document) in documents.iter().enumerate() {
+            let reused = reusable.and_then(|map| map.get(&text_digest(&document.text)));
+            if let Some(vector) = reused {
+                vectors.push(Some(vector.clone()));
+            } else {
+                vectors.push(None);
+                pending.push((position, document.text.clone()));
+            }
+            ids.push(document.document_id.clone());
+        }
+        for batch in pending.chunks(batch_size) {
             let inputs = batch
                 .iter()
-                .map(|document| document.text.clone())
+                .map(|(_, text)| text.clone())
                 .collect::<Vec<_>>();
             let mut embedded = embedder.embed(&inputs, EmbedRole::Document).await?;
             validate_and_normalize(&mut embedded)?;
-            for (document, vector) in batch.iter().zip(embedded) {
-                let expected = *dimensions.get_or_insert(vector.len());
-                if vector.len() != expected {
-                    return Err(CceError::Embedding(
-                        "embedding dimensions changed within an index".to_owned(),
-                    ));
+            for (&(position, _), vector) in batch.iter().zip(embedded) {
+                if let Some(slot) = vectors.get_mut(position) {
+                    *slot = Some(vector);
                 }
-                ids.push(document.document_id.clone());
-                vectors.extend(vector);
             }
+        }
+        let mut dimensions = None;
+        let mut flat = Vec::new();
+        for vector in vectors.into_iter().flatten() {
+            let expected = *dimensions.get_or_insert(vector.len());
+            if vector.len() != expected {
+                return Err(CceError::Embedding(
+                    "embedding dimensions changed within an index".to_owned(),
+                ));
+            }
+            flat.extend(vector);
         }
         Ok(Self {
             profile: embedder.profile().to_owned(),
             dimensions: dimensions.unwrap_or_default(),
             ids,
-            vectors,
+            vectors: flat,
         })
+    }
+
+    /// Decompose into aligned `(document_id, vector)` pairs plus the index
+    /// profile — the decode side of incremental reuse.
+    #[must_use]
+    pub fn into_parts(self) -> (String, Vec<String>, Vec<f32>, usize) {
+        (self.profile, self.ids, self.vectors, self.dimensions)
     }
 
     /// Brute-force top-`limit` search; `embedder` profile must match the
@@ -548,6 +579,13 @@ fn tokens(value: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_ascii_lowercase)
 }
 
+/// Content digest used as the vector-reuse key: identical text under the
+/// same model produces the same embedding, so reuse is keyed on what the
+/// model actually sees rather than positional document ids.
+pub(crate) fn text_digest(text: &str) -> String {
+    blake3::hash(text.as_bytes()).to_hex().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,7 +613,7 @@ mod tests {
                 text: "unrelated CSS styles".to_owned(),
             },
         ];
-        let index = DenseIndex::build(&documents, &embedder, 8)
+        let index = DenseIndex::build(&documents, &embedder, 8, None)
             .await
             .expect("index");
         let decoded = DenseIndex::decode(&index.encode().expect("encode")).expect("decode");
@@ -584,5 +622,89 @@ mod tests {
             .await
             .expect("search");
         assert_eq!(hits[0].document_id, "a");
+    }
+
+    struct CountingEmbedder {
+        inner: DeterministicEmbedder,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Embedder for CountingEmbedder {
+        fn profile(&self) -> &str {
+            self.inner.profile()
+        }
+        fn production_ready(&self) -> bool {
+            false
+        }
+        async fn embed(&self, inputs: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>> {
+            self.calls
+                .fetch_add(inputs.len(), std::sync::atomic::Ordering::SeqCst);
+            self.inner.embed(inputs, role).await
+        }
+    }
+
+    fn document(id: &str, text: &str) -> DocumentContent {
+        DocumentContent {
+            document_id: id.to_owned(),
+            entity_id: format!("e{id}"),
+            region_id: None,
+            representation: cce_core::RetrievalRepresentation::RawCode,
+            address: None,
+            evidence: Vec::new(),
+            text: text.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_reuses_vectors_for_unchanged_text() {
+        let embedder = CountingEmbedder {
+            inner: DeterministicEmbedder::new(64).expect("embedder"),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let prior = vec![
+            document("a", "resume cursor persistence"),
+            document("b", "unrelated CSS styles"),
+        ];
+        let prior_index = DenseIndex::build(&prior, &embedder, 8, None)
+            .await
+            .expect("prior index");
+        assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // The prior snapshot's artifacts decouple into a text-digest →
+        // vector map; document ids may differ as long as text is identical.
+        let (profile, ids, vectors, dimensions) = prior_index.into_parts();
+        let mut reusable = HashMap::new();
+        for (position, id) in ids.iter().enumerate() {
+            let text = prior
+                .iter()
+                .find(|document| &document.document_id == id)
+                .expect("prior document");
+            let start = position * dimensions;
+            reusable.insert(
+                text_digest(&text.text),
+                vectors[start..start + dimensions].to_vec(),
+            );
+        }
+        assert_eq!(profile, embedder.profile());
+
+        let next = vec![
+            document("a", "resume cursor persistence"), // unchanged text
+            document("b2", "edited CSS styles now"),    // changed text
+        ];
+        embedder.calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let next_index = DenseIndex::build(&next, &embedder, 8, Some(&reusable))
+            .await
+            .expect("incremental index");
+        assert_eq!(
+            embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the changed document should pay the embedder"
+        );
+        // Reused vectors must rank identically to a fresh full embed.
+        let fresh = DenseIndex::build(&next, &embedder, 8, None)
+            .await
+            .expect("fresh index");
+        assert_eq!(next_index, fresh);
     }
 }

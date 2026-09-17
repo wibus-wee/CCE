@@ -216,8 +216,10 @@ class Adapter:
         if session not in SESSION_MODES:
             raise ValueError(f"{path}: session must be one of {SESSION_MODES}, got {session!r}")
         dense = raw.get("dense")
-        if dense is not None and dense not in ("baseline", "local"):
-            raise ValueError(f"{path}: dense must be 'baseline' or 'local', got {dense!r}")
+        if dense is not None and dense not in ("baseline", "local", "disabled"):
+            raise ValueError(
+                f"{path}: dense must be 'baseline', 'local', or 'disabled', got {dense!r}"
+            )
         embedding_model = raw.get("embedding_model")
         embedding_dimensions = (
             int(raw["embedding_dimensions"]) if "embedding_dimensions" in raw else None

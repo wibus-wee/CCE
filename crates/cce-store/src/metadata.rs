@@ -633,6 +633,36 @@ impl MetadataStore {
             .map_err(storage_error)
     }
 
+    /// The most recent *other* completed snapshot under the same index
+    /// profile that produced a dense artifact — the incremental-embedding
+    /// reuse source. Returns `(snapshot_id, artifact_digest)`.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn prior_dense_artifact(
+        &self,
+        repository_id: &str,
+        exclude_snapshot_id: &str,
+        profile_hash: &str,
+    ) -> Result<Option<(String, String)>> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT s.id, v.artifact_digest
+                 FROM snapshots s
+                 JOIN view_status v
+                   ON v.snapshot_id = s.id AND v.repository_id = s.repository_id
+                 WHERE s.repository_id = ?1 AND s.id != ?2 AND s.complete = 1
+                   AND s.index_profile_hash = ?3
+                   AND v.view_kind = '\"dense\"' AND v.artifact_digest IS NOT NULL
+                 ORDER BY s.created_at DESC LIMIT 1",
+                params![repository_id, exclude_snapshot_id, profile_hash],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)
+    }
+
     /// Look up a cached per-file analysis artifact digest for reuse.
     ///
     /// # Errors

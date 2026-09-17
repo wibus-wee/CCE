@@ -18,7 +18,10 @@ struct Arguments {
     data_dir: Option<PathBuf>,
     #[arg(long, global = true)]
     json: bool,
-    #[arg(long, global = true, value_enum, default_value_t = DenseMode::Disabled)]
+    /// Dense embedding backend. `local` (default) runs the local ONNX
+    /// embedder — the first index downloads the model once (see `cce
+    /// models`); `disabled` keeps indexing/querying fully offline.
+    #[arg(long, global = true, value_enum, env = "CCE_DENSE", default_value_t = DenseMode::Local)]
     dense: DenseMode,
     /// Local embedding model code (see `cce models`), used with --dense local.
     #[arg(long, global = true, env = "CCE_EMBEDDING_MODEL")]

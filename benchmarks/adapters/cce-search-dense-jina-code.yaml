@@ -11,7 +11,7 @@ command:
   - "{route_args}"
   - --limit
   - "50"
-timeout_seconds: 120
+timeout_seconds: 360
 model_revision: none
 dense: local
 embedding_model: jinaai/jina-embeddings-v2-base-code

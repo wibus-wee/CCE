@@ -16,7 +16,7 @@ CCE is a local-first, Agent-agnostic repository intelligence runtime. It is not 
 - Deterministic facts, framework-derived relations, and model inference must remain distinguishable.
 - A stale or unavailable view is reported explicitly; never silently fall back and claim the requested capability.
 - Retrieval, selection, packing, and downstream generation are separate evaluation stages.
-- Keep network access opt-in. Indexing and lexical/structural querying must work offline.
+- Keep network access minimal and disclosed. Dense local embeddings are the frontend default (`--dense local`); the first index downloads the ONNX model once into `<data>/models/`. `--dense disabled` / `CCE_DENSE=disabled` is the offline switch — indexing and lexical/structural querying must keep working with no network and no cached model (mark the dense view `Failed`/`Unavailable` with a reason, never hard-fail).
 
 ## Quality gates
 

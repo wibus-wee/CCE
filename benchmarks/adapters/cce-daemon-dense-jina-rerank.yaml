@@ -12,7 +12,7 @@ command:
   - "{route_args}"
   - --budget
   - "{budget}"
-timeout_seconds: 240
+timeout_seconds: 360
 model_revision: none
 dense: local
 embedding_model: jinaai/jina-embeddings-v2-base-code

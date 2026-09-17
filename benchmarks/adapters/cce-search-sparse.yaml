@@ -1,6 +1,6 @@
-name: cce-search
-# Retrieval stage only: raw SearchResult hits instead of the packed context.
-# Use this adapter to score retrieval without the packing stage masking it.
+name: cce-search-sparse
+# Sparse control arm: pins `--dense disabled` so lexical/structural-only
+# retrieval stays measurable after dense became the product default.
 command:
   - target/release/cce
   - --json
@@ -14,5 +14,6 @@ command:
 timeout_seconds: 360
 model_identity: none
 model_revision: none
+dense: disabled
 environment:
   CCE_DATA_DIR: .cce-benchmark

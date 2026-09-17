@@ -137,6 +137,176 @@ impl CceEngine {
         }
     }
 
+    /// Build (or rebuild) the dense view for a committed snapshot and record
+    /// its outcome in the manifest. Best-effort by contract: a backend that
+    /// fails to initialize or a build that fails marks the view `Failed`
+    /// with its reason but never fails the index — lexical/structural views
+    /// still stand. Called both from the main index path and from the
+    /// early-return repair path that heals snapshots interrupted mid-build.
+    async fn build_dense_view(
+        &self,
+        repository_id: &str,
+        snapshot: &SnapshotIdentity,
+    ) -> Result<()> {
+        let embedder = match self.embedder().await {
+            Ok(embedder) => embedder,
+            Err(error) => {
+                self.store.set_view_status(
+                    repository_id,
+                    &snapshot.id,
+                    ViewKind::Dense,
+                    &status(
+                        snapshot,
+                        ViewState::Failed,
+                        vec![],
+                        Some(format!("embedding backend init failed: {error}")),
+                    ),
+                )?;
+                return Ok(());
+            }
+        };
+        let Some(embedder) = embedder else {
+            self.store.set_view_status(
+                repository_id,
+                &snapshot.id,
+                ViewKind::Dense,
+                &status(
+                    snapshot,
+                    ViewState::Unavailable,
+                    vec![],
+                    Some(
+                        "No embedding backend selected; lexical and structural views remain available"
+                            .to_owned(),
+                    ),
+                ),
+            )?;
+            return Ok(());
+        };
+        self.store.set_view_status(
+            repository_id,
+            &snapshot.id,
+            ViewKind::Dense,
+            &status(
+                snapshot,
+                ViewState::Building,
+                vec![Capability {
+                    name: "flat_inner_product".to_owned(),
+                    level: "building".to_owned(),
+                    reason: None,
+                }],
+                None,
+            ),
+        )?;
+        let batch_size = match &self.config.dense {
+            DenseBackendConfig::Local { .. } => 32,
+            DenseBackendConfig::DeterministicBaseline { .. } | DenseBackendConfig::Disabled => 64,
+        };
+        let dense_result: Result<ArtifactRecord> = async {
+            let documents = self.store.documents_for_snapshot(&snapshot.id)?;
+            let reusable = self.dense_reuse_map(repository_id, snapshot, &embedder)?;
+            let index =
+                DenseIndex::build(&documents, &embedder, batch_size, reusable.as_ref()).await?;
+            let artifact = self
+                .store
+                .artifacts()
+                .put_bytes(ArtifactKind::VectorIndex, &index.encode()?)?;
+            self.store.register_artifact(&artifact)?;
+            Ok(artifact)
+        }
+        .await;
+        match dense_result {
+            Ok(artifact) => {
+                let mut dense_status = status(
+                    snapshot,
+                    if embedder.production_ready() {
+                        ViewState::Ready
+                    } else {
+                        ViewState::Partial
+                    },
+                    vec![Capability {
+                        name: "flat_inner_product".to_owned(),
+                        level: if embedder.production_ready() {
+                            "production".to_owned()
+                        } else {
+                            "benchmark_only".to_owned()
+                        },
+                        reason: (!embedder.production_ready()).then(|| {
+                            "deterministic hash embeddings are a reproducible baseline, not semantic production retrieval"
+                                .to_owned()
+                        }),
+                    }],
+                    None,
+                );
+                dense_status.artifact_digest = Some(artifact.digest);
+                self.store.set_view_status(
+                    repository_id,
+                    &snapshot.id,
+                    ViewKind::Dense,
+                    &dense_status,
+                )?;
+            }
+            Err(error) => {
+                self.store.set_view_status(
+                    repository_id,
+                    &snapshot.id,
+                    ViewKind::Dense,
+                    &status(snapshot, ViewState::Failed, vec![], Some(error.to_string())),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Vectors reusable for `snapshot`'s dense build, keyed by document-text
+    /// digest. Decodes the newest completed snapshot under the same index
+    /// profile and joins its vectors with that snapshot's document texts —
+    /// unchanged text reuses its embedding verbatim, so a worktree edit only
+    /// pays the model for documents that actually changed. `None` on a cold
+    /// start, a profile/model change, or a prior build without an artifact.
+    fn dense_reuse_map(
+        &self,
+        repository_id: &str,
+        snapshot: &SnapshotIdentity,
+        embedder: &EmbeddingBackend,
+    ) -> Result<Option<HashMap<String, Vec<f32>>>> {
+        let Some((prior_snapshot, digest)) = self.store.prior_dense_artifact(
+            repository_id,
+            &snapshot.id,
+            &snapshot.index_profile_hash,
+        )?
+        else {
+            return Ok(None);
+        };
+        let bytes = self.store.artifacts().read(&digest)?;
+        let (profile, ids, vectors, dimensions) = DenseIndex::decode(&bytes)?.into_parts();
+        if profile != embedder.profile() || dimensions == 0 {
+            return Ok(None);
+        }
+        let text_keys: HashMap<String, String> = self
+            .store
+            .documents_for_snapshot(&prior_snapshot)?
+            .into_iter()
+            .map(|document| {
+                (
+                    document.document_id,
+                    crate::dense::text_digest(&document.text),
+                )
+            })
+            .collect();
+        let mut reusable = HashMap::with_capacity(ids.len());
+        for (position, id) in ids.iter().enumerate() {
+            let Some(key) = text_keys.get(id) else {
+                continue;
+            };
+            let start = position * dimensions;
+            let Some(slice) = vectors.get(start..start + dimensions) else {
+                continue;
+            };
+            reusable.insert(key.clone(), slice.to_vec());
+        }
+        Ok(Some(reusable))
+    }
+
     /// The underlying metadata store.
     #[must_use]
     pub const fn store(&self) -> &MetadataStore {
@@ -210,9 +380,28 @@ impl CceEngine {
         let scanned = RepositoryScanner::new(self.config.clone()).scan(Some(&self.store))?;
         self.store.register_repository(&scanned.identity)?;
         if self.store.snapshot_is_complete(&scanned.snapshot.id)? {
-            let manifest = self
+            let mut manifest = self
                 .store
                 .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
+            // A snapshot is marked complete when its records transaction
+            // commits — the dense build runs after that, so an interrupted
+            // index leaves `Building` (or a transient `Failed`) committed in
+            // the manifest while the early return above would skip the
+            // rebuild forever. Repair in place: the documents the dense
+            // build needs are already committed.
+            let dense_needs_repair =
+                matches!(
+                    manifest.views.get(&ViewKind::Dense).map(|view| view.state),
+                    Some(ViewState::Building | ViewState::Failed)
+                ) && !matches!(self.config.dense, DenseBackendConfig::Disabled);
+            if dense_needs_repair {
+                let _lease = crate::lock::IndexLease::acquire(&self.config.data_root)?;
+                self.build_dense_view(&scanned.identity.id, &scanned.snapshot)
+                    .await?;
+                manifest = self
+                    .store
+                    .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
+            }
             return Ok(IndexReport {
                 repository_id: scanned.identity.id,
                 snapshot: scanned.snapshot,
@@ -925,101 +1114,8 @@ impl CceEngine {
             ViewKind::Graph,
             &graph_status,
         )?;
-        if let Some(embedder) = self.embedder().await? {
-            self.store.set_view_status(
-                &scanned.identity.id,
-                &scanned.snapshot.id,
-                ViewKind::Dense,
-                &status(
-                    &scanned.snapshot,
-                    ViewState::Building,
-                    vec![Capability {
-                        name: "flat_inner_product".to_owned(),
-                        level: "building".to_owned(),
-                        reason: None,
-                    }],
-                    None,
-                ),
-            )?;
-            let batch_size = match &self.config.dense {
-                DenseBackendConfig::Local { .. } => 32,
-                DenseBackendConfig::DeterministicBaseline { .. } | DenseBackendConfig::Disabled => {
-                    64
-                }
-            };
-            let dense_result: Result<ArtifactRecord> = async {
-                let documents = self.store.documents_for_snapshot(&scanned.snapshot.id)?;
-                let index = DenseIndex::build(&documents, &embedder, batch_size).await?;
-                let artifact = self
-                    .store
-                    .artifacts()
-                    .put_bytes(ArtifactKind::VectorIndex, &index.encode()?)?;
-                self.store.register_artifact(&artifact)?;
-                Ok(artifact)
-            }
-            .await;
-            match dense_result {
-                Ok(artifact) => {
-                    let mut dense_status = status(
-                        &scanned.snapshot,
-                        if embedder.production_ready() {
-                            ViewState::Ready
-                        } else {
-                            ViewState::Partial
-                        },
-                        vec![Capability {
-                            name: "flat_inner_product".to_owned(),
-                            level: if embedder.production_ready() {
-                                "production".to_owned()
-                            } else {
-                                "benchmark_only".to_owned()
-                            },
-                            reason: (!embedder.production_ready()).then(|| {
-                                "deterministic hash embeddings are a reproducible baseline, not semantic production retrieval"
-                                    .to_owned()
-                            }),
-                        }],
-                        None,
-                    );
-                    dense_status.artifact_digest = Some(artifact.digest);
-                    self.store.set_view_status(
-                        &scanned.identity.id,
-                        &scanned.snapshot.id,
-                        ViewKind::Dense,
-                        &dense_status,
-                    )?;
-                }
-                Err(error) => {
-                    self.store.set_view_status(
-                        &scanned.identity.id,
-                        &scanned.snapshot.id,
-                        ViewKind::Dense,
-                        &status(
-                            &scanned.snapshot,
-                            ViewState::Failed,
-                            vec![],
-                            Some(error.to_string()),
-                        ),
-                    )?;
-                    return Err(error);
-                }
-            }
-        } else {
-            self.store.set_view_status(
-                &scanned.identity.id,
-                &scanned.snapshot.id,
-                ViewKind::Dense,
-                &status(
-                    &scanned.snapshot,
-                    ViewState::Unavailable,
-                    vec![],
-                    Some(
-                        "No embedding backend selected; lexical and structural views remain available"
-                            .to_owned(),
-                    ),
-                ),
-            )?;
-        }
+        self.build_dense_view(&scanned.identity.id, &scanned.snapshot)
+            .await?;
         self.store.set_view_status(
             &scanned.identity.id,
             &scanned.snapshot.id,

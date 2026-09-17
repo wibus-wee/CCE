@@ -287,13 +287,24 @@ impl CceEngine {
         }) {
             if let Some(dense_status) = manifest.views.get(&ViewKind::Dense) {
                 if matches!(dense_status.state, ViewState::Ready | ViewState::Partial) {
-                    if let (Some(digest), Some(embedder)) = (
-                        dense_status.artifact_digest.as_deref(),
-                        self.embedder().await?,
-                    ) {
+                    // A Ready view with a backend that cannot initialize now
+                    // (model cache moved, offline first query) degrades to the
+                    // fused ranking plus a missing-capability note.
+                    let embedder = match self.embedder().await {
+                        Ok(embedder) => embedder,
+                        Err(error) => {
+                            missing_capabilities.push(format!(
+                                "dense view is Ready but the embedding backend failed to initialize: {error}"
+                            ));
+                            None
+                        }
+                    };
+                    if let (Some(digest), Some(embedder)) =
+                        (dense_status.artifact_digest.as_deref(), embedder.as_ref())
+                    {
                         let index = DenseIndex::decode(&self.store().artifacts().read(digest)?)?;
                         let dense_hits = index
-                            .search(&request.query, &embedder, request.limit.saturating_mul(3))
+                            .search(&request.query, embedder, request.limit.saturating_mul(3))
                             .await?;
                         let documents = self
                             .store()

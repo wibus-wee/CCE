@@ -25,7 +25,9 @@ struct Arguments {
     repository: PathBuf,
     #[arg(long, env = "CCE_DATA_DIR")]
     data_dir: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t = DenseMode::Disabled)]
+    /// Dense embedding backend; `local` (default) downloads the model once
+    /// on first index, `disabled` stays fully offline.
+    #[arg(long, value_enum, env = "CCE_DENSE", default_value_t = DenseMode::Local)]
     dense: DenseMode,
     /// Local embedding model code, used with --dense local.
     #[arg(long, env = "CCE_EMBEDDING_MODEL")]

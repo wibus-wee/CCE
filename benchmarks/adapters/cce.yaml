@@ -9,7 +9,7 @@ command:
   - "{route_args}"
   - --budget
   - "{budget}"
-timeout_seconds: 120
+timeout_seconds: 360
 model_identity: none
 model_revision: none
 environment:

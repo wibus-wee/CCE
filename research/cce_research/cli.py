@@ -137,6 +137,11 @@ def run_adapter(
     adapter = Adapter.load(adapter_file)
     cases = list(load_jsonl(dataset, BenchmarkCase))
     output.parent.mkdir(parents=True, exist_ok=True)
+    # The adapter substitutes {repository} verbatim into subprocess commands
+    # whose cwd is the repository itself — a relative arg like ".." would
+    # re-resolve against that cwd and index the parent directory. Pin the
+    # absolute path once here.
+    repository = repository.resolve()
     component_map = adapter.component_map(repository)
     if not component_map:
         console.print(
