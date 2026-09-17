@@ -115,4 +115,10 @@ uv run --project research cce-research compare benchmarks/datasets/cce-self.json
 uv run --project research cce-research compare benchmarks/datasets/cce-self.jsonl research/output/baseline.jsonl research/output/candidate.jsonl --gate
 ```
 
+### Dense model comparison
+
+`benchmarks/adapters/cce-(search-)dense-<model>.yaml` variants pin a local embedding model via `dense: local` + `embedding_model: <code>` (`cce models` lists valid codes). Each model gets its own snapshot — embedding model identity is part of `index_profile_hash` — so arms share `.cce-benchmark` without wiping. Warm each model's index once (`cce --dense local --embedding-model <code> index .`; the first run downloads into `<data>/models/`, the documented network opt-in), then run all arms on the same dataset revision and `compare` pairwise. Model identity travels in the bundle manifest via `model_identity: local:<code>`.
+
+First ladder result (cce-self-v5, n=29, search stage): dense beats sparse decisively — recall@20 +0.12 (p=.03), nDCG@10 +0.09 (p=.01), file_success@20 .62→.79 — at ~3s/query subprocess cost dominated by per-process ONNX session init (see `engine_latency_ms` for engine-only time). Between dense models the suite is underpowered: e5-base and jina-v2-base-code show positive point estimates on the vocab-gap subset (recall@5 .40→.60/.70) but all CIs include zero at MDE≈0.10–0.16. Qwen3-Embedding-0.6B is not in the fastembed registry and was dropped from the matrix. Conclusion: keep e5-small as default; revisit when the suite grows or a reranker lands.
+
 Published bundles must replace `WORKTREE` with an immutable commit and record CPU, memory, operating system, model endpoint/revision, cold versus warm cache state, and lockfile digests.

@@ -23,7 +23,7 @@ atlas correctness bug found during the audit.
 | 001 | Benchmark harness: dense/model passthrough + engine latency | P1 | S | — | DONE |
 | 002 | Atlas: resolve snapshot directly, no dummy search | P1 | S | — | DONE |
 | 003 | Dataset cce-self-v5: vocab-gap, budget-curve, dataflow cases | P1 | S | — | DONE |
-| 004 | Embedding model ladder: paired e5-small / Qwen3-0.6B / e5-base | P1 | S | 001, 003 | TODO |
+| 004 | Embedding model ladder: paired e5-small / Qwen3-0.6B / e5-base | P1 | S | 001, 003 | DONE (Qwen3 unavailable in fastembed; jina-code substituted) |
 | 005 | Task→Component Recall@K metric (package-granularity L0) | P1 | S | — (annotates 003's cases) | DONE |
 | 006 | Framework landmark extractor: axum route bindings | P2 | S | — (best after 003) | DONE |
 

@@ -1,0 +1,19 @@
+name: cce-search-dense-jina-code
+# Retrieval stage only, dense local embedding enabled. Model identity is
+# derived as `local:<embedding_model>` in the bundle manifest.
+command:
+  - target/release/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 120
+model_revision: none
+dense: local
+embedding_model: jinaai/jina-embeddings-v2-base-code
+environment:
+  CCE_DATA_DIR: .cce-benchmark

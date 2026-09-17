@@ -1,0 +1,17 @@
+name: cce-dense-jina-code
+command:
+  - target/release/cce
+  - --json
+  - context
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --budget
+  - "{budget}"
+timeout_seconds: 120
+model_revision: none
+dense: local
+embedding_model: jinaai/jina-embeddings-v2-base-code
+environment:
+  CCE_DATA_DIR: .cce-benchmark
