@@ -116,7 +116,9 @@ function HitCard({ hit }: { hit: SearchHit }) {
         ))}
         <span className="chip chip-dim">{hit.representation.replaceAll('_', ' ')}</span>
         {!hit.verifiedCurrent && <span className="chip chip-warn">unverified</span>}
-        {hit.symbolName && (
+        {/* def/refs resolve code symbols; a `commit:<sha>` pseudo-symbol
+            would just 404, so commit hits skip the lookup actions. */}
+        {hit.symbolName && !hit.symbolName.startsWith('commit:') && (
           <span className="hit-actions">
             <button
               type="button"

@@ -66,6 +66,7 @@ export type SearchRoute =
   | 'structural'
   | 'knowledge'
   | 'history'
+  | 'diff'
   | 'reranked'
 
 export type RetrievalRepresentation =
@@ -78,6 +79,7 @@ export type RetrievalRepresentation =
   | 'flow_summary'
   | 'test_behavior'
   | 'commit_summary'
+  | 'commit_diff'
   | 'knowledge_page'
 
 export type GraphPolicy =
@@ -100,6 +102,9 @@ export interface SearchInput {
 export interface QueryFilters {
   pathPrefix?: string
   language?: string
+  // `type:diff`/`type:commit`/`type:file` — echoed back when parsed from the
+  // query text.
+  type?: string
 }
 
 // The effective request echoed back inside SearchResult.
@@ -294,6 +299,13 @@ export const api = {
       body: JSON.stringify({ query, budgetTokens, maxCandidates: 50, requireFresh: true }),
     }),
   providers: () => request<ProviderReport[]>('/v1/providers'),
+  // Query-time regex over stored commit patches — same SearchResult shape
+  // as /v1/search pinned to the diff route.
+  diff: (pattern: string, limit?: number) =>
+    request<SearchResult>('/v1/diff', {
+      method: 'POST',
+      body: JSON.stringify({ pattern, limit }),
+    }),
   definitions: (name: string) =>
     request<DefinitionsReport>(`/v1/def/${encodeURIComponent(name)}`),
   references: (name: string) =>

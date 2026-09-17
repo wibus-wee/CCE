@@ -15,6 +15,7 @@ export function App() {
   const [providers, setProviders] = useState<ProviderReport[]>()
   const [providersError, setProvidersError] = useState<string>()
   const [searchText, setSearchText] = useState('snapshot freshness')
+  const [searchType, setSearchType] = useState<'file' | 'diff' | 'commit'>('file')
   const [limit, setLimit] = useState(25)
   const [result, setResult] = useState<SearchResult>()
   const [searchError, setSearchError] = useState<string>()
@@ -76,7 +77,10 @@ export function App() {
     setSearchError(undefined)
     try {
       const safeLimit = Number.isFinite(limit) ? Math.min(200, Math.max(1, Math.trunc(limit))) : 20
-      setResult(await api.search({ query: text, limit: safeLimit }))
+      // A `type:` token typed by hand wins over the selector.
+      const effective =
+        searchType === 'file' || /\btype:\S+/i.test(text) ? text : `type:${searchType} ${text}`
+      setResult(await api.search({ query: effective, limit: safeLimit }))
     } catch (value) {
       setResult(undefined)
       setSearchError(describeError(value))
@@ -183,6 +187,17 @@ export function App() {
               onChange={(event) => setSearchText(event.target.value)}
               placeholder="symbol, path, or question — lang:rust path:crates/ narrows"
             />
+          </label>
+          <label className="budget">
+            Type
+            <select
+              value={searchType}
+              onChange={(event) => setSearchType(event.target.value as 'file' | 'diff' | 'commit')}
+            >
+              <option value="file">file</option>
+              <option value="diff">diff</option>
+              <option value="commit">commit</option>
+            </select>
           </label>
           <label className="budget">
             Limit
