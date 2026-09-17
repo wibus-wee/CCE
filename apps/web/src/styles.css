@@ -34,8 +34,9 @@ section { margin-top: 2.5rem; }
 .view small { color: #7f8da1; }
 .state { font: 700 0.65rem ui-monospace, monospace; text-transform: uppercase; border-radius: 99px; padding: 0.28rem 0.5rem; background: #293244; }
 .state-ready { color: #9df0ba; background: #173723; }
-.state-partial { color: #ffe09a; background: #3a2e12; }
+.state-partial, .state-stale, .state-missing { color: #ffe09a; background: #3a2e12; }
 .state-unavailable, .state-failed { color: #ffaaa5; background: #421d20; }
+.state-not_applicable, .state-building { color: #aab4c4; background: #232b38; }
 .skeleton { animation: pulse 1.6s ease-in-out infinite; }
 form { display: grid; grid-template-columns: minmax(0, 1fr) 140px auto; gap: 0.75rem; align-items: end; }
 label { display: grid; gap: 0.5rem; color: #b4bdcb; font-size: 0.78rem; font-weight: 700; }
@@ -48,6 +49,49 @@ textarea, input { width: 100%; border: 1px solid #354154; border-radius: 10px; p
 .pack footer { padding-bottom: 1rem; }
 .pack aside { border: 1px solid #5c4720; background: #221c10; border-radius: 12px; padding: 1rem; margin-top: 1.5rem; color: #e9d39f; }
 code { color: #94a5bb; font-size: 0.72rem; }
+
+/* freshness + capability caveats: stale/unavailable is reported, never hidden */
+.stale-note { margin: -0.4rem 0 1rem; color: #ffe09a; font-size: 0.8rem; }
+.warnings { border: 1px solid #5c4720; background: #221c10; border-radius: 12px; padding: 0.9rem 1rem; margin: 0 0 1rem; color: #e9d39f; }
+.warnings h3 { color: #ffd98a; margin-bottom: 0.4rem; }
+.warnings p { margin: 0.3rem 0; font-size: 0.8rem; }
+.empty { border: 1px dashed #354154; border-radius: 10px; padding: 1.1rem; color: #96a0af; text-align: center; }
+
+/* provider panel */
+.providers { border: 1px solid #263142; border-radius: 14px; padding: 1rem 1.25rem; background: #10151e; margin-top: 2.5rem; }
+.providers summary { cursor: pointer; font-weight: 700; font-size: 1.05rem; }
+.providers summary small { color: #7f8da1; font-weight: 400; }
+.providers[open] summary { margin-bottom: 1rem; }
+.provider-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0.75rem; }
+.provider { border: 1px solid #232b38; border-radius: 10px; padding: 0.85rem 1rem; background: #0d1219; }
+.provider-head { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+.provider-line { margin: 0.4rem 0 0; font-size: 0.78rem; overflow-wrap: anywhere; }
+.provider-line small { color: #7f8da1; margin-right: 0.4rem; }
+
+/* search results */
+.search-results { margin-top: 1.5rem; }
+.plan-line { font: 0.72rem ui-monospace, monospace; color: #8490a2; margin: 0 0 0.4rem; }
+.plan-reasons { color: #8490a2; font-size: 0.78rem; margin-bottom: 1rem; }
+.plan-reasons summary { cursor: pointer; }
+.plan-reasons ul { margin: 0.4rem 0 0; padding-left: 1.2rem; }
+.hit { border-top: 1px solid #263142; padding: 1rem 0; }
+.hit-head { display: flex; align-items: baseline; gap: 0.75rem; }
+.hit-head h3 { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+.hit-rank { color: #8490a2; font: 0.72rem ui-monospace, monospace; }
+.hit-score { margin-left: auto; color: #9df0ba; font: 0.72rem ui-monospace, monospace; white-space: nowrap; }
+.hit-path { display: inline-block; margin-top: 0.3rem; }
+.hit-snippet { white-space: pre-wrap; overflow-wrap: anywhere; background: #10151e; border-radius: 10px; padding: 1rem; color: #dbe4f4; font-size: 0.78rem; line-height: 1.55; margin: 0.5rem 0; }
+.hit-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+.chip { font: 700 0.62rem ui-monospace, monospace; text-transform: uppercase; letter-spacing: 0.05em; border-radius: 99px; padding: 0.22rem 0.55rem; background: #1b2736; color: #8cbcff; }
+.chip-dim { background: #232b38; color: #aab4c4; }
+.chip-warn { background: #3a2e12; color: #ffe09a; }
+.hit-actions { margin-left: auto; }
+button.link { background: none; border: none; color: #8cbcff; padding: 0.2rem 0.45rem; font: 700 0.7rem ui-monospace, monospace; }
+button.link:hover:not(:disabled) { text-decoration: underline; }
+.hit-why { color: #8490a2; font-size: 0.74rem; margin: 0.5rem 0 0; }
+.lookup { margin-top: 0.6rem; border-left: 2px solid #354154; padding-left: 0.9rem; font-size: 0.78rem; }
+.lookup p { margin: 0.25rem 0; }
+.lookup-error { color: #ffaaa5; }
 @keyframes pulse { 50% { opacity: 0.45; } }
 @media (max-width: 720px) {
   main { padding-top: 1.5rem; }

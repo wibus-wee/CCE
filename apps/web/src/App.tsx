@@ -1,8 +1,23 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react'
-import { api, ContextPack, ViewManifest } from './api'
+import {
+  api,
+  ContextPack,
+  describeError,
+  ProviderReport,
+  SearchResult,
+  ViewManifest,
+} from './api'
+import { ProvidersPanel } from './ProvidersPanel'
+import { SearchResults } from './SearchResults'
 
 export function App() {
   const [manifest, setManifest] = useState<ViewManifest>()
+  const [providers, setProviders] = useState<ProviderReport[]>()
+  const [providersError, setProvidersError] = useState<string>()
+  const [searchText, setSearchText] = useState('snapshot freshness')
+  const [limit, setLimit] = useState(25)
+  const [result, setResult] = useState<SearchResult>()
+  const [searchError, setSearchError] = useState<string>()
   const [query, setQuery] = useState('Where is snapshot freshness decided?')
   const [budget, setBudget] = useState(4096)
   const [pack, setPack] = useState<ContextPack>()
@@ -12,13 +27,24 @@ export function App() {
   const refresh = useCallback(async () => {
     setBusy(true)
     setError(undefined)
-    try {
-      setManifest(await api.status())
-    } catch (value) {
-      setError(asMessage(value))
-    } finally {
-      setBusy(false)
+    // Status and provider probes are independent: one failing must not
+    // blank the other.
+    const [status, providerReports] = await Promise.allSettled([
+      api.status(),
+      api.providers(),
+    ])
+    if (status.status === 'fulfilled') {
+      setManifest(status.value)
+    } else {
+      setError(describeError(status.reason))
     }
+    if (providerReports.status === 'fulfilled') {
+      setProviders(providerReports.value)
+      setProvidersError(undefined)
+    } else {
+      setProvidersError(describeError(providerReports.reason))
+    }
+    setBusy(false)
   }, [])
 
   useEffect(() => {
@@ -29,10 +55,31 @@ export function App() {
     setBusy(true)
     setError(undefined)
     try {
-      const result = await api.index()
-      setManifest(result.manifest)
+      const report = await api.index()
+      setManifest(report.manifest)
+      // IndexReport.providers carries run outcomes (duration, SCIP counts);
+      // fresher than re-probing.
+      setProviders(report.providers)
+      setProvidersError(undefined)
     } catch (value) {
-      setError(asMessage(value))
+      setError(describeError(value))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function search(event: FormEvent) {
+    event.preventDefault()
+    const text = searchText.trim()
+    if (!text) return
+    setBusy(true)
+    setSearchError(undefined)
+    try {
+      const safeLimit = Number.isFinite(limit) ? Math.min(200, Math.max(1, Math.trunc(limit))) : 20
+      setResult(await api.search({ query: text, limit: safeLimit }))
+    } catch (value) {
+      setResult(undefined)
+      setSearchError(describeError(value))
     } finally {
       setBusy(false)
     }
@@ -50,11 +97,15 @@ export function App() {
         current && current.snapshotId === result.snapshotId ? current : undefined,
       )
     } catch (value) {
-      setError(asMessage(value))
+      setError(describeError(value))
     } finally {
       setBusy(false)
     }
   }
+
+  const degradedViews = manifest
+    ? Object.entries(manifest.views).filter(([, view]) => view.state !== 'ready')
+    : []
 
   return (
     <main>
@@ -76,13 +127,28 @@ export function App() {
           <h2>Materialized views</h2>
           <code>{manifest?.snapshotId.slice(0, 21) ?? 'connecting…'}</code>
         </div>
-        <div className="view-grid">
-          {manifest
-            ? Object.entries(manifest.views).map(([name, view]) => (
+        {degradedViews.length > 0 && (
+          <p className="stale-note" role="status">
+            Not fully current:{' '}
+            {degradedViews
+              .map(([name, view]) => `${name} (${view.state.replaceAll('_', ' ')})`)
+              .join(', ')}
+          </p>
+        )}
+        {manifest ? (
+          Object.keys(manifest.views).length === 0 ? (
+            <p className="empty">
+              No views reported yet — press “Refresh index” to build the first snapshot.
+            </p>
+          ) : (
+            <div className="view-grid">
+              {Object.entries(manifest.views).map(([name, view]) => (
                 <article className="view" key={name}>
                   <div className="view-title">
                     <h3>{name}</h3>
-                    <span className={`state state-${view.state}`}>{view.state}</span>
+                    <span className={`state state-${view.state}`}>
+                      {view.state.replaceAll('_', ' ')}
+                    </span>
                   </div>
                   {view.capabilities.map((capability) => (
                     <p key={capability.name} title={capability.reason}>
@@ -91,10 +157,49 @@ export function App() {
                   ))}
                   {view.message && <p className="muted">{view.message}</p>}
                 </article>
-              ))
-            : Array.from({ length: 6 }, (_, index) => <div className="view skeleton" key={index} />)}
-        </div>
+              ))}
+            </div>
+          )
+        ) : error ? (
+          <p className="empty">Status unavailable — see the error above.</p>
+        ) : (
+          <div className="view-grid">
+            {Array.from({ length: 6 }, (_, index) => (
+              <div className="view skeleton" key={index} />
+            ))}
+          </div>
+        )}
       </section>
+
+      <ProvidersPanel providers={providers} error={providersError} />
+
+      <section>
+        <h2>Search</h2>
+        <form onSubmit={(event) => void search(event)}>
+          <label>
+            Query
+            <input
+              value={searchText}
+              onChange={(event) => setSearchText(event.target.value)}
+              placeholder="symbol, path, or question — lang:rust path:crates/ narrows"
+            />
+          </label>
+          <label className="budget">
+            Limit
+            <input
+              type="number"
+              min={1}
+              max={200}
+              value={limit}
+              onChange={(event) => setLimit(Number(event.target.value))}
+            />
+          </label>
+          <button disabled={busy || !searchText.trim()}>Search</button>
+        </form>
+        {searchError && <div className="error" role="alert">{searchError}</div>}
+      </section>
+
+      {result && <SearchResults result={result} />}
 
       <section>
         <h2>Build context</h2>
@@ -124,17 +229,22 @@ export function App() {
               <p className="eyebrow">{pack.intent.replaceAll('_', ' ')}</p>
               <h2>Context pack</h2>
             </div>
-            <strong>{pack.usedTokens.toLocaleString()} / {pack.budgetTokens.toLocaleString()} tokens</strong>
+            <strong>
+              {pack.usedTokens.toLocaleString()} / {pack.budgetTokens.toLocaleString()} tokens
+            </strong>
           </div>
           {pack.items.map((item) => (
             <details key={item.id} open={item.kind === 'orientation' || item.provenance.rank < 4}>
               <summary>
                 <span>{item.title}</span>
-                <small>{item.kind} · {item.estimatedTokens}t</small>
+                <small>
+                  {item.kind} · {item.estimatedTokens}t
+                </small>
               </summary>
               <pre>{item.body}</pre>
               <footer>
-                {item.provenance.route} · rank {item.provenance.rank} · {item.provenance.whyRetrieved}
+                {item.provenance.route} · rank {item.provenance.rank} ·{' '}
+                {item.provenance.whyRetrieved}
               </footer>
             </details>
           ))}
@@ -153,8 +263,3 @@ export function App() {
     </main>
   )
 }
-
-function asMessage(value: unknown): string {
-  return value instanceof Error ? value.message : String(value)
-}
-
