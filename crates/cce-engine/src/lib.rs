@@ -8,6 +8,7 @@ mod context;
 mod dense;
 mod engine;
 mod history;
+mod ignore;
 mod landmarks;
 mod lock;
 mod packages;

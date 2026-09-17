@@ -7,9 +7,12 @@ use std::{
 use cce_core::{CceError, RepositoryIdentity, Result, SnapshotIdentity};
 use cce_store::{MetadataStore, ScanCacheEntry};
 use chrono::Utc;
-use ignore::{DirEntry, WalkBuilder};
+use ignore::WalkBuilder;
 
-use crate::EngineConfig;
+use crate::{
+    EngineConfig,
+    ignore::{builtin_skip_reason, is_internal_or_generated, is_sensitive_name},
+};
 
 #[derive(Debug, Clone)]
 pub struct ScannedFile {
@@ -89,6 +92,9 @@ pub struct ScannedRepository {
     pub skipped_large_files: Vec<String>,
     pub skipped_binary_files: Vec<String>,
     pub skipped_sensitive_files: Vec<String>,
+    /// Files dropped by the unconditional built-in policy (lockfiles,
+    /// minified assets), each paired with its skip reason.
+    pub skipped_builtin_files: Vec<(String, &'static str)>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +161,7 @@ impl RepositoryScanner {
         let mut skipped_large_files = Vec::new();
         let mut skipped_binary_files = Vec::new();
         let mut skipped_sensitive_files = Vec::new();
+        let mut skipped_builtin_files = Vec::new();
         for entry in builder.build() {
             let entry = entry.map_err(|error| CceError::Configuration(error.to_string()))?;
             let Some(file_type) = entry.file_type() else {
@@ -180,7 +187,12 @@ impl RepositoryScanner {
                         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
                 })
                 .unwrap_or_default();
-            if !self.config.index.include_sensitive && is_sensitive_name(entry_file_name(&path)) {
+            let file_name = entry_file_name(&path);
+            if let Some(reason) = builtin_skip_reason(file_name) {
+                skipped_builtin_files.push((relative_path, reason));
+                continue;
+            }
+            if !self.config.index.include_sensitive && is_sensitive_name(file_name) {
                 skipped_sensitive_files.push(relative_path);
                 continue;
             }
@@ -276,6 +288,7 @@ impl RepositoryScanner {
             skipped_large_files,
             skipped_binary_files,
             skipped_sensitive_files,
+            skipped_builtin_files,
         })
     }
 }
@@ -283,48 +296,6 @@ impl RepositoryScanner {
 fn entry_file_name(path: &Path) -> &str {
     path.file_name()
         .map_or("", |name| name.to_str().unwrap_or(""))
-}
-
-fn is_internal_or_generated(entry: &DirEntry) -> bool {
-    if entry.depth() == 0 {
-        return false;
-    }
-    matches!(
-        entry.file_name().to_str(),
-        Some(".git" | ".cce" | "target" | "node_modules" | ".venv" | "__pycache__")
-    )
-}
-
-/// File names that frequently contain credentials. Skipped unless the index
-/// option `include_sensitive` is enabled; always reported in the index report.
-fn is_sensitive_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if lower == ".env" || lower.starts_with(".env.") || lower.starts_with(".env-") {
-        return true;
-    }
-    if lower.rsplit_once('.').is_some_and(|(_, extension)| {
-        matches!(
-            extension,
-            "env" | "pem" | "key" | "p12" | "pfx" | "keystore" | "jks"
-        )
-    }) {
-        return true;
-    }
-    matches!(
-        lower.as_str(),
-        "id_rsa"
-            | "id_dsa"
-            | "id_ecdsa"
-            | "id_ed25519"
-            | ".netrc"
-            | ".npmrc"
-            | ".pypirc"
-            | "credentials"
-            | "credentials.json"
-            | "secrets.json"
-            | "secrets.yaml"
-            | "secrets.yml"
-    )
 }
 
 fn normalized_relative(root: &Path, path: &Path) -> Result<String> {

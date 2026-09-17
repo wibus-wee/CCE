@@ -32,6 +32,9 @@ pub struct IndexReport {
     pub skipped_large_files: Vec<String>,
     pub skipped_binary_files: Vec<String>,
     pub skipped_sensitive_files: Vec<String>,
+    /// Files dropped by the unconditional built-in policy (lockfiles,
+    /// minified assets), each paired with its skip reason.
+    pub skipped_builtin_files: Vec<(String, String)>,
     pub manifest: ViewManifest,
 }
 
@@ -150,6 +153,11 @@ impl CceEngine {
                 skipped_large_files: scanned.skipped_large_files,
                 skipped_binary_files: scanned.skipped_binary_files,
                 skipped_sensitive_files: scanned.skipped_sensitive_files,
+                skipped_builtin_files: scanned
+                    .skipped_builtin_files
+                    .into_iter()
+                    .map(|(path, reason)| (path, reason.to_owned()))
+                    .collect(),
                 manifest,
             });
         }
@@ -989,6 +997,11 @@ impl CceEngine {
             skipped_large_files: scanned.skipped_large_files,
             skipped_binary_files: scanned.skipped_binary_files,
             skipped_sensitive_files: scanned.skipped_sensitive_files,
+            skipped_builtin_files: scanned
+                .skipped_builtin_files
+                .into_iter()
+                .map(|(path, reason)| (path, reason.to_owned()))
+                .collect(),
             manifest,
         })
     }
