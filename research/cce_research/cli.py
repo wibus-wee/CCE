@@ -144,12 +144,16 @@ def run_adapter(
             "[yellow]![/yellow] adapter produced no component map; "
             "component_* metrics will be skipped"
         )
-    with output.open("w", encoding="utf-8") as handle:
-        for case in cases:
-            result = adapter.run(case, repository, system_revision)
-            result.component_map = component_map
-            handle.write(result.model_dump_json() + "\n")
-            console.print(f"[green]✓[/green] {case.case_id}")
+    adapter.start_session(repository)
+    try:
+        with output.open("w", encoding="utf-8") as handle:
+            for case in cases:
+                result = adapter.run(case, repository, system_revision)
+                result.component_map = component_map
+                handle.write(result.model_dump_json() + "\n")
+                console.print(f"[green]✓[/green] {case.case_id}")
+    finally:
+        adapter.shutdown()
     dataset_revisions = {case.provenance.dataset_revision for case in cases}
     if len(dataset_revisions) != 1:
         raise ValueError("a result bundle must contain exactly one dataset revision")
@@ -340,19 +344,22 @@ def lint_gold(
         "hybrid", "structural", "knowledge", "history",
     ]
     failures = 0
-    for case in cases:
-        probe = case.model_copy(update={"routes": union_routes, "supply_intent": True})
-        result = adapter.run(probe, repository, "LINT")
-        reachable = {item.path for item in result.retrieved[:limit]}
-        gold = set(case.gold_files) | {item.path for item in case.gold_ranges}
-        if unreachable := sorted(gold - reachable):
-            failures += 1
-            console.print(f"[red]{case.case_id}[/red]: unreachable gold {unreachable}")
-        if case.no_context and result.retrieved:
-            console.print(
-                f"[yellow]{case.case_id}[/yellow]: no-context case still retrieved "
-                f"{len(result.retrieved)} items under union routes"
-            )
+    try:
+        for case in cases:
+            probe = case.model_copy(update={"routes": union_routes, "supply_intent": True})
+            result = adapter.run(probe, repository, "LINT")
+            reachable = {item.path for item in result.retrieved[:limit]}
+            gold = set(case.gold_files) | {item.path for item in case.gold_ranges}
+            if unreachable := sorted(gold - reachable):
+                failures += 1
+                console.print(f"[red]{case.case_id}[/red]: unreachable gold {unreachable}")
+            if case.no_context and result.retrieved:
+                console.print(
+                    f"[yellow]{case.case_id}[/yellow]: no-context case still retrieved "
+                    f"{len(result.retrieved)} items under union routes"
+                )
+    finally:
+        adapter.shutdown()
     if failures:
         raise typer.Exit(code=1)
     console.print("[green]all gold evidence reachable under union routes[/green]")
@@ -364,7 +371,10 @@ def probe_staleness(adapter_file: Path, repository: Path) -> None:
     rewrite it, and check whether fresh content surfaces and stale content
     is served."""
     adapter = Adapter.load(adapter_file)
-    report = run_staleness_probe(adapter, repository)
+    try:
+        report = run_staleness_probe(adapter, repository)
+    finally:
+        adapter.shutdown()
     console.print(report)
 
 

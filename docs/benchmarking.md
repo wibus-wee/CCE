@@ -39,6 +39,8 @@ Result `metadata` carries the executed `command` and `engine_latency_ms` — the
 
 Adapter YAMLs may declare `dense: baseline|local` plus `embedding_model`/`embedding_dimensions`; the adapter appends the corresponding global CLI flags and derives `model_identity` as `local:<model>` when unset, so bundles stay attributable to the model that produced them.
 
+Adapters default to `session: subprocess` — one engine process per case, so `query_ms` includes spawn and model-session init. `session: daemon` instead spawns `cce-daemon` once per run (the sibling binary of the command template's executable: `target/release/cce` → `target/release/cce-daemon`), blocks until `GET /healthz` answers, then issues each case as `POST /v1/search` or `POST /v1/context` with the same template-derived parameters. This exercises the production warm path: dense model init is paid once at startup, and `query_ms` measures per-request wall-clock only. The daemon inherits the adapter `environment` (`CCE_DATA_DIR` etc.) and logs to `research/output/<adapter>.daemon.log`; `metadata.command` records the HTTP request and `metadata.session` records `daemon`. One caveat: `/v1/search` cannot pin routes — route-pinned cases on a search adapter fall back to a cold subprocess for that case (`metadata.session: subprocess-fallback`); `/v1/context` accepts `routes` and honors them in-session.
+
 ## Required metrics
 
 - ranked retrieval: Recall@5/10/20/50, MRR, nDCG@10, file success, symbol and line recall

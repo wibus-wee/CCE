@@ -1,0 +1,25 @@
+name: cce-search-daemon-dense-e5-small
+# Retrieval stage only, dense local embedding, served by a warm cce-daemon
+# process (session: daemon): the ONNX session init is paid once per run
+# instead of once per case. The daemon binary is the sibling of command[0]
+# (target/release/cce -> target/release/cce-daemon); each case is issued as
+# POST /v1/search. Requires `cargo build --release -p cce-daemon`.
+# Caveat: /v1/search cannot pin routes — route-pinned cases fall back to a
+# cold subprocess (metadata session=subprocess-fallback).
+session: daemon
+command:
+  - target/release/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 120
+model_revision: none
+dense: local
+embedding_model: intfloat/multilingual-e5-small
+environment:
+  CCE_DATA_DIR: .cce-benchmark

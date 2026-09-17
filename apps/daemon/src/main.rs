@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use cce_core::{QueryIntent, SearchRequest};
+use cce_core::{QueryIntent, SearchRequest, SearchRoute};
 use cce_engine::{CceEngine, ContextRequest, DenseBackendConfig, EngineConfig};
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,9 @@ struct SearchInput {
     intent: Option<QueryIntent>,
     #[serde(default = "default_search_limit")]
     limit: usize,
+    /// Route pins for ablation-style queries; empty follows the planner.
+    #[serde(default)]
+    routes: Vec<SearchRoute>,
 }
 
 const fn default_search_limit() -> usize {
@@ -192,7 +195,7 @@ async fn search(
                 intent: input.intent,
                 limit: input.limit.clamp(1, 200),
                 require_fresh: true,
-                routes: Vec::new(),
+                routes: input.routes,
             })
             .await?,
     ))
