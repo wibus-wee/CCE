@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Instant};
 
 use cce_core::{
     Result, RetrievalRepresentation, SearchHit, SearchRequest, SearchRoute, ViewKind, ViewManifest,
-    ViewState,
+    ViewState, has_cjk,
 };
 use cce_store::RelationDirection;
 use serde::{Deserialize, Serialize};
@@ -17,14 +17,34 @@ const RRF_K: f64 = 60.0;
 /// in pairs; beyond ~50 the fused prior is already thin.
 const RERANK_POOL: usize = 50;
 
+/// Only topical hits are scored by the reranker: graph-expansion routes
+/// (structural/knowledge/history) answer "what is connected", not "what
+/// matches the query text" — judging them on topical relevance punishes
+/// blast-radius evidence.
+const TOPICAL: [SearchRoute; 5] = [
+    SearchRoute::Lexical,
+    SearchRoute::DenseRaw,
+    SearchRoute::DenseSummary,
+    SearchRoute::ExactSymbol,
+    SearchRoute::Hybrid,
+];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// The full result of a search: the executed plan, view manifest, ranked
+/// hits, and explicit missing capabilities.
 pub struct SearchResult {
+    /// The effective request (repository/snapshot resolved).
     pub request: SearchRequest,
+    /// The plan that was executed.
     pub plan: QueryPlan,
+    /// View manifest at query time (staleness surfaced to caller).
     pub manifest: ViewManifest,
+    /// Ranked hits.
     pub hits: Vec<SearchHit>,
+    /// Capabilities the plan needed but could not satisfy.
     pub missing_capabilities: Vec<String>,
+    /// Engine-side wall time in milliseconds.
     pub latency_ms: u64,
 }
 
@@ -74,6 +94,12 @@ impl CceEngine {
         })
     }
 
+    /// Execute a search: resolve the snapshot, plan routes, gather hits,
+    /// fuse, and attach manifest/missing-capability reporting.
+    ///
+    /// # Errors
+    /// `ViewUnavailable` when no committed snapshot exists and
+    /// `require_fresh`/`require_current` demand one.
     pub async fn search(&self, mut request: SearchRequest) -> Result<SearchResult> {
         let started = Instant::now();
         let resolved = self.resolve_index(request.require_fresh).await?;
@@ -432,9 +458,11 @@ impl CceEngine {
                 )
             });
             if let Some(&kept) = seen_regions.get(&region_key) {
-                for route in &hit.contributing_routes {
-                    if !hits[kept].contributing_routes.contains(route) {
-                        hits[kept].contributing_routes.push(*route);
+                if let Some(kept_hit) = hits.get_mut(kept) {
+                    for route in &hit.contributing_routes {
+                        if !kept_hit.contributing_routes.contains(route) {
+                            kept_hit.contributing_routes.push(*route);
+                        }
                     }
                 }
                 continue;
@@ -466,13 +494,6 @@ impl CceEngine {
         //
         // Configured-but-failed rerankers degrade to fused order with an
         // explicit missing-capability note.
-        const TOPICAL: [SearchRoute; 5] = [
-            SearchRoute::Lexical,
-            SearchRoute::DenseRaw,
-            SearchRoute::DenseSummary,
-            SearchRoute::ExactSymbol,
-            SearchRoute::Hybrid,
-        ];
         let topical: Vec<usize> = hits
             .iter()
             .enumerate()
@@ -489,8 +510,8 @@ impl CceEngine {
                 Ok(Some(reranker)) => {
                     let documents = topical
                         .iter()
-                        .map(|&index| {
-                            let hit = &hits[index];
+                        .filter_map(|&index| hits.get(index))
+                        .map(|hit| {
                             let location = hit.address.as_ref().map_or_else(
                                 || {
                                     hit.symbol_name
@@ -512,7 +533,12 @@ impl CceEngine {
                         Ok(order) => {
                             let mut reranked = Vec::with_capacity(order.len());
                             for (index, score) in order {
-                                let mut hit = hits[topical[index]].clone();
+                                let Some(&slot) = topical.get(index) else {
+                                    continue;
+                                };
+                                let Some(mut hit) = hits.get(slot).cloned() else {
+                                    continue;
+                                };
                                 hit.explanation.push(format!(
                                     "cross-encoder rerank by {}: fused {:.4} -> rerank {:.4}",
                                     reranker.model_code(),
@@ -526,7 +552,9 @@ impl CceEngine {
                                 reranked.push(hit);
                             }
                             for (slot, hit) in topical.iter().zip(reranked) {
-                                hits[*slot] = hit;
+                                if let Some(target) = hits.get_mut(*slot) {
+                                    *target = hit;
+                                }
                             }
                         }
                         Err(error) => missing_capabilities.push(format!(
@@ -557,7 +585,9 @@ impl CceEngine {
 
 /// Which edges count as evidence for each graph policy. The intent chooses
 /// the vocabulary of the expansion, not just its direction.
-fn expansion_policy(policy: GraphPolicy) -> (RelationDirection, &'static [cce_core::RelationKind]) {
+const fn expansion_policy(
+    policy: GraphPolicy,
+) -> (RelationDirection, &'static [cce_core::RelationKind]) {
     use cce_core::RelationKind;
     match policy {
         GraphPolicy::OutgoingTrace => (
@@ -671,7 +701,7 @@ fn ranked_candidates(candidates: &HashMap<String, Candidate>) -> Vec<&Candidate>
     ranked
 }
 
-fn representation_weight(representation: &RetrievalRepresentation) -> f64 {
+const fn representation_weight(representation: &RetrievalRepresentation) -> f64 {
     match representation {
         RetrievalRepresentation::RoleSummary
         | RetrievalRepresentation::SymbolSummary
@@ -747,6 +777,21 @@ fn entity_tokens(query: &str) -> Vec<String> {
                 || character == '.')
         })
         .map(|token| token.trim_matches('.'))
+        // CJK interrogatives glue onto the phrase they lead ("在哪定义" is
+        // "在哪" + "定义"): peel non-ASCII stopword prefixes so the remainder
+        // is judged on its own. Latin stopwords stay whole-word — "there"
+        // must not lose "the".
+        .map(|token| {
+            let mut rest = token;
+            while let Some(prefix) = stop
+                .iter()
+                .filter(|stop| stop.chars().any(has_cjk))
+                .find(|stop| rest.len() > stop.len() && rest.starts_with(*stop))
+            {
+                rest = &rest[prefix.len()..];
+            }
+            rest
+        })
         .filter(|token| token.chars().count() >= 3)
         .filter(|token| !stop.contains(&token.to_ascii_lowercase().as_str()))
         .map(str::to_owned)
@@ -756,7 +801,13 @@ fn entity_tokens(query: &str) -> Vec<String> {
     // with an entity of the same name is coincidence, not intent — such
     // terms are lexical evidence instead. Identifier-shaped tokens keep
     // the route; a single-token query keeps its only token.
-    if tokens.len() > 1 {
+    //
+    // Code-switched queries are the exception: a Latin word embedded in a
+    // CJK sentence ("…标记为 stale") is a deliberate anchor the writer chose
+    // not to translate, and CJK spellings are themselves valid identifier
+    // territory — so the identifier-shape gate stays off for them.
+    let code_switched = tokens.iter().any(|token| token.chars().any(has_cjk));
+    if tokens.len() > 1 && !code_switched {
         tokens.retain(|token| is_identifier_like(token));
     }
     tokens.sort_by_key(|token| std::cmp::Reverse(token.len()));
@@ -776,4 +827,38 @@ fn is_identifier_like(token: &str) -> bool {
 
 fn truncate_chars(value: &str, maximum: usize) -> String {
     value.chars().take(maximum).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entity_tokens_gate_drops_plain_words_in_homogeneous_query() {
+        // Multi-token natural-language queries keep only identifier-shaped
+        // tokens; plain lowercase words are lexical evidence, not identity.
+        assert!(entity_tokens("where is the merged from handle").is_empty());
+        assert_eq!(
+            entity_tokens("where is SnapshotIdentity defined"),
+            ["SnapshotIdentity"]
+        );
+    }
+
+    #[test]
+    fn entity_tokens_code_switched_query_keeps_latin_anchors() {
+        // In a CJK query a Latin word is a deliberate technical anchor, and
+        // CJK spellings are valid identifier territory — the shape gate is
+        // off for the whole query.
+        let tokens = entity_tokens("search 偶发返回陈旧结果，哪里把过期视图标记为 stale");
+        assert!(tokens.contains(&"search".to_owned()));
+        assert!(tokens.contains(&"stale".to_owned()));
+        assert!(tokens.contains(&"偶发返回陈旧结果".to_owned()));
+    }
+
+    #[test]
+    fn entity_tokens_cjk_stopwords_still_filtered() {
+        // Code-switching does not resurrect interrogative filler.
+        let tokens = entity_tokens("SnapshotIdentity 在哪定义");
+        assert_eq!(tokens, ["SnapshotIdentity"]);
+    }
 }

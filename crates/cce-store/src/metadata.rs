@@ -7,7 +7,7 @@ use std::{
 use cce_core::{
     CceError, CodeEntity, CodeRegion, Relation, RepositoryIdentity, Result, RetrievalDocument,
     RetrievalRepresentation, SnapshotIdentity, SourceAddress, ViewKind, ViewManifest, ViewState,
-    ViewStatus,
+    ViewStatus, has_cjk,
 };
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -17,96 +17,157 @@ use serde::{Deserialize, Serialize};
 use crate::{ArtifactRecord, ArtifactStore};
 
 #[derive(Debug, Clone)]
+/// One indexed source file: identity plus the artifact holding its bytes.
 pub struct SourceFileRecord {
+    /// Repository-relative path.
     pub path: String,
+    /// Detected language, when known.
     pub language: Option<String>,
+    /// BLAKE3 content hash of the file bytes.
     pub content_hash: String,
+    /// Artifact storing the file's bytes.
     pub artifact: ArtifactRecord,
+    /// File size.
     pub byte_count: u64,
+    /// Number of lines.
     pub line_count: u64,
+    /// Digest of cached per-file analysis output, when present.
     pub analysis_artifact_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
+/// A retrieval document with its materialized body for FTS indexing.
 pub struct IndexedDocument {
+    /// The document record.
     pub document: RetrievalDocument,
+    /// Source path the document is drawn from.
     pub path: String,
+    /// Display/symbol name used for exact-match lookups.
     pub name: String,
+    /// Text body fed to the FTS index.
     pub body: String,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Everything committed atomically for one snapshot.
 pub struct SnapshotRecords {
+    /// Artifact records to register.
     pub artifacts: Vec<ArtifactRecord>,
+    /// Source file records.
     pub files: Vec<SourceFileRecord>,
+    /// Canonical code regions.
     pub regions: Vec<CodeRegion>,
+    /// Entity graph nodes.
     pub entities: Vec<CodeEntity>,
+    /// Typed relations (already merged across extractors).
     pub relations: Vec<Relation>,
+    /// Retrieval documents for FTS.
     pub documents: Vec<IndexedDocument>,
 }
 
 #[derive(Debug, Clone)]
+/// One FTS5 match with its entity linkage and score.
 pub struct LexicalHit {
+    /// Retrieved document id.
     pub document_id: String,
+    /// Entity owning the document.
     pub entity_id: String,
+    /// Canonical region, when mappable.
     pub region_id: Option<String>,
+    /// Symbol/display name.
     pub symbol_name: String,
+    /// Document representation.
     pub representation: RetrievalRepresentation,
+    /// Primary source address.
     pub address: Option<SourceAddress>,
+    /// Evidence addresses.
     pub evidence: Vec<SourceAddress>,
+    /// FTS rank score.
     pub score: f64,
+    /// Match snippet.
     pub snippet: String,
 }
 
 /// A file's stat fingerprint observed during a repository scan.
 #[derive(Debug, Clone)]
+/// Cached file metadata for incremental scans.
 pub struct ScanCacheEntry {
+    /// Repository-relative path.
     pub path: String,
+    /// File size at scan time.
     pub size_bytes: u64,
+    /// Modification time in epoch milliseconds.
     pub mtime_ms: i64,
+    /// Line count at scan time.
     pub line_count: u64,
+    /// Content hash at scan time.
     pub content_hash: String,
 }
 
 /// Outcome of a garbage-collection pass over snapshots and the artifact store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Result of a garbage-collection pass.
 pub struct GcReport {
+    /// Snapshots dropped.
     pub pruned_snapshots: usize,
+    /// Artifact rows dereferenced.
     pub removed_digests: usize,
+    /// Unreferenced object files deleted.
     pub removed_orphan_files: usize,
+    /// Bytes reclaimed.
     pub reclaimed_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
+/// A document's materialized text plus linkage, for packing/snippet use.
 pub struct DocumentContent {
+    /// Document id.
     pub document_id: String,
+    /// Owning entity.
     pub entity_id: String,
+    /// Canonical region when mappable.
     pub region_id: Option<String>,
+    /// Document representation.
     pub representation: RetrievalRepresentation,
+    /// Primary source address.
     pub address: Option<SourceAddress>,
+    /// Evidence addresses.
     pub evidence: Vec<SourceAddress>,
+    /// Full document text.
     pub text: String,
 }
 
+/// Edge traversal direction for relation queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationDirection {
+    /// Edges where the entity is the source.
     Outgoing,
+    /// Edges where the entity is the target.
     Incoming,
+    /// Both directions.
     Both,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Result of a store health check.
 pub struct StoreHealth {
+    /// Whether `SQLite` answered its self-check.
     pub sqlite_ok: bool,
+    /// PRAGMA integrity/foreign-key messages.
     pub sqlite_messages: Vec<String>,
+    /// How many referenced artifacts were verified on disk.
     pub artifacts_checked: usize,
+    /// Referenced digests missing from the object store.
     pub missing_artifacts: Vec<String>,
+    /// Error encountered while scanning the object store, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_scan_error: Option<String>,
 }
 
+/// The canonical metadata store: one `SQLite` database (entities, relations,
+/// FTS, view status) plus the content-addressed artifact store.
 #[derive(Clone)]
 pub struct MetadataStore {
     connection: Arc<Mutex<Connection>>,
@@ -124,7 +185,16 @@ impl std::fmt::Debug for MetadataStore {
     }
 }
 
+// The connection guard is held for the whole query body; tightening its
+// drop buys nothing on a single-writer store and complicates statement
+// borrows, so the nursery lint is allowed here deliberately.
+#[allow(clippy::significant_drop_tightening)]
 impl MetadataStore {
+    /// Open (creating/migrating if needed) the store under `data_root`.
+    ///
+    /// # Errors
+    /// `UnsupportedFormat` if the database is newer than this build; I/O or
+    /// storage errors on open/migration failure.
     pub fn open(data_root: impl AsRef<Path>) -> Result<Self> {
         let data_root = data_root.as_ref();
         std::fs::create_dir_all(data_root).map_err(|error| CceError::io(data_root, error))?;
@@ -176,11 +246,16 @@ impl MetadataStore {
         })
     }
 
+    /// The content-addressed artifact store.
     #[must_use]
     pub const fn artifacts(&self) -> &ArtifactStore {
         &self.artifacts
     }
 
+    /// Insert or update a repository record.
+    ///
+    /// # Errors
+    /// Storage error on write failure.
     pub fn register_repository(&self, repository: &RepositoryIdentity) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.connection
@@ -201,6 +276,10 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Run integrity checks over `SQLite` and referenced artifacts.
+    ///
+    /// # Errors
+    /// Storage error if the checks themselves cannot run.
     pub fn health(&self) -> Result<StoreHealth> {
         let connection = self.connection.lock();
         let messages = match connection.prepare("PRAGMA quick_check") {
@@ -212,7 +291,7 @@ impl MetadataStore {
             },
             Err(error) => vec![error.to_string()],
         };
-        let sqlite_ok = messages.len() == 1 && messages[0] == "ok";
+        let sqlite_ok = messages.len() == 1 && messages.first().is_some_and(|m| m == "ok");
         let messages = messages.into_iter().map(bound_health_message).collect();
         let (digests, artifact_scan_error) =
             match connection.prepare("SELECT digest FROM artifacts ORDER BY digest") {
@@ -240,6 +319,10 @@ impl MetadataStore {
         })
     }
 
+    /// Record an artifact row so it is known to health checks and GC.
+    ///
+    /// # Errors
+    /// Storage error on write failure.
     pub fn register_artifact(&self, artifact: &ArtifactRecord) -> Result<()> {
         let connection = self.connection.lock();
         connection
@@ -258,6 +341,10 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Insert a snapshot row before its records are committed.
+    ///
+    /// # Errors
+    /// Storage error on write failure.
     pub fn begin_snapshot(&self, snapshot: &SnapshotIdentity) -> Result<()> {
         self.connection
             .lock()
@@ -281,6 +368,11 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Atomically commit all records for a snapshot (files, regions,
+    /// entities, relations, documents) in one transaction.
+    ///
+    /// # Errors
+    /// Storage error; on failure nothing is committed.
     pub fn commit_snapshot(
         &self,
         snapshot: &SnapshotIdentity,
@@ -470,6 +562,10 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Upsert the status of one view for a snapshot.
+    ///
+    /// # Errors
+    /// Storage error on write failure.
     pub fn set_view_status(
         &self,
         repository_id: &str,
@@ -503,6 +599,10 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// The most recently committed snapshot for a repository, if any.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn current_snapshot(&self, repository_id: &str) -> Result<Option<String>> {
         self.connection
             .lock()
@@ -515,6 +615,10 @@ impl MetadataStore {
             .map_err(storage_error)
     }
 
+    /// Whether the snapshot finished committing (all rows present).
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn snapshot_is_complete(&self, snapshot_id: &str) -> Result<bool> {
         self.connection
             .lock()
@@ -528,6 +632,10 @@ impl MetadataStore {
             .map_err(storage_error)
     }
 
+    /// Look up a cached per-file analysis artifact digest for reuse.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn cached_analysis_digest(
         &self,
         repository_id: &str,
@@ -551,6 +659,11 @@ impl MetadataStore {
 
     /// Look up a cached content hash for a file whose size and mtime are
     /// unchanged since the last scan. Heuristic fast path only.
+    /// Return cached scan entries for files whose mtime/size/hash still
+    /// match, so unchanged files can skip re-reading.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn scan_cache_lookup(
         &self,
         repository_id: &str,
@@ -574,6 +687,10 @@ impl MetadataStore {
 
     /// Replace the scan cache for a repository with the entries observed in
     /// the latest scan.
+    /// Replace a repository's scan-cache entries after a scan.
+    ///
+    /// # Errors
+    /// Storage error on write failure.
     pub fn update_scan_cache(&self, repository_id: &str, entries: &[ScanCacheEntry]) -> Result<()> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction().map_err(storage_error)?;
@@ -605,6 +722,10 @@ impl MetadataStore {
     /// Delete all snapshots for a repository except the current one and the
     /// `keep` most recently created completed snapshots. Returns the pruned
     /// snapshot ids. Callers must hold the index lease.
+    /// Drop all but the newest `keep` snapshots, returning removed ids.
+    ///
+    /// # Errors
+    /// Storage error on delete failure.
     pub fn prune_snapshots(&self, repository_id: &str, keep: usize) -> Result<Vec<String>> {
         let connection = self.connection.lock();
         // Query on the held guard — `current_snapshot` would re-lock this
@@ -667,6 +788,10 @@ impl MetadataStore {
 
     /// Remove artifact rows and object files that no committed metadata row
     /// references. Returns the removed digests and reclaimed byte count.
+    /// Delete artifact objects no longer referenced by metadata.
+    ///
+    /// # Errors
+    /// Storage/I/O error during the sweep.
     pub fn gc_artifacts(&self) -> Result<GcReport> {
         let connection = self.connection.lock();
         let mut statement = connection
@@ -701,12 +826,15 @@ impl MetadataStore {
             .collect::<std::result::Result<std::collections::HashSet<_>, _>>()
             .map_err(storage_error)?;
         drop(statement);
-        drop(connection);
         let mut report = self.artifacts.retain(&keep)?;
         report.removed_digests = unreferenced.len();
         Ok(report)
     }
 
+    /// Load the full view-status manifest for a snapshot.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn view_manifest(&self, repository_id: &str, snapshot_id: &str) -> Result<ViewManifest> {
         let connection = self.connection.lock();
         let mut statement = connection
@@ -760,6 +888,10 @@ impl MetadataStore {
     /// a fallback hit must cover at least two distinct query terms to count
     /// as evidence. Results are deduplicated by document id and capped at
     /// `limit`.
+    /// FTS5 query with code-switching cascade (see `fts_match_queries`).
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn lexical_search(
         &self,
         snapshot_id: &str,
@@ -843,6 +975,10 @@ impl MetadataStore {
         Ok(hits)
     }
 
+    /// Exact-name entity lookup, optionally filtered to a path prefix.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn entity_by_name(
         &self,
         snapshot_id: &str,
@@ -880,6 +1016,10 @@ impl MetadataStore {
 
     /// All entities of one kind in a snapshot — e.g. `Package` nodes for the
     /// architecture map.
+    /// List entities of a kind within a snapshot.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn entities_by_kind(
         &self,
         snapshot_id: &str,
@@ -914,6 +1054,10 @@ impl MetadataStore {
             .collect()
     }
 
+    /// Fetch a single entity by id.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn entity_by_id(&self, snapshot_id: &str, id: &str) -> Result<Option<CodeEntity>> {
         let connection = self.connection.lock();
         let row = connection
@@ -944,6 +1088,10 @@ impl MetadataStore {
 
     /// Regions of one kind for a snapshot — the canonical code-range join
     /// target shared by documents, entities, and citations.
+    /// All canonical regions in one file, ordered by position.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn regions_for_path(&self, snapshot_id: &str, path: &str) -> Result<Vec<CodeRegion>> {
         let connection = self.connection.lock();
         let mut statement = connection
@@ -1007,6 +1155,10 @@ impl MetadataStore {
         Ok(regions)
     }
 
+    /// Edges touching an entity, in the requested direction.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn relations_for_entity(
         &self,
         snapshot_id: &str,
@@ -1056,6 +1208,10 @@ impl MetadataStore {
 
     /// All relations of one kind in a snapshot — e.g. `BuildDependsOn` for
     /// the package architecture map.
+    /// All edges of a kind within a snapshot.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn relations_by_kind(
         &self,
         snapshot_id: &str,
@@ -1101,6 +1257,10 @@ impl MetadataStore {
 
     /// Total edge count touching an entity — used to penalize hub nodes
     /// during graph expansion.
+    /// Total inbound+outbound edge count for an entity.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn entity_relation_degree(&self, snapshot_id: &str, entity_id: &str) -> Result<usize> {
         self.connection
             .lock()
@@ -1114,6 +1274,10 @@ impl MetadataStore {
             .map(|count| usize::try_from(count).unwrap_or(0))
     }
 
+    /// Read the source text at a canonical address (with integrity check).
+    ///
+    /// # Errors
+    /// `ArtifactCorrupt` on digest mismatch; storage error otherwise.
     pub fn source_text(&self, address: &SourceAddress) -> Result<String> {
         let digest = self
             .connection
@@ -1139,6 +1303,10 @@ impl MetadataStore {
         String::from_utf8(slice.to_vec()).map_err(|_| CceError::ArtifactCorrupt(digest))
     }
 
+    /// Materialize all documents for a snapshot (text included).
+    ///
+    /// # Errors
+    /// Storage error on query failure.
     pub fn documents_for_snapshot(&self, snapshot_id: &str) -> Result<Vec<DocumentContent>> {
         let rows = {
             let connection = self.connection.lock();
@@ -1217,11 +1385,11 @@ fn insert_artifact(transaction: &Transaction<'_>, artifact: &ArtifactRecord) -> 
     Ok(())
 }
 
-fn json(value: &impl serde::Serialize) -> Result<String> {
+fn json(value: &impl Serialize) -> Result<String> {
     serde_json::to_string(value).map_err(Into::into)
 }
 
-fn optional_json<T: serde::Serialize>(value: Option<&T>) -> Result<Option<String>> {
+fn optional_json<T: Serialize>(value: Option<&T>) -> Result<Option<String>> {
     value.map(json).transpose()
 }
 
@@ -1373,32 +1541,63 @@ fn fts_terms(query: &str) -> Vec<String> {
 /// query whose only hit is a coincidental prefix ("stored" → "store") still
 /// surfaced noise. FTS5 has no "at least k of" operator, so the floor is
 /// expressed at the MATCH level as the OR of every pairwise AND: a fallback
-/// hit must cover at least two distinct content terms. With fewer than three
+/// hit must cover at least two distinct query terms. With fewer than three
 /// terms the prefix-AND stage already enforces the floor (a two-term query
 /// requires both terms, a one-term query its only term), so no third stage
 /// is emitted.
+///
+/// Code-switched queries (CJK runs alongside Latin words) get extra stages
+/// between the AND stages and the pairwise floor. unicode61 indexes a CJK
+/// run as one monolithic token, so a CJK term can only ever match documents
+/// carrying the same script — requiring it vetoes every Latin-script source
+/// document, which is where mixed-script answers almost always live. The
+/// Latin side of a code-switched query is a deliberate anchor (the writer
+/// chose not to translate "stale"), so it earns a single-term tail that a
+/// homogeneous query does not get.
 fn fts_match_queries(terms: &[String]) -> Vec<String> {
     let quoted = |term: &str| format!("\"{term}\"");
-    let mut queries = vec![
+    let exact_and = |terms: &[String]| {
         terms
             .iter()
             .map(|term| quoted(term))
             .collect::<Vec<_>>()
-            .join(" AND "),
+            .join(" AND ")
+    };
+    let prefix_and = |terms: &[String]| {
         terms
             .iter()
             .map(|term| format!("{}*", quoted(term)))
             .collect::<Vec<_>>()
-            .join(" AND "),
-    ];
+            .join(" AND ")
+    };
+    let mut queries = vec![exact_and(terms), prefix_and(terms)];
+    let latin: Vec<String> = terms
+        .iter()
+        .filter(|term| !term.chars().any(has_cjk))
+        .cloned()
+        .collect();
+    let code_switched = !latin.is_empty() && latin.len() < terms.len();
+    if code_switched {
+        queries.push(exact_and(&latin));
+        queries.push(prefix_and(&latin));
+    }
     if terms.len() >= 3 {
         let mut pairs = Vec::new();
         for (index, left) in terms.iter().enumerate() {
-            for right in &terms[index + 1..] {
+            for right in terms.get(index + 1..).unwrap_or_default() {
                 pairs.push(format!("({}* AND {}*)", quoted(left), quoted(right)));
             }
         }
         queries.push(pairs.join(" OR "));
+    }
+    if code_switched {
+        queries.push(
+            latin
+                .iter()
+                .map(|term| format!("{}*", quoted(term)))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        );
     }
     queries
 }
@@ -1478,6 +1677,63 @@ mod tests {
         assert_eq!(
             fts_match_queries(&fts_terms("freshness freshness")),
             ["\"freshness\"", "\"freshness\"*"]
+        );
+    }
+
+    #[test]
+    fn fts_code_switched_query_gets_latin_fallback_stages() {
+        // CJK runs index as monolithic unicode61 tokens; requiring them in
+        // every stage vetoes all Latin-script source. The Latin anchors get
+        // their own cascade and a single-term tail.
+        let terms = fts_terms("search 偶发返回陈旧结果，哪里把过期视图标记为 stale");
+        assert_eq!(
+            terms,
+            [
+                "search",
+                "偶发返回陈旧结果",
+                "哪里把过期视图标记为",
+                "stale"
+            ]
+        );
+        assert_eq!(
+            fts_match_queries(&terms),
+            [
+                "\"search\" AND \"偶发返回陈旧结果\" AND \"哪里把过期视图标记为\" AND \"stale\"",
+                "\"search\"* AND \"偶发返回陈旧结果\"* AND \"哪里把过期视图标记为\"* AND \"stale\"*",
+                "\"search\" AND \"stale\"",
+                "\"search\"* AND \"stale\"*",
+                "(\"search\"* AND \"偶发返回陈旧结果\"*) OR (\"search\"* AND \"哪里把过期视图标记为\"*) OR (\"search\"* AND \"stale\"*) OR (\"偶发返回陈旧结果\"* AND \"哪里把过期视图标记为\"*) OR (\"偶发返回陈旧结果\"* AND \"stale\"*) OR (\"哪里把过期视图标记为\"* AND \"stale\"*)",
+                "\"search\"* OR \"stale\"*",
+            ]
+        );
+    }
+
+    #[test]
+    fn fts_pure_cjk_query_keeps_strict_cascade() {
+        // No Latin anchors: nothing extra to fall back on. A single
+        // monolithic CJK term still gets exact and prefix stages.
+        let terms = fts_terms("多条检索通道的命中是怎么合并成一个排序的");
+        assert_eq!(
+            fts_match_queries(&terms),
+            [
+                "\"多条检索通道的命中是怎么合并成一个排序的\"",
+                "\"多条检索通道的命中是怎么合并成一个排序的\"*",
+            ]
+        );
+    }
+
+    #[test]
+    fn fts_diacritic_words_do_not_trigger_code_switching() {
+        // unicode61 strips diacritics on both sides, so a Latin-script word
+        // like "café" can still match — it is not a CJK monolith.
+        let terms = fts_terms("café search resume");
+        assert_eq!(
+            fts_match_queries(&terms),
+            [
+                "\"café\" AND \"search\" AND \"resume\"",
+                "\"café\"* AND \"search\"* AND \"resume\"*",
+                "(\"café\"* AND \"search\"*) OR (\"café\"* AND \"resume\"*) OR (\"search\"* AND \"resume\"*)",
+            ]
         );
     }
 }

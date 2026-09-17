@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+//! Canonical persistence for CCE: the `SQLite` metadata/FTS store plus the
+//! content-addressed artifact store for large payloads.
 
 mod artifact;
 mod metadata;

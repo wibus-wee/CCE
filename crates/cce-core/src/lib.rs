@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+//! Shared vocabulary types for CCE: canonical source addresses, entities,
+//! relations, snapshots, view manifests, and retrieval/context contracts.
+//! Every crate in the workspace speaks these types at its boundaries.
 
 mod address;
 mod context;
@@ -9,6 +12,7 @@ mod region;
 mod relation;
 mod retrieval;
 mod snapshot;
+mod text;
 
 pub use address::SourceAddress;
 pub use context::{ContextItem, ContextItemKind, ContextPack, ContextProvenance, Uncertainty};
@@ -22,5 +26,8 @@ pub use retrieval::{
     SearchRoute,
 };
 pub use snapshot::{IndexProfile, RepositoryIdentity, SnapshotIdentity};
+pub use text::has_cjk;
 
+/// On-disk data format version; bumped when the metadata/artifact layout
+/// changes incompatibly.
 pub const DATA_FORMAT_VERSION: u32 = 1;
