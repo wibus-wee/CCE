@@ -1,0 +1,22 @@
+name: cce-search-daemon-dense-jina-rerank-multi
+# Retrieval stage only: jina-v2-base-code dense embeddings plus a local
+# jina-reranker-v2-multilingual cross-encoder pass over the fused head, all inside a
+# warm cce-daemon session.
+session: daemon
+command:
+  - target/release/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 360
+model_revision: none
+dense: local
+embedding_model: jinaai/jina-embeddings-v2-base-code
+reranker: jinaai/jina-reranker-v2-base-multilingual
+environment:
+  CCE_DATA_DIR: .cce-benchmark
