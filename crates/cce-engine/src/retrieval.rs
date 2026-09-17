@@ -1,8 +1,8 @@
 use std::{collections::HashMap, time::Instant};
 
 use cce_core::{
-    Result, RetrievalRepresentation, SearchHit, SearchRequest, SearchRoute, ViewKind, ViewManifest,
-    ViewState, has_cjk,
+    QueryIntent, Result, RetrievalRepresentation, SearchHit, SearchRequest, SearchRoute, ViewKind,
+    ViewManifest, ViewState, has_cjk,
 };
 use cce_store::RelationDirection;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,21 @@ const TOPICAL: [SearchRoute; 5] = [
     SearchRoute::ExactSymbol,
     SearchRoute::Hybrid,
 ];
+
+/// How many head topical hits the feedback pass mines for expansion terms.
+/// Beyond ~5 the fused ranking is already thin and noise starts to dominate
+/// the term vocabulary.
+const PRF_FEEDBACK_DOCS: usize = 5;
+
+/// Terms appended to the second-pass query: enough to bridge a vocabulary
+/// mismatch without diluting the original intent terms.
+const PRF_EXPANSION_TERMS: usize = 8;
+
+/// Second-pass RRF numerator relative to the first-pass lexical weight.
+/// Expansion-only evidence should land in the tail where structural
+/// features and rerank can still promote it; documents confirmed by both
+/// passes gain additive fused score, which is where promotion happens.
+const PRF_ATTENUATION: f64 = 0.6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -399,6 +414,11 @@ impl CceEngine {
             }
         }
 
+        // Pseudo-relevance feedback: the fused head's discriminative terms
+        // expand the query for one more lexical pass, before graph
+        // expansion picks its seeds so both stages see the enriched head.
+        self.prf_expansion_pass(&request, &plan, &mut candidates, verified_fresh)?;
+
         if plan.routes.contains(&SearchRoute::Structural)
             && !matches!(
                 plan.graph_policy,
@@ -666,6 +686,89 @@ impl CceEngine {
             missing_capabilities,
             latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         })
+    }
+
+    /// Pseudo-relevance feedback (RM3-style): treat the fused topical head
+    /// as relevant, mine its discriminative terms, and run ONE extra FTS5
+    /// query with the expanded text so vocabulary-mismatched documents in
+    /// the tail re-enter through the same RRF fusion. Fully deterministic —
+    /// the only added work is a single `lexical_search` call.
+    ///
+    /// Skipped when the pass cannot help or was opted out of:
+    /// - `ExactEntity` intent — identifier queries gain nothing and
+    ///   expansion risks precision;
+    /// - plans without the lexical route — explicit route overrides and
+    ///   `type:` pins (`diff`/`commit` repoint the plan to other routes);
+    /// - zero topical seeds — there is no relevance signal to feed back.
+    fn prf_expansion_pass(
+        &self,
+        request: &SearchRequest,
+        plan: &QueryPlan,
+        candidates: &mut HashMap<String, Candidate>,
+        verified_fresh: bool,
+    ) -> Result<()> {
+        if plan.intent == QueryIntent::ExactEntity || !plan.routes.contains(&SearchRoute::Lexical) {
+            return Ok(());
+        }
+        let seeds: Vec<&Candidate> = ranked_candidates(candidates)
+            .into_iter()
+            .filter(|candidate| {
+                candidate
+                    .hit
+                    .contributing_routes
+                    .iter()
+                    .any(|route| TOPICAL.contains(route))
+            })
+            .take(PRF_FEEDBACK_DOCS)
+            .collect();
+        let terms = prf_expansion_terms(&request.query, &seeds);
+        if terms.is_empty() {
+            return Ok(());
+        }
+        let expanded = format!("{} {}", request.query, terms.join(" "));
+        for (offset, hit) in self
+            .store()
+            .lexical_search(
+                &request.snapshot_id,
+                &expanded,
+                request.limit.saturating_mul(2),
+                &request.filters,
+            )?
+            .into_iter()
+            // Same exclusion as the first lexical pass: commit documents are
+            // history-route evidence, not current-source answers.
+            .filter(|hit| {
+                !matches!(
+                    hit.representation,
+                    RetrievalRepresentation::CommitSummary
+                        | RetrievalRepresentation::CommitDiff
+                )
+            })
+            .enumerate()
+        {
+            let rank = offset + 1;
+            add_candidate(
+                candidates,
+                SearchHit {
+                    document_id: hit.document_id,
+                    entity_id: hit.entity_id,
+                    region_id: hit.region_id,
+                    symbol_name: Some(hit.symbol_name),
+                    representation: hit.representation,
+                    route: SearchRoute::Lexical,
+                    rank,
+                    score: hit.score,
+                    contributing_routes: vec![SearchRoute::Lexical],
+                    address: hit.address,
+                    evidence: hit.evidence,
+                    snippet: hit.snippet,
+                    verified_current: verified_fresh,
+                    explanation: vec![format!("PRF expansion: +{}", terms.join(" "))],
+                },
+                PRF_ATTENUATION / (RRF_K + rank as f64),
+            );
+        }
+        Ok(())
     }
 
     /// Post-fusion check for `path:`/`lang:` filters on routes that cannot
@@ -957,6 +1060,77 @@ fn is_identifier_like(token: &str) -> bool {
             .any(|character| character.is_ascii_uppercase())
 }
 
+/// Mine expansion terms from the feedback documents: identifier-split each
+/// hit's snippet, symbol name, and path into word terms, then rank by
+/// document frequency across the head. Terms already in the query are
+/// dropped — re-adding them buys nothing — and stopwords/short/numeric
+/// tokens are filtered inside `prf_terms_in`.
+fn prf_expansion_terms(query: &str, seeds: &[&Candidate]) -> Vec<String> {
+    let query_terms = prf_terms_in(query);
+    let mut frequency = HashMap::<String, usize>::new();
+    for seed in seeds {
+        // Per-document dedup: the score is document frequency across the
+        // head, so one snippet repeating a term cannot buy rank.
+        let mut document_terms = prf_terms_in(&seed.hit.snippet);
+        if let Some(name) = &seed.hit.symbol_name {
+            document_terms.extend(prf_terms_in(name));
+        }
+        if let Some(address) = &seed.hit.address {
+            document_terms.extend(prf_terms_in(&address.path));
+        }
+        for term in document_terms {
+            if !query_terms.contains(&term) {
+                *frequency.entry(term).or_default() += 1;
+            }
+        }
+    }
+    let mut ranked = frequency.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ranked.truncate(PRF_EXPANSION_TERMS);
+    ranked.into_iter().map(|(term, _)| term).collect()
+}
+
+/// Tokenize text into candidate expansion terms: `split_identifier_terms`
+/// breaks on non-alphanumeric plus `camelCase`/`snake_case`/digit boundaries
+/// and lowercases, so source text, symbol names, and paths all yield
+/// comparable words. Kept: ≥3 chars, at least one letter (pure digits are
+/// version/line noise), not a boilerplate stopword.
+fn prf_terms_in(text: &str) -> std::collections::HashSet<String> {
+    cce_core::split_identifier_terms(text)
+        .into_iter()
+        .filter(|term| {
+            term.chars().count() >= 3
+                && term.chars().any(char::is_alphabetic)
+                && !is_prf_stopword(term)
+        })
+        .collect()
+}
+
+/// Feedback stopwords: English function words, language keywords, and
+/// file-layout boilerplate — tokens that are frequent yet carry no
+/// discriminative signal as vocabulary bridges. Only words of ≥3 chars
+/// appear here; shorter tokens are already dropped by the length floor.
+fn is_prf_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "and" | "are" | "was" | "were" | "with" | "this" | "that" | "from" | "into" | "not"
+            | "but" | "all" | "any" | "can" | "has" | "have" | "had" | "its" | "our" | "out"
+            | "use" | "used" | "using" | "when" | "where" | "which" | "who" | "whom" | "will"
+            | "would" | "should" | "could" | "than" | "then" | "them" | "they" | "you" | "your"
+            | "how" | "what" | "why" | "does" | "the" | "for"
+            // Language keywords and identifier boilerplate.
+            | "return" | "function" | "pub" | "let" | "const" | "var" | "new" | "get" | "set"
+            | "impl" | "struct" | "enum" | "type" | "def" | "class" | "import" | "export"
+            | "async" | "await" | "true" | "false" | "none" | "null" | "nil" | "self" | "void"
+            | "int" | "str" | "string" | "bool" | "else" | "match" | "case" | "break" | "continue"
+            | "while" | "loop" | "try" | "catch" | "throw" | "throws" | "static" | "final"
+            | "public" | "private" | "protected" | "override" | "extends" | "implements"
+            | "package" | "crate" | "super" | "mod"
+            // File-layout boilerplate mined from path components.
+            | "src" | "lib" | "test" | "tests" | "index" | "main" | "pkg" | "cmd" | "app"
+    )
+}
+
 fn truncate_chars(value: &str, maximum: usize) -> String {
     value.chars().take(maximum).collect()
 }
@@ -992,5 +1166,103 @@ mod tests {
         // Code-switching does not resurrect interrogative filler.
         let tokens = entity_tokens("SnapshotIdentity 在哪定义");
         assert_eq!(tokens, ["SnapshotIdentity"]);
+    }
+
+    fn prf_seed(symbol: &str, snippet: &str, path: &str, score: f64) -> Candidate {
+        Candidate {
+            hit: SearchHit {
+                document_id: format!("doc:{symbol}"),
+                entity_id: format!("entity:{symbol}"),
+                region_id: None,
+                symbol_name: Some(symbol.to_owned()),
+                representation: RetrievalRepresentation::RawCode,
+                route: SearchRoute::Lexical,
+                rank: 1,
+                score,
+                contributing_routes: vec![SearchRoute::Lexical],
+                address: Some(cce_core::SourceAddress {
+                    repository_id: "repo".to_owned(),
+                    snapshot_id: "snap".to_owned(),
+                    path: path.to_owned(),
+                    start_byte: 0,
+                    end_byte: 1,
+                    start_line: 1,
+                    end_line: 1,
+                    symbol_id: None,
+                }),
+                evidence: Vec::new(),
+                snippet: snippet.to_owned(),
+                verified_current: true,
+                explanation: Vec::new(),
+            },
+            fused_score: score,
+        }
+    }
+
+    #[test]
+    fn prf_terms_identifier_split_and_drop_query_terms() {
+        // camelCase, snake_case, and path components all break into word
+        // terms; query terms and boilerplate never become expansion terms.
+        let seeds = [prf_seed(
+            "resumeSessionState",
+            "pub fn resume_session_state(cursor) { restore(cursor) }",
+            "src/session.rs",
+            1.0,
+        )];
+        let terms = prf_expansion_terms("cursor restore", &seeds.iter().collect::<Vec<_>>());
+        assert!(terms.contains(&"session".to_owned()));
+        assert!(terms.contains(&"state".to_owned()));
+        assert!(terms.contains(&"resume".to_owned()));
+        assert!(!terms.contains(&"cursor".to_owned()));
+        assert!(!terms.contains(&"restore".to_owned()));
+        assert!(!terms.contains(&"pub".to_owned()));
+        assert!(!terms.contains(&"src".to_owned()));
+        // "rs" is below the length floor.
+        assert!(!terms.contains(&"rs".to_owned()));
+    }
+
+    #[test]
+    fn prf_terms_ranked_by_document_frequency() {
+        // A term in two head documents outranks a term in one, however
+        // distinctive the singleton looks.
+        let seeds = [
+            prf_seed(
+                "snapshot_freshness",
+                "freshness is computed per snapshot",
+                "src/snapshot.rs",
+                1.0,
+            ),
+            prf_seed(
+                "snapshot_anchor",
+                "every snapshot carries an anchor",
+                "src/anchor.rs",
+                0.9,
+            ),
+            prf_seed("quixotic", "quixotic marker", "src/quixotic.rs", 0.8),
+        ];
+        let terms = prf_expansion_terms("where is decided", &seeds.iter().collect::<Vec<_>>());
+        assert_eq!(terms.first(), Some(&"snapshot".to_owned()));
+    }
+
+    #[test]
+    fn prf_terms_cap_and_deterministic_order() {
+        // More candidates than the term budget: the cap keeps the most
+        // frequent, breaking ties alphabetically for determinism.
+        let seeds = [prf_seed(
+            "vocabulary",
+            "zebra yarrow xenon walnut violet umber topaz silver quartz",
+            "src/vocabulary.rs",
+            1.0,
+        )];
+        let terms = prf_expansion_terms("query", &seeds.iter().collect::<Vec<_>>());
+        assert_eq!(terms.len(), PRF_EXPANSION_TERMS);
+        let mut sorted = terms.clone();
+        sorted.sort();
+        assert_eq!(terms, sorted);
+    }
+
+    #[test]
+    fn prf_terms_empty_without_seeds() {
+        assert!(prf_expansion_terms("anything", &[]).is_empty());
     }
 }

@@ -1075,3 +1075,130 @@ async fn interrupted_post_commit_views_are_repaired() {
         "repair must not re-run within the same process"
     );
 }
+
+// --- pseudo-relevance feedback ----------------------------------------------
+
+/// PRF fixture: `anchor.rs` answers the query; `harbor.rs` shares its
+/// vocabulary ("position", "dock") but never the query term itself, so
+/// only the feedback expansion can reach it.
+fn prf_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        dir.path(),
+        "src/anchor.rs",
+        "pub fn anchor_position(dock: &str) -> bool {\n    dock.is_empty()\n}\n",
+    );
+    write(
+        dir.path(),
+        "src/harbor.rs",
+        "pub fn harbor_position(dock: &str) -> bool {\n    dock.len() > 1\n}\n",
+    );
+    write(dir.path(), "README.md", "# fixture repository\n");
+    dir
+}
+
+fn has_prf_explanation(result: &cce_engine::SearchResult) -> bool {
+    result.hits.iter().any(|hit| {
+        hit.explanation
+            .iter()
+            .any(|line| line.contains("PRF expansion"))
+    })
+}
+
+#[tokio::test]
+async fn prf_second_pass_surfaces_expansion_only_hit() {
+    let repo = prf_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // "anchor" matches src/anchor.rs lexically; src/harbor.rs shares the
+    // head vocabulary (position, dock) without the query term, so the
+    // expanded second pass is the only channel that can surface it.
+    let result = engine
+        .search(search_request("anchor", true))
+        .await
+        .expect("search");
+    let harbor = result
+        .hits
+        .iter()
+        .find(|hit| hit.symbol_name.as_deref() == Some("harbor_position"))
+        .expect("harbor_position must surface through the feedback pass");
+    assert!(
+        harbor
+            .explanation
+            .iter()
+            .any(|line| line.contains("PRF expansion: +")),
+        "second-pass hit must carry the expansion explanation: {:?}",
+        harbor.explanation
+    );
+    // Attenuated entry: expansion-only evidence stays below the head of
+    // the first-pass ranking rather than leapfrogging it.
+    let top = result.hits.first().expect("non-empty hits");
+    assert!(
+        harbor.score < top.score,
+        "PRF-only hit {:?} must not outscore the fused head {:?}",
+        harbor.score,
+        top.score
+    );
+}
+
+#[tokio::test]
+async fn prf_skips_exact_entity_and_route_overrides() {
+    let repo = prf_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // Identifier-shaped query infers ExactEntity: expansion risks
+    // precision on a lookup that already names its target.
+    let exact = engine
+        .search(search_request("anchor_position", true))
+        .await
+        .expect("exact entity search");
+    assert!(!exact.hits.is_empty());
+    assert!(
+        !has_prf_explanation(&exact),
+        "exact-entity query must not run the feedback pass: {:?}",
+        exact
+            .hits
+            .iter()
+            .map(|hit| hit.explanation.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // An explicit route override without Lexical opted out of lexical
+    // retrieval; the pass must not smuggle it back in. Intent is supplied
+    // so the ExactEntity guard is not the one firing here.
+    let mut request = search_request("anchor_position", true);
+    request.intent = Some(cce_core::QueryIntent::NaturalLanguageBehavior);
+    request.routes = vec![cce_core::SearchRoute::ExactSymbol];
+    let routed = engine.search(request).await.expect("route override");
+    assert!(!routed.hits.is_empty());
+    assert!(
+        !has_prf_explanation(&routed),
+        "routes without Lexical must not run the feedback pass: {:?}",
+        routed
+            .hits
+            .iter()
+            .map(|hit| hit.explanation.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn prf_skips_type_pinned_queries() {
+    let repo = history_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // `type:commit` repoints the plan at the history route alone; history
+    // hits exist but no feedback pass ran.
+    let result = engine
+        .search(search_request("type:commit second_lineage_marker", true))
+        .await
+        .expect("type:commit");
+    assert!(!result.hits.is_empty());
+    assert!(
+        !has_prf_explanation(&result),
+        "type:commit must not run the feedback pass"
+    );
+}
