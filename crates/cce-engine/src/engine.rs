@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 
 use cce_core::{
     Capability, CceError, CodeEntity, CodeRegion, EntityKind, RegionKind, Relation, RelationKind,
@@ -576,7 +577,7 @@ impl CceEngine {
                 // between "which code marks views stale" phrasing and
                 // identifier-shaped implementation names — semantic material,
                 // not generated knowledge.
-                let summary_body = symbol_descriptor(&file.relative_path, parsed, index);
+                let summary_body = symbol_descriptor(&file.relative_path, file_text, parsed, index);
                 records.documents.push(IndexedDocument {
                     document: RetrievalDocument {
                         id: document_id(&unit_id, "symbol_summary", 0, summary_body.len()),
@@ -1280,16 +1281,129 @@ fn qualified_name(path: &str, parsed: &crate::ParsedFile, index: usize) -> Strin
 /// Deterministic descriptor for one symbol: kind + qualified name + file +
 /// signature, phrased so both FTS and dense models can bridge
 /// natural-language queries onto identifier-shaped implementations.
-fn symbol_descriptor(path: &str, parsed: &crate::ParsedFile, index: usize) -> String {
+/// Deterministic contextual descriptor for a symbol — the index-time half
+/// of contextual retrieval, built without a model. Natural-language queries
+/// ("how are hits merged into one ranking") share almost no vocabulary with
+/// identifier spellings (`add_candidate`), so the descriptor carries every
+/// free semantic surface the parse already produced: split identifier
+/// words, the doc comment, callee spellings, and type references.
+fn symbol_descriptor(
+    path: &str,
+    file_text: &str,
+    parsed: &crate::ParsedFile,
+    index: usize,
+) -> String {
     let unit = &parsed.units[index];
     let kind = format!("{:?}", unit.kind).to_ascii_lowercase();
     let qualified = qualified_name(path, parsed, index);
     let mut descriptor = format!("{kind} {qualified} in {path}");
+    let split_words = split_identifier_words(&unit.name);
+    if !split_words.is_empty() && split_words != unit.name.to_ascii_lowercase() {
+        let _ = write!(descriptor, " ({split_words})");
+    }
     if let Some(signature) = &unit.signature {
         descriptor.push_str(" — ");
         descriptor.push_str(signature);
     }
+    if let Some(doc) = leading_doc_comment(file_text, unit.start_line) {
+        descriptor.push('\n');
+        descriptor.push_str(&doc);
+    }
+    let mut callees = parsed
+        .calls
+        .iter()
+        .filter(|call| call.caller == Some(index))
+        .map(|call| call.name.as_str())
+        .collect::<Vec<_>>();
+    callees.sort_unstable();
+    callees.dedup();
+    callees.truncate(12);
+    if !callees.is_empty() {
+        let _ = write!(descriptor, "\ncalls: {}", callees.join(", "));
+    }
+    if !unit.type_references.is_empty() {
+        let _ = write!(
+            descriptor,
+            "\nuses types: {}",
+            unit.type_references.join(", ")
+        );
+    }
     descriptor
+}
+
+/// `add_candidate`/`addCandidate`/`HTTPServer` -> "add candidate" etc. —
+/// the natural-language words hidden inside an identifier spelling.
+fn split_identifier_words(name: &str) -> String {
+    lexical_terms(name).join(" ")
+}
+
+/// Leading doc/comment lines above a unit, language-agnostic: contiguous
+/// `///`, `//!`, `//`, `#`, `--`, or `#[doc = "..."]` lines, or a `*/`
+/// block walked back to its `/*`. Capped at a few short lines — the goal
+/// is topical vocabulary, not a doc extract.
+fn leading_doc_comment(file_text: &str, start_line: u32) -> Option<String> {
+    let lines: Vec<&str> = file_text.lines().collect();
+    let mut cursor = start_line as usize;
+    let mut collected: Vec<String> = Vec::new();
+    while cursor > 0 && collected.len() < 4 {
+        cursor -= 1;
+        let trimmed = lines[cursor].trim();
+        if trimmed.is_empty() {
+            if collected.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if trimmed.starts_with("#[") {
+            if let Some(quoted) = trimmed.strip_prefix("#[doc").and_then(|rest| {
+                rest.trim_start_matches([' ', '='])
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.rsplit('"').nth(1))
+            }) {
+                collected.push(quoted.trim().to_owned());
+            }
+            // Other attributes belong to the unit, not the comment.
+            continue;
+        }
+        if let Some(body) = trimmed
+            .strip_prefix("///")
+            .or_else(|| trimmed.strip_prefix("//!"))
+            .or_else(|| trimmed.strip_prefix("//"))
+            .or_else(|| trimmed.strip_prefix("--"))
+            .or_else(|| trimmed.strip_prefix('#'))
+        {
+            collected.push(body.trim().to_owned());
+            continue;
+        }
+        if trimmed.ends_with("*/") {
+            // Walk back to the block comment opener, collecting content.
+            while cursor > 0 {
+                let inner = lines[cursor].trim();
+                let is_open = inner.contains("/*");
+                let body = inner
+                    .trim_end_matches("*/")
+                    .trim_start_matches("/*")
+                    .trim_start_matches('*')
+                    .trim();
+                if !body.is_empty() {
+                    collected.push(body.to_owned());
+                }
+                cursor -= 1;
+                if is_open {
+                    break;
+                }
+            }
+            continue;
+        }
+        // Decorators belong to the unit, not the comment.
+        if trimmed.starts_with('@') {
+            continue;
+        }
+        break;
+    }
+    collected.reverse();
+    let doc = collected.join(" ").chars().take(400).collect::<String>();
+    (!doc.is_empty()).then_some(doc)
 }
 
 fn is_test(file: &ScannedFile, name: &str) -> bool {
