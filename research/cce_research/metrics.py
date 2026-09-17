@@ -147,6 +147,11 @@ def case_observations(case: BenchmarkCase, result: CaseResult) -> dict[str, floa
     observations["bpref@20"] = bpref(case, result.retrieved[:20])
     if case.gold_facts:
         observations["claim_support"] = claim_support(case, result.retrieved)
+    if case.expect_missing_capability:
+        expected = case.expect_missing_capability.lower()
+        observations["capability_contract"] = float(
+            any(expected in capability.lower() for capability in result.missing_capabilities)
+        )
     observations["abstention_accuracy"] = float(result.abstained == case.no_context)
     observations["relevant_line_density"] = relevant_line_density(case, result.retrieved)
     observations["citation_correctness"] = citation_correctness(result.retrieved)
@@ -277,10 +282,17 @@ def bpref(case: BenchmarkCase, retrieved: list[RetrievedRange]) -> float:
     total_relevant = len(gold)
     nonrel_before = 0
     score = 0.0
+    # Each gold path earns gain once, at its first occurrence — repeated
+    # ranges inside one file must not inflate the score past 1.0.
+    scored_gold: set[str] = set()
+    scored_nonrel: set[str] = set()
     for candidate in retrieved:
         if candidate.path in gold:
-            score += 1.0 - min(nonrel_before, total_relevant) / total_relevant
-        elif candidate.path in judged_nonrelevant:
+            if candidate.path not in scored_gold:
+                scored_gold.add(candidate.path)
+                score += 1.0 - min(nonrel_before, total_relevant) / total_relevant
+        elif candidate.path in judged_nonrelevant and candidate.path not in scored_nonrel:
+            scored_nonrel.add(candidate.path)
             nonrel_before += 1
         # Unjudged items are neither reward nor penalty — that is the point.
     return score / total_relevant

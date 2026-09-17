@@ -110,6 +110,10 @@ class BenchmarkCase(BaseModel):
     # Optional extraction key for downstream answer probes: the string a
     # correct consumer must be able to produce from the pack.
     answer_key: str | None = None
+    # Capability-contract cases: when set, the result must surface a
+    # missing_capability containing this substring (case-insensitive).
+    # "Refuse correctly" is the pass condition, not retrieval.
+    expect_missing_capability: str | None = None
     provenance: Provenance
     tags: list[str] = Field(default_factory=list)
 
