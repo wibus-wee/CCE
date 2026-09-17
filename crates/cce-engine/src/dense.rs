@@ -196,8 +196,14 @@ impl LocalEmbedder {
         let options = fastembed::TextInitOptions::new(model)
             .with_cache_dir(cache_dir.to_path_buf())
             .with_show_download_progress(true);
-        let session = fastembed::TextEmbedding::try_new(options)
-            .map_err(|error| CceError::Embedding(format!("local model init failed: {error}")))?;
+        let session = fastembed::TextEmbedding::try_new(options).map_err(|error| {
+            CceError::Embedding(format!(
+                "local model init failed: {error} — models download into {} on first use \
+                 (the `--dense local` opt-in); check network/proxy access or run with \
+                 CCE_DENSE=disabled to skip the dense view",
+                cache_dir.display()
+            ))
+        })?;
         // E5-family models require "query: "/"passage: " prefixes; fastembed
         // does not add them itself.
         let prefix = model_code

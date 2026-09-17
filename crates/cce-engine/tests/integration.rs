@@ -1004,3 +1004,74 @@ async fn history_indexing_is_idempotent() {
         .collect::<Vec<_>>();
     assert_eq!(third_ids, first_ids);
 }
+
+#[tokio::test]
+async fn interrupted_post_commit_views_are_repaired() {
+    let repo = history_repo();
+    let engine = engine(repo.path());
+    let report = engine.index().await.expect("index");
+    let repository_id = report.repository_id.clone();
+    let snapshot_id = report.snapshot.id.clone();
+
+    // Simulate a process killed between `commit_snapshot` and the
+    // post-commit status writes: records committed, statuses stuck.
+    let stuck_kinds = [
+        ViewKind::Symbols,
+        ViewKind::Graph,
+        ViewKind::Knowledge,
+        ViewKind::History,
+        ViewKind::Dataflow,
+    ];
+    let manifest = engine
+        .store()
+        .view_manifest(&repository_id, &snapshot_id)
+        .expect("manifest");
+    for kind in stuck_kinds {
+        let mut view = manifest.views[&kind].clone();
+        view.state = ViewState::Building;
+        engine
+            .store()
+            .set_view_status(&repository_id, &snapshot_id, kind, &view)
+            .expect("corrupt view");
+    }
+
+    let second = engine.index().await.expect("repairing index");
+    assert!(second.reused_snapshot);
+    let repaired = second.manifest;
+    assert_eq!(repaired.views[&ViewKind::Symbols].state, ViewState::Ready);
+    assert_eq!(repaired.views[&ViewKind::Graph].state, ViewState::Partial);
+    assert_eq!(
+        repaired.views[&ViewKind::Knowledge].state,
+        ViewState::Partial
+    );
+    assert_eq!(repaired.views[&ViewKind::History].state, ViewState::Ready);
+    assert_eq!(
+        repaired.views[&ViewKind::Dataflow].state,
+        ViewState::Unavailable
+    );
+    // Repaired statuses report recomputed evidence, not just a flipped flag.
+    let history = &repaired.views[&ViewKind::History];
+    assert!(
+        history
+            .capabilities
+            .iter()
+            .any(|capability| capability.name == "git_diff_hunks"),
+        "repaired history lost its capabilities: {:?}",
+        history.capabilities
+    );
+
+    // Repair runs once per snapshot per process: a view corrupted after the
+    // pass is reported as-is instead of re-triggering the repair pipeline.
+    let mut view = repaired.views[&ViewKind::History].clone();
+    view.state = ViewState::Building;
+    engine
+        .store()
+        .set_view_status(&repository_id, &snapshot_id, ViewKind::History, &view)
+        .expect("corrupt again");
+    let third = engine.index().await.expect("third index");
+    assert_eq!(
+        third.manifest.views[&ViewKind::History].state,
+        ViewState::Building,
+        "repair must not re-run within the same process"
+    );
+}

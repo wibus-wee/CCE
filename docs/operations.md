@@ -20,7 +20,7 @@ Embedding models for `--dense local` and reranker models for `--reranker` are do
 
 ## Failure recovery
 
-- An interrupted build does not advance `current_snapshots`; retry `cce index`.
+- A build interrupted before the records commit does not advance `current_snapshots`; retry `cce index`. One interrupted after it leaves post-commit views stuck at `building`/`failed` on the committed snapshot — the next `cce index` repairs them in place (each input is recomputed from committed records; a `failed` dense backend retries once per process, so a missing model file reports `failed` once instead of re-running per request).
 - A corrupt artifact produces an explicit error and must be restored from backup or rebuilt from source.
 - A newer SQLite format is never downgraded in place; deploy a compatible binary.
 - If local embedding fails (model download, ONNX session, or inference), the dense view becomes failed while the prior complete snapshot remains available. Re-run `cce index` once the model files are present or the cause is fixed, or disable dense retrieval.

@@ -67,6 +67,19 @@ pub struct SnapshotRecords {
 }
 
 #[derive(Debug, Clone)]
+/// Lightweight per-file row for post-commit view repair — the full
+/// `ArtifactRecord` is not joined since repair only needs the analysis
+/// digest to reload cached parse results.
+pub struct SourceFileRow {
+    /// Repository-relative path.
+    pub path: String,
+    /// Detected language, when known.
+    pub language: Option<String>,
+    /// Digest of cached per-file analysis output, when present.
+    pub analysis_artifact_digest: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 /// One FTS5 match with its entity linkage and score.
 pub struct LexicalHit {
     /// Retrieved document id.
@@ -1313,6 +1326,82 @@ impl MetadataStore {
                 "SELECT COUNT(*) FROM relations
                  WHERE snapshot_id=?1 AND (source_entity_id=?2 OR target_entity_id=?2)",
                 params![snapshot_id, entity_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_error)
+            .map(|count| usize::try_from(count).unwrap_or(0))
+    }
+
+    /// Per-file rows for post-commit view repair. The full artifact record
+    /// is not joined — repair only needs the analysis digest to reload
+    /// cached parse results.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn source_files_for_snapshot(&self, snapshot_id: &str) -> Result<Vec<SourceFileRow>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT path, language, analysis_artifact_digest FROM source_files
+                 WHERE snapshot_id=?1 ORDER BY path",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([snapshot_id], |row| {
+                Ok(SourceFileRow {
+                    path: row.get::<_, String>(0)?,
+                    language: row.get::<_, Option<String>>(1)?,
+                    analysis_artifact_digest: row.get::<_, Option<String>>(2)?,
+                })
+            })
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)
+    }
+
+    /// Count relations of one kind produced by a given origin — used to
+    /// recompute provider-derived view statuses during post-commit repair.
+    ///
+    /// # Errors
+    /// Storage or serialization error on failure.
+    pub fn count_relations(
+        &self,
+        snapshot_id: &str,
+        kind: &cce_core::RelationKind,
+        origin: &cce_core::RelationOrigin,
+    ) -> Result<usize> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM relations
+                 WHERE snapshot_id=?1 AND kind=?2 AND origin=?3",
+                params![
+                    snapshot_id,
+                    serde_json::to_string(kind)?,
+                    serde_json::to_string(origin)?
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_error)
+            .map(|count| usize::try_from(count).unwrap_or(0))
+    }
+
+    /// Count retrieval documents of one representation — used to recompute
+    /// history coverage during post-commit repair.
+    ///
+    /// # Errors
+    /// Storage or serialization error on failure.
+    pub fn count_documents(
+        &self,
+        snapshot_id: &str,
+        representation: &RetrievalRepresentation,
+    ) -> Result<usize> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM retrieval_documents
+                 WHERE snapshot_id=?1 AND representation=?2",
+                params![snapshot_id, json(representation)?],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(storage_error)

@@ -72,6 +72,12 @@ pub struct CceEngine {
     /// Lazily initialized cross-encoder reranker (`--reranker`). Same
     /// lifecycle as `embedder`: one ONNX session, init result cached.
     reranker: tokio::sync::OnceCell<std::result::Result<Option<crate::LocalReranker>, String>>,
+    /// Snapshot ids whose committed-view repair already ran in this process.
+    /// Repair is once per snapshot per process: a deterministically failing
+    /// step (e.g. a missing model file) reports `Failed` once instead of
+    /// re-running on every search; a fixed environment heals on the next
+    /// process/index invocation.
+    repair_attempts: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl CceEngine {
@@ -87,6 +93,7 @@ impl CceEngine {
             parser: SourceParser::new(),
             embedder: tokio::sync::OnceCell::new(),
             reranker: tokio::sync::OnceCell::new(),
+            repair_attempts: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -257,6 +264,185 @@ impl CceEngine {
         Ok(())
     }
 
+    /// Recompute the post-commit view statuses of a complete snapshot whose
+    /// index was interrupted. All inputs are derivable from committed
+    /// records: file analyses live in the artifact store, provider edges in
+    /// `relations`, history coverage in commit entities/documents, and
+    /// provider detect-state is re-probed (a report is fresher than a stale
+    /// persisted one). The dense view rebuilds in place via
+    /// `build_dense_view`. Idempotent — statuses converge, data is never
+    /// rewritten.
+    async fn repair_committed_views(
+        &self,
+        scanned: &ScannedRepository,
+        manifest: &ViewManifest,
+    ) -> Result<()> {
+        let snapshot = &scanned.snapshot;
+        let repository_id = scanned.identity.id.as_str();
+        let stuck = |kind: ViewKind| {
+            manifest
+                .views
+                .get(&kind)
+                .is_some_and(|view| matches!(view.state, ViewState::Building | ViewState::Failed))
+        };
+        let scip_edges = if stuck(ViewKind::Graph) || stuck(ViewKind::Dataflow) {
+            self.store.count_relations(
+                &snapshot.id,
+                &RelationKind::References,
+                &RelationOrigin::Scip,
+            )?
+        } else {
+            0
+        };
+        if stuck(ViewKind::Source) {
+            self.store.set_view_status(
+                repository_id,
+                &snapshot.id,
+                ViewKind::Source,
+                &source_view_status(snapshot),
+            )?;
+        }
+        if stuck(ViewKind::Lexical) {
+            self.store.set_view_status(
+                repository_id,
+                &snapshot.id,
+                ViewKind::Lexical,
+                &lexical_view_status(snapshot),
+            )?;
+        }
+        if stuck(ViewKind::Symbols) {
+            self.store.set_view_status(
+                repository_id,
+                &snapshot.id,
+                ViewKind::Symbols,
+                &symbols_view_status(snapshot, self.committed_syntax_coverage(&snapshot.id)?),
+            )?;
+        }
+        if stuck(ViewKind::Graph) {
+            self.store.set_view_status(
+                repository_id,
+                &snapshot.id,
+                ViewKind::Graph,
+                &repaired_graph_status(
+                    snapshot,
+                    &crate::providers::detect_all(&self.config.repository_root),
+                    scip_edges,
+                ),
+            )?;
+        }
+        if stuck(ViewKind::Dense) && !matches!(self.config.dense, DenseBackendConfig::Disabled) {
+            self.build_dense_view(repository_id, snapshot).await?;
+        }
+        if stuck(ViewKind::Knowledge) {
+            self.store.set_view_status(
+                repository_id,
+                &snapshot.id,
+                ViewKind::Knowledge,
+                &knowledge_view_status(snapshot),
+            )?;
+        }
+        if stuck(ViewKind::History) {
+            let commits = self
+                .store
+                .entities_by_kind(&snapshot.id, &EntityKind::Commit)?
+                .len();
+            let history_status = if commits == 0 {
+                if self.config.repository_root.join(".git").exists() {
+                    status(
+                        snapshot,
+                        ViewState::Failed,
+                        vec![],
+                        Some(
+                            "snapshot carries no commit records — history extraction failed \
+                             or produced nothing"
+                                .to_owned(),
+                        ),
+                    )
+                } else {
+                    status(
+                        snapshot,
+                        ViewState::Unavailable,
+                        vec![],
+                        Some("Repository has no local .git object database".to_owned()),
+                    )
+                }
+            } else {
+                let diff_documents = self
+                    .store
+                    .count_documents(&snapshot.id, &RetrievalRepresentation::CommitDiff)?;
+                status(
+                    snapshot,
+                    ViewState::Ready,
+                    vec![
+                        Capability {
+                            name: "git_commit_messages".to_owned(),
+                            level: "historical_evidence".to_owned(),
+                            reason: Some(format!(
+                                "{commits} reachable commits indexed with gitoxide"
+                            )),
+                        },
+                        Capability {
+                            name: "git_diff_hunks".to_owned(),
+                            level: "historical_evidence".to_owned(),
+                            reason: Some(format!(
+                                "{diff_documents} commits contributed extracted diff hunks"
+                            )),
+                        },
+                    ],
+                    None,
+                )
+            };
+            self.store.set_view_status(
+                repository_id,
+                &snapshot.id,
+                ViewKind::History,
+                &history_status,
+            )?;
+        }
+        if stuck(ViewKind::Dataflow) {
+            self.store.set_view_status(
+                repository_id,
+                &snapshot.id,
+                ViewKind::Dataflow,
+                &dataflow_view_status(snapshot, scip_edges),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Recompute tree-sitter coverage from committed file analyses — the
+    /// parse flag lives inside each file's `CachedFileAnalysis` artifact.
+    fn committed_syntax_coverage(&self, snapshot_id: &str) -> Result<f64> {
+        let mut parsed = 0_usize;
+        let mut candidates = 0_usize;
+        for row in self.store.source_files_for_snapshot(snapshot_id)? {
+            if !row.language.as_deref().is_some_and(SourceParser::supports) {
+                continue;
+            }
+            candidates += 1;
+            let Some(digest) = row.analysis_artifact_digest else {
+                continue;
+            };
+            match self.store.artifacts().read(&digest).and_then(|bytes| {
+                serde_json::from_slice::<CachedFileAnalysis>(&bytes).map_err(|error| {
+                    CceError::Storage(format!("invalid cached analysis {digest}: {error}"))
+                })
+            }) {
+                Ok(cache) => {
+                    parsed += usize::from(cache.parsed.parsed);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %row.path, %error, "skipping unreadable file analysis in repair");
+                }
+            }
+        }
+        Ok(if candidates == 0 {
+            1.0
+        } else {
+            parsed as f64 / candidates as f64
+        })
+    }
+
     /// Vectors reusable for `snapshot`'s dense build, keyed by document-text
     /// digest. Decodes the newest completed snapshot under the same index
     /// profile and joins its vectors with that snapshot's document texts —
@@ -384,20 +570,26 @@ impl CceEngine {
                 .store
                 .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
             // A snapshot is marked complete when its records transaction
-            // commits — the dense build runs after that, so an interrupted
-            // index leaves `Building` (or a transient `Failed`) committed in
-            // the manifest while the early return above would skip the
-            // rebuild forever. Repair in place: the documents the dense
-            // build needs are already committed.
-            let dense_needs_repair =
-                matches!(
-                    manifest.views.get(&ViewKind::Dense).map(|view| view.state),
-                    Some(ViewState::Building | ViewState::Failed)
-                ) && !matches!(self.config.dense, DenseBackendConfig::Disabled);
-            if dense_needs_repair {
+            // commits — post-commit steps (the dense build, view status
+            // writes) can still be interrupted, leaving `Building` (or a
+            // transient `Failed`) committed in the manifest while the early
+            // return above would skip the rebuild forever. Repair in place:
+            // every post-commit input is derivable from committed records.
+            // Once per snapshot per process — a deterministically failing
+            // step reports `Failed` once rather than re-running per search.
+            let needs_repair = manifest
+                .views
+                .values()
+                .any(|view| matches!(view.state, ViewState::Building | ViewState::Failed));
+            let first_attempt = needs_repair
+                && self
+                    .repair_attempts
+                    .lock()
+                    .map_err(|_| CceError::Storage("repair mutex poisoned".to_owned()))?
+                    .insert(scanned.snapshot.id.clone());
+            if first_attempt {
                 let _lease = crate::lock::IndexLease::acquire(&self.config.data_root)?;
-                self.build_dense_view(&scanned.identity.id, &scanned.snapshot)
-                    .await?;
+                self.repair_committed_views(&scanned, &manifest).await?;
                 manifest = self
                     .store
                     .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
@@ -1058,54 +1250,19 @@ impl CceEngine {
             &scanned.identity.id,
             &scanned.snapshot.id,
             ViewKind::Source,
-            &status(
-                &scanned.snapshot,
-                ViewState::Ready,
-                vec![Capability {
-                    name: "content_addressed_source".to_owned(),
-                    level: "authoritative".to_owned(),
-                    reason: None,
-                }],
-                None,
-            ),
+            &source_view_status(&scanned.snapshot),
         )?;
         self.store.set_view_status(
             &scanned.identity.id,
             &scanned.snapshot.id,
             ViewKind::Lexical,
-            &status(
-                &scanned.snapshot,
-                ViewState::Ready,
-                vec![Capability {
-                    name: "sqlite_fts5".to_owned(),
-                    level: "ready".to_owned(),
-                    reason: None,
-                }],
-                None,
-            ),
+            &lexical_view_status(&scanned.snapshot),
         )?;
-        let structural_state = if syntax_coverage >= 0.99 {
-            ViewState::Ready
-        } else {
-            ViewState::Partial
-        };
         self.store.set_view_status(
             &scanned.identity.id,
             &scanned.snapshot.id,
             ViewKind::Symbols,
-            &status(
-                &scanned.snapshot,
-                structural_state,
-                vec![Capability {
-                    name: "syntax_symbols".to_owned(),
-                    level: "syntax_only".to_owned(),
-                    reason: Some(format!(
-                        "tree-sitter coverage {:.1}%",
-                        syntax_coverage * 100.0
-                    )),
-                }],
-                None,
-            ),
+            &symbols_view_status(&scanned.snapshot, syntax_coverage),
         )?;
         let (graph_status, scip_edges) = graph_view_status(&scanned.snapshot, &provider_reports);
         self.store.set_view_status(
@@ -1120,23 +1277,7 @@ impl CceEngine {
             &scanned.identity.id,
             &scanned.snapshot.id,
             ViewKind::Knowledge,
-            &status(
-                &scanned.snapshot,
-                ViewState::Partial,
-                vec![
-                    Capability {
-                        name: "deterministic_role_summary".to_owned(),
-                        level: "derived".to_owned(),
-                        reason: Some("hierarchical model synthesis not configured".to_owned()),
-                    },
-                    Capability {
-                        name: "deterministic_hierarchy".to_owned(),
-                        level: "derived".to_owned(),
-                        reason: None,
-                    },
-                ],
-                None,
-            ),
+            &knowledge_view_status(&scanned.snapshot),
         )?;
         self.store.set_view_status(
             &scanned.identity.id,
@@ -1148,32 +1289,7 @@ impl CceEngine {
             &scanned.identity.id,
             &scanned.snapshot.id,
             ViewKind::Dataflow,
-            &if scip_edges > 0 {
-                status(
-                    &scanned.snapshot,
-                    ViewState::Partial,
-                    vec![Capability {
-                        name: "scip_def_ref_substrate".to_owned(),
-                        level: "compiler_derived".to_owned(),
-                        reason: Some(format!("{scip_edges} definition/reference edges ingested")),
-                    }],
-                    Some(
-                        "SCIP definition/reference graph available; no source→sink \
-                         taint analysis yet"
-                            .to_owned(),
-                    ),
-                )
-            } else {
-                status(
-                    &scanned.snapshot,
-                    ViewState::Unavailable,
-                    Vec::new(),
-                    Some(
-                        "No evidence-backed SCIP or static-analysis dataflow artifact was supplied"
-                            .to_owned(),
-                    ),
-                )
-            },
+            &dataflow_view_status(&scanned.snapshot, scip_edges),
         )?;
         if let Err(error) = self
             .store
@@ -1513,18 +1629,7 @@ fn graph_view_status(
     reports: &[crate::providers::ProviderReport],
 ) -> (ViewStatus, usize) {
     use crate::providers::ProviderState;
-    let mut capabilities = vec![
-        Capability {
-            name: "contains".to_owned(),
-            level: "syntax_fact".to_owned(),
-            reason: None,
-        },
-        Capability {
-            name: "relative_imports".to_owned(),
-            level: "framework_derived".to_owned(),
-            reason: Some("relative imports only; no compiler resolution".to_owned()),
-        },
-    ];
+    let mut capabilities = base_graph_capabilities();
     let mut uncovered = Vec::new();
     let mut scip_edges = 0_usize;
     let mut digest = None;
@@ -1555,7 +1660,73 @@ fn graph_view_status(
     let any_applicable = reports
         .iter()
         .any(|report| report.state != ProviderState::NotApplicable);
-    let (state, message) = if !any_applicable {
+    let (state, message) = graph_state(any_applicable, &uncovered);
+    let mut status = status(snapshot, state, capabilities, message);
+    status.artifact_digest = digest;
+    (status, scip_edges)
+}
+
+/// Graph status recomputed during post-commit repair: provider runs are
+/// not persisted, so detect-state is re-probed and the compiler-derived
+/// edge count comes from committed relations rather than run reports.
+fn repaired_graph_status(
+    snapshot: &SnapshotIdentity,
+    reports: &[crate::providers::ProviderReport],
+    scip_edges: usize,
+) -> ViewStatus {
+    use crate::providers::ProviderState;
+    let mut capabilities = base_graph_capabilities();
+    let mut uncovered = Vec::new();
+    for report in reports {
+        match report.state {
+            ProviderState::NotApplicable => {}
+            ProviderState::Ready => capabilities.push(Capability {
+                name: report.provider_id.clone(),
+                level: "compiler_derived".to_owned(),
+                reason: Some("provider output ingested".to_owned()),
+            }),
+            ProviderState::Missing | ProviderState::Failed => {
+                uncovered.push(format!(
+                    "{}: {}",
+                    report.provider_id,
+                    report.message.as_deref().unwrap_or("unavailable")
+                ));
+            }
+        }
+    }
+    if scip_edges > 0 {
+        capabilities.push(Capability {
+            name: "reference_edges".to_owned(),
+            level: "compiler_derived".to_owned(),
+            reason: Some(format!(
+                "{scip_edges} committed SCIP reference edges (recomputed post-repair)"
+            )),
+        });
+    }
+    let any_applicable = reports
+        .iter()
+        .any(|report| report.state != ProviderState::NotApplicable);
+    let (state, message) = graph_state(any_applicable, &uncovered);
+    status(snapshot, state, capabilities, message)
+}
+
+fn base_graph_capabilities() -> Vec<Capability> {
+    vec![
+        Capability {
+            name: "contains".to_owned(),
+            level: "syntax_fact".to_owned(),
+            reason: None,
+        },
+        Capability {
+            name: "relative_imports".to_owned(),
+            level: "framework_derived".to_owned(),
+            reason: Some("relative imports only; no compiler resolution".to_owned()),
+        },
+    ]
+}
+
+fn graph_state(any_applicable: bool, uncovered: &[String]) -> (ViewState, Option<String>) {
+    if !any_applicable {
         (
             ViewState::Partial,
             Some("Compiler/SCIP resolved references are not built".to_owned()),
@@ -1570,10 +1741,102 @@ fn graph_view_status(
                 uncovered.join("; ")
             )),
         )
-    };
-    let mut status = status(snapshot, state, capabilities, message);
-    status.artifact_digest = digest;
-    (status, scip_edges)
+    }
+}
+
+fn source_view_status(snapshot: &SnapshotIdentity) -> ViewStatus {
+    status(
+        snapshot,
+        ViewState::Ready,
+        vec![Capability {
+            name: "content_addressed_source".to_owned(),
+            level: "authoritative".to_owned(),
+            reason: None,
+        }],
+        None,
+    )
+}
+
+fn lexical_view_status(snapshot: &SnapshotIdentity) -> ViewStatus {
+    status(
+        snapshot,
+        ViewState::Ready,
+        vec![Capability {
+            name: "sqlite_fts5".to_owned(),
+            level: "ready".to_owned(),
+            reason: None,
+        }],
+        None,
+    )
+}
+
+fn symbols_view_status(snapshot: &SnapshotIdentity, syntax_coverage: f64) -> ViewStatus {
+    status(
+        snapshot,
+        if syntax_coverage >= 0.99 {
+            ViewState::Ready
+        } else {
+            ViewState::Partial
+        },
+        vec![Capability {
+            name: "syntax_symbols".to_owned(),
+            level: "syntax_only".to_owned(),
+            reason: Some(format!(
+                "tree-sitter coverage {:.1}%",
+                syntax_coverage * 100.0
+            )),
+        }],
+        None,
+    )
+}
+
+fn knowledge_view_status(snapshot: &SnapshotIdentity) -> ViewStatus {
+    status(
+        snapshot,
+        ViewState::Partial,
+        vec![
+            Capability {
+                name: "deterministic_role_summary".to_owned(),
+                level: "derived".to_owned(),
+                reason: Some("hierarchical model synthesis not configured".to_owned()),
+            },
+            Capability {
+                name: "deterministic_hierarchy".to_owned(),
+                level: "derived".to_owned(),
+                reason: None,
+            },
+        ],
+        None,
+    )
+}
+
+fn dataflow_view_status(snapshot: &SnapshotIdentity, scip_edges: usize) -> ViewStatus {
+    if scip_edges > 0 {
+        status(
+            snapshot,
+            ViewState::Partial,
+            vec![Capability {
+                name: "scip_def_ref_substrate".to_owned(),
+                level: "compiler_derived".to_owned(),
+                reason: Some(format!("{scip_edges} definition/reference edges ingested")),
+            }],
+            Some(
+                "SCIP definition/reference graph available; no source→sink \
+                 taint analysis yet"
+                    .to_owned(),
+            ),
+        )
+    } else {
+        status(
+            snapshot,
+            ViewState::Unavailable,
+            Vec::new(),
+            Some(
+                "No evidence-backed SCIP or static-analysis dataflow artifact was supplied"
+                    .to_owned(),
+            ),
+        )
+    }
 }
 
 /// Commits walked for history extraction (message summary and diff
