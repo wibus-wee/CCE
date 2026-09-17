@@ -601,7 +601,12 @@ impl CceEngine {
             &request.query,
             &mut candidates,
         )?;
-        apply_corroboration(&expansion_evidence, &mut candidates);
+        apply_corroboration(
+            self.store(),
+            &request.snapshot_id,
+            &expansion_evidence,
+            &mut candidates,
+        )?;
 
         // Multiple retrieval documents can describe one source region (raw
         // chunk + symbol summary); the hit list presents regions, so the
@@ -962,6 +967,18 @@ const PACKAGE_BONUS: f64 = 0.15;
 /// leapfrog an identity match on its own.
 const CORROBORATION_BONUS: f64 = 0.2;
 
+/// Head candidates inspected for mechanism clustering: wide enough to
+/// catch a task's file set when it genuinely clusters, narrow enough to
+/// keep the relations fetch at ~one query per head file.
+const CLUSTER_HEAD: usize = 15;
+
+/// Intra-candidate edge weight. ln-damped so the first supporting edges
+/// matter most — 0.12·ln(2) ≈ 0.08 for one edge, ≈0.17 for three — and
+/// capped beside the co-change ceiling: a file whose neighbors also rank
+/// is corroborated, never self-evident.
+const CLUSTER_SCALE: f64 = 0.12;
+const CLUSTER_CAP: f64 = 0.2;
+
 /// Structural priors layered on the fused ranking:
 /// - exact symbol/word agreement between the query and a hit's symbol name;
 /// - same-file evidence aggregation (a file holding a top-3 hit makes its
@@ -1127,23 +1144,70 @@ fn apply_structural_features(
     Ok(())
 }
 
-/// Join expansion evidence back onto document candidates. Expansion hits
-/// are keyed `entity:{id}` while document candidates carry document ids,
-/// so the `add_candidate` merge can never connect them — before this
-/// pass a gold file confirmed by three graph edges scored identically to
-/// an isolated vocabulary match.
+/// Join graph evidence back onto document candidates — the pass that
+/// fixes the `entity:`-vs-document key asymmetry of `add_candidate`.
+/// Two priors share one per-candidate loop:
 ///
-/// A candidate is corroborated when it IS a surfaced entity, shares a
-/// surfaced entity's region, or lives in a file any surfaced entity
-/// points into — path membership covers both the file-entity-adjacent
-/// (`ChangedWith`/`Imports`) and symbol-entity-adjacent (`Calls`/
-/// `References`) cases, since surfaced entities of either granularity
-/// carry the file's `address.path`. Strength is the best normalized
-/// propagated score reaching the candidate, so weak tail evidence lifts
-/// less than a head-confirmed hit.
-fn apply_corroboration(expansion: &ExpansionEvidence, candidates: &mut HashMap<String, Candidate>) {
-    if expansion.entities.is_empty() {
-        return;
+/// Corroboration: expansion hits are keyed `entity:{id}` while document
+/// candidates carry document ids, so the merge can never connect them —
+/// before this pass a gold file confirmed by three graph edges scored
+/// identically to an isolated vocabulary match. A candidate is
+/// corroborated when it IS a surfaced entity, shares a surfaced entity's
+/// region, or lives in a file any surfaced entity points into — path
+/// membership covers both file-entity-adjacent (`ChangedWith`/`Imports`)
+/// and symbol-entity-adjacent (`Calls`/`References`) expansion, since
+/// surfaced entities of either granularity carry `address.path`.
+/// Strength is the best normalized propagated score reaching the
+/// candidate, so weak tail evidence lifts less than a head-confirmed hit.
+///
+/// Cluster support: the files answering one query call, import, and
+/// co-change each other; isolated vocabulary matches don't. The head's
+/// candidates resolve to FILE entities (document hits on symbol regions
+/// still map to a file through `address.path`), then edges whose other
+/// endpoint is also in the head file set count as per-file support. Only
+/// file-level adjacency is visible at this granularity: symbol-level
+/// `Calls` never touch file entities as endpoints, so `Imports`/
+/// `ChangedWith` carry the cluster signal.
+fn apply_corroboration(
+    store: &MetadataStore,
+    snapshot_id: &str,
+    expansion: &ExpansionEvidence,
+    candidates: &mut HashMap<String, Candidate>,
+) -> Result<()> {
+    let mut head_files = HashMap::<String, String>::new(); // path → file entity id
+    for candidate in ranked_candidates(candidates).into_iter().take(CLUSTER_HEAD) {
+        let Some(path) = candidate.hit.address.as_ref().map(|a| a.path.clone()) else {
+            continue;
+        };
+        if head_files.contains_key(&path) {
+            continue;
+        }
+        if let Some(entity) = file_entity(store, snapshot_id, &path)? {
+            head_files.insert(path, entity.id);
+        }
+    }
+    let head_ids: std::collections::HashSet<&str> =
+        head_files.values().map(String::as_str).collect();
+    // path → count of edges whose other endpoint is another head file.
+    let mut support = HashMap::<String, usize>::new();
+    for (path, file_id) in &head_files {
+        // Span the whole degree like the co-change fetch: confidence-
+        // ordered heads crowd out the 0.7-capped ChangedWith edges that
+        // carry much of the cluster signal.
+        let degree = store.entity_relation_degree(snapshot_id, file_id)?;
+        let count = store
+            .relations_for_entity(snapshot_id, file_id, RelationDirection::Both, degree)?
+            .iter()
+            .filter(|relation| {
+                let other = if relation.source_entity_id == *file_id {
+                    relation.target_entity_id.as_str()
+                } else {
+                    relation.source_entity_id.as_str()
+                };
+                other != file_id.as_str() && head_ids.contains(other)
+            })
+            .count();
+        support.insert(path.clone(), count);
     }
     for candidate in candidates.values_mut() {
         let hit = &candidate.hit;
@@ -1152,27 +1216,43 @@ fn apply_corroboration(expansion: &ExpansionEvidence, candidates: &mut HashMap<S
         if hit.contributing_routes.contains(&SearchRoute::Structural) {
             continue;
         }
-        let evidence = [
-            expansion.entities.get(&hit.entity_id),
-            hit.region_id
-                .as_ref()
-                .and_then(|region_id| expansion.regions.get(region_id)),
-            hit.address
-                .as_ref()
-                .and_then(|address| expansion.paths.get(&address.path)),
-        ]
-        .into_iter()
-        .flatten()
-        .max_by(|left, right| left.0.total_cmp(&right.0));
-        if let Some(&(score, edges)) = evidence {
-            let strength = (score / expansion.max_score).min(1.0);
-            candidate.fused_score += CORROBORATION_BONUS * strength / RRF_K;
-            candidate.hit.explanation.push(format!(
-                "corroborated by graph expansion ({edges} edge{})",
-                if edges == 1 { "" } else { "s" }
-            ));
+        let mut bonus = 0.0_f64;
+        let mut notes = Vec::new();
+        if !expansion.entities.is_empty() {
+            let evidence = [
+                expansion.entities.get(&hit.entity_id),
+                hit.region_id
+                    .as_ref()
+                    .and_then(|region_id| expansion.regions.get(region_id)),
+                hit.address
+                    .as_ref()
+                    .and_then(|address| expansion.paths.get(&address.path)),
+            ]
+            .into_iter()
+            .flatten()
+            .max_by(|left, right| left.0.total_cmp(&right.0));
+            if let Some(&(score, edges)) = evidence {
+                let strength = (score / expansion.max_score).min(1.0);
+                bonus = CORROBORATION_BONUS.mul_add(strength, bonus);
+                notes.push(format!(
+                    "corroborated by graph expansion ({edges} edge{})",
+                    if edges == 1 { "" } else { "s" }
+                ));
+            }
         }
+        if let Some(&count) = hit
+            .address
+            .as_ref()
+            .and_then(|address| support.get(&address.path))
+            .filter(|count| **count > 0)
+        {
+            bonus += (CLUSTER_SCALE * (count as f64).ln_1p()).min(CLUSTER_CAP);
+            notes.push(format!("{count} intra-candidate edges (mechanism cluster)"));
+        }
+        candidate.hit.explanation.extend(notes);
+        candidate.fused_score += bonus / RRF_K;
     }
+    Ok(())
 }
 
 /// The package owning `path`: the longest matching `rootDir` prefix.
@@ -1630,7 +1710,12 @@ mod tests {
         structural.hit.contributing_routes = vec![SearchRoute::Structural];
         candidates.insert("s".to_owned(), structural);
 
-        apply_corroboration(&expansion, &mut candidates);
+        // No file entities are indexed, so no head file resolves and the
+        // cluster pass contributes nothing — the gap is pure corroboration.
+        let records = SnapshotRecords::default();
+        let (_dir, store, snapshot_id) = store_with(&records);
+        apply_corroboration(&store, &snapshot_id, &expansion, &mut candidates)
+            .expect("corroboration");
 
         // b matches its entity id at full strength; d matches through the
         // symbol's file at 0.04/0.05 strength; c is isolated; the
@@ -1650,6 +1735,51 @@ mod tests {
                 "{key} must explain its corroboration"
             );
         }
+        assert!(candidates["c"].hit.explanation.is_empty());
+    }
+
+    #[test]
+    fn clustered_file_outranks_lone_file() {
+        // Mechanism density: a and b co-change inside the candidate head;
+        // c is isolated. Each endpoint counts the edge once, so both
+        // clustered files earn the ln-damped bonus and the lone file
+        // earns nothing — the sibling's presence in the ranking is the
+        // evidence.
+        let records = SnapshotRecords {
+            entities: vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")],
+            relations: vec![changed_with("file:src/a.rs", "file:src/b.rs", 0.6)],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, store, snapshot_id) = store_with(&records);
+
+        let mut candidates = HashMap::new();
+        candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
+        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.1));
+        candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.1));
+        apply_corroboration(
+            &store,
+            &snapshot_id,
+            &ExpansionEvidence::default(),
+            &mut candidates,
+        )
+        .expect("corroboration");
+
+        let expected = CLUSTER_SCALE * 2.0_f64.ln() / RRF_K;
+        for key in ["a", "b"] {
+            assert!(
+                (candidates[key].fused_score - 0.1 - expected).abs() < 1e-9,
+                "{key} fused {}",
+                candidates[key].fused_score
+            );
+            assert!(
+                candidates[key]
+                    .hit
+                    .explanation
+                    .iter()
+                    .any(|line| line.contains("intra-candidate edges (mechanism cluster)"))
+            );
+        }
+        assert!((candidates["c"].fused_score - 0.1).abs() < f64::EPSILON);
         assert!(candidates["c"].hit.explanation.is_empty());
     }
 
