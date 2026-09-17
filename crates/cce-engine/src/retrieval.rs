@@ -1019,9 +1019,10 @@ const PACKAGE_BONUS: f64 = 0.15;
 const CORROBORATION_BONUS: f64 = 0.2;
 
 /// Head candidates inspected for mechanism clustering: wide enough to
-/// catch a task's file set when it genuinely clusters, narrow enough to
-/// keep the relations fetch at ~one query per head file.
-const CLUSTER_HEAD: usize = 15;
+/// catch a task's file set when it genuinely clusters — gold evidence for
+/// one query routinely spans 6-11 files parked across ranks 6-30 — while
+/// bounded so the relations fetch stays at ~one query per head file.
+const CLUSTER_HEAD: usize = 30;
 
 /// Intra-candidate edge weight. ln-damped so the first supporting edges
 /// matter most — 0.12·ln(2) ≈ 0.08 for one edge, ≈0.17 for three — and
@@ -1197,7 +1198,7 @@ fn apply_structural_features(
 
 /// Join graph evidence back onto document candidates — the pass that
 /// fixes the `entity:`-vs-document key asymmetry of `add_candidate`.
-/// Two priors share one per-candidate loop:
+/// Three priors share one per-candidate loop:
 ///
 /// Corroboration: expansion hits are keyed `entity:{id}` while document
 /// candidates carry document ids, so the merge can never connect them —
@@ -1999,7 +2000,7 @@ mod tests {
         candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.1));
         candidates.insert("d".to_owned(), candidate("d", "src/d.rs", 0.1));
         candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.1));
-        let mut structural = candidate("s", "src/b.rs", 0.1);
+        let mut structural = candidate("s", "src/e.rs", 0.1);
         structural.hit.route = SearchRoute::Structural;
         structural.hit.contributing_routes = vec![SearchRoute::Structural];
         candidates.insert("s".to_owned(), structural);
