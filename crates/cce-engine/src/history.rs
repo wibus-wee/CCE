@@ -53,6 +53,16 @@ pub(crate) fn summarize(
     }))
 }
 
+/// One commit's touched paths plus its committer timestamp, diffed against
+/// its first parent.
+#[derive(Debug)]
+pub(crate) struct CommitPaths {
+    /// Committer timestamp, seconds since the epoch.
+    pub timestamp: i64,
+    /// Repository-relative paths the commit touched.
+    pub paths: Vec<String>,
+}
+
 /// Paths touched by each recent commit, diffed against its first parent and
 /// newest first. Root commits contribute nothing — their "change" is the
 /// whole tree. Every failure degrades to a shorter or empty list: history is
@@ -60,7 +70,7 @@ pub(crate) fn summarize(
 pub(crate) fn changed_paths_per_commit(
     repository_root: &Path,
     maximum_commits: usize,
-) -> Vec<Vec<String>> {
+) -> Vec<CommitPaths> {
     let mut commits = Vec::new();
     if !repository_root.join(".git").exists() {
         return commits;
@@ -90,11 +100,28 @@ pub(crate) fn changed_paths_per_commit(
         let Ok(parent_tree) = parent.tree() else {
             continue;
         };
+        let timestamp = commit.time().map_or(0, |time| time.seconds);
         let mut touched = Vec::new();
         diff_trees(&repository, &parent_tree, &tree, "", &mut touched);
-        commits.push(touched);
+        commits.push(CommitPaths {
+            timestamp,
+            paths: touched,
+        });
     }
     commits
+}
+
+/// Newest-commit timestamp per touched path. The walk is newest-first, so
+/// a path's first sighting is its most recent change — later sightings are
+/// older and must not overwrite the entry.
+pub(crate) fn last_touched(commits: &[CommitPaths]) -> std::collections::HashMap<String, i64> {
+    let mut touched = std::collections::HashMap::new();
+    for commit in commits {
+        for path in &commit.paths {
+            touched.entry(path.clone()).or_insert(commit.timestamp);
+        }
+    }
+    touched
 }
 
 /// Record paths whose entries differ between two trees, recursing only into

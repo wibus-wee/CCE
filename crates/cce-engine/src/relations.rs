@@ -21,6 +21,9 @@ pub(crate) struct RelationContext<'a> {
     pub unit_ids: &'a HashMap<String, Vec<String>>,
     /// Simple-name lookup for every extracted symbol entity.
     pub name_index: &'a HashMap<String, Vec<SymbolCandidate>>,
+    /// Newest-first per-commit touched paths, shared with the `lastTouched`
+    /// attribute pass so history is walked once per index.
+    pub touched: &'a [crate::history::CommitPaths],
 }
 
 #[derive(Debug, Clone)]
@@ -495,13 +498,13 @@ fn changed_with_relations(context: &RelationContext<'_>) -> Vec<Relation> {
     const MAX_COMMITS: usize = 256;
     const MAX_FILES_PER_COMMIT: usize = 512;
     const MAX_PARTNERS: usize = 8;
-    let Some(root) = repository_root(context) else {
-        return Vec::new();
-    };
     let mut appearances: HashMap<String, usize> = HashMap::new();
     let mut co_changes: HashMap<(String, String), usize> = HashMap::new();
-    for touched in crate::history::changed_paths_per_commit(&root, MAX_COMMITS) {
-        let mut paths = touched
+    // The shared walk covers more commits than this pass needs; the cap
+    // here keeps the co-change window unchanged.
+    for commit in context.touched.iter().take(MAX_COMMITS) {
+        let mut paths = commit
+            .paths
             .iter()
             .filter(|path| context.file_entities.contains_key(path.as_str()))
             .cloned()
@@ -584,19 +587,6 @@ fn changed_with_relations(context: &RelationContext<'_>) -> Vec<Relation> {
         });
     }
     relations
-}
-
-/// The repository root recovered from a scanned file: `absolute_path` is
-/// always `root.join(relative_path)` by scanner construction.
-fn repository_root(context: &RelationContext<'_>) -> Option<std::path::PathBuf> {
-    let file = context.files.first()?;
-    let mut root = file.absolute_path.clone();
-    for _ in std::path::Path::new(&file.relative_path).components() {
-        if !root.pop() {
-            return None;
-        }
-    }
-    Some(root)
 }
 
 // --- tests -----------------------------------------------------------------

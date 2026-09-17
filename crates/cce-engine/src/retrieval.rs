@@ -1,8 +1,8 @@
 use std::{collections::HashMap, time::Instant};
 
 use cce_core::{
-    CodeEntity, EntityKind, Result, RetrievalRepresentation, SearchHit, SearchRequest, SearchRoute,
-    ViewKind, ViewManifest, ViewState, has_cjk,
+    CodeEntity, EntityKind, QueryIntent, Result, RetrievalRepresentation, SearchHit, SearchRequest,
+    SearchRoute, ViewKind, ViewManifest, ViewState, has_cjk,
 };
 use cce_store::{MetadataStore, RelationDirection};
 use serde::{Deserialize, Serialize};
@@ -510,9 +510,18 @@ impl CceEngine {
             );
         }
 
+        // One clock read anchors the recency prior for the whole pass so a
+        // query's ordering is internally consistent.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+            });
         apply_structural_features(
             self.store(),
             &request.snapshot_id,
+            plan.intent,
+            now_unix,
             &request.query,
             &mut candidates,
         )?;
@@ -773,11 +782,15 @@ const CO_CHANGE_SCALE: f64 = 0.3;
 ///   other hits more likely to be task evidence);
 /// - git co-change neighborhood (files that keep landing in the same
 ///   commits as a top-3 file);
+/// - git recency prior for issue/history intents (a recently touched file
+///   is the likelier culprit — BugCache-style version-history evidence);
 /// - definition prior (Signature/TestBehavior representations beat stray
 ///   raw-code mentions for symbol-shaped queries).
 fn apply_structural_features(
     store: &MetadataStore,
     snapshot_id: &str,
+    intent: QueryIntent,
+    now_unix: i64,
     query: &str,
     candidates: &mut HashMap<String, Candidate>,
 ) -> Result<()> {
@@ -824,6 +837,15 @@ fn apply_structural_features(
             *confidence = confidence.max(relation.confidence);
         }
     }
+    // BugCache-style recency prior for fault-localization intents: a file
+    // touched recently is the likelier culprit. A 90-day half-life keeps a
+    // same-day touch near the 0.2 ceiling and a year-old touch near
+    // nothing; staleness decays evidence rather than disqualifying it.
+    let recency_intent = matches!(
+        intent,
+        QueryIntent::IssueLocalization | QueryIntent::History
+    );
+    let mut last_touched = HashMap::<String, Option<i64>>::new();
     for candidate in candidates.values_mut() {
         let hit = &candidate.hit;
         let mut bonus = 0.0;
@@ -847,6 +869,28 @@ fn apply_structural_features(
                 notes.push(format!(
                     "co-change partner of a top hit file (confidence {confidence:.2})"
                 ));
+            }
+            if recency_intent {
+                let touched = if let Some(cached) = last_touched.get(path) {
+                    *cached
+                } else {
+                    let touched = file_entity(store, snapshot_id, path)?.and_then(|entity| {
+                        entity
+                            .attributes
+                            .get("lastTouched")
+                            .and_then(serde_json::Value::as_i64)
+                    });
+                    last_touched.insert(path.clone(), touched);
+                    touched
+                };
+                if let Some(touched) = touched {
+                    // Future-dated commits (clock skew) clamp to a same-day
+                    // touch rather than earning a negative-age bonus.
+                    let days = (now_unix - touched).max(0) as f64 / 86_400.0;
+                    let recency = (0.2 * (-days / 90.0).exp2()).min(0.2);
+                    bonus += recency;
+                    notes.push(format!("recently touched file ({days:.0}d ago)"));
+                }
             }
         }
         if matches!(
@@ -1135,8 +1179,15 @@ mod tests {
         candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
         candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.1));
         candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.1));
-        apply_structural_features(&store, &snapshot_id, "query", &mut candidates)
-            .expect("structural features");
+        apply_structural_features(
+            &store,
+            &snapshot_id,
+            QueryIntent::NaturalLanguageBehavior,
+            0,
+            "query",
+            &mut candidates,
+        )
+        .expect("structural features");
 
         // All three files sit in top_paths and take the same-file 0.25, so
         // the fused-score gap between a partner and the unrelated file is
@@ -1160,6 +1211,66 @@ mod tests {
             );
         }
         assert!(candidates["c"].hit.explanation.is_empty());
+    }
+
+    fn file_touched(path: &str, last_touched: i64) -> CodeEntity {
+        let mut entity = file(path);
+        entity.attributes =
+            serde_json::Map::from_iter([("lastTouched".to_owned(), last_touched.into())]);
+        entity
+    }
+
+    #[test]
+    fn recency_prior_prefers_recently_touched_under_issue_intent() {
+        let now = 1_700_000_000_i64;
+        let day = 86_400_i64;
+        let records = SnapshotRecords {
+            entities: vec![
+                file_touched("src/recent.rs", now - day),
+                file_touched("src/stale.rs", now - 400 * day),
+            ],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, store, snapshot_id) = store_with(&records);
+        let build = || {
+            let mut candidates = HashMap::new();
+            candidates.insert("r".to_owned(), candidate("r", "src/recent.rs", 0.1));
+            candidates.insert("s".to_owned(), candidate("s", "src/stale.rs", 0.1));
+            candidates
+        };
+
+        // Issue intent: the day-old file earns ~0.2, the 400-day file ~0.
+        let mut issue = build();
+        apply_structural_features(
+            &store,
+            &snapshot_id,
+            QueryIntent::IssueLocalization,
+            now,
+            "query",
+            &mut issue,
+        )
+        .expect("structural features");
+        assert!(issue["r"].fused_score > issue["s"].fused_score);
+        assert!(
+            issue["r"]
+                .hit
+                .explanation
+                .iter()
+                .any(|line| line.contains("recently touched"))
+        );
+
+        // Behavior intent carries no recency prior at all.
+        let mut behavior = build();
+        apply_structural_features(
+            &store,
+            &snapshot_id,
+            QueryIntent::NaturalLanguageBehavior,
+            now,
+            "query",
+            &mut behavior,
+        )
+        .expect("structural features");
+        assert!((behavior["r"].fused_score - behavior["s"].fused_score).abs() < f64::EPSILON);
     }
 
     #[test]

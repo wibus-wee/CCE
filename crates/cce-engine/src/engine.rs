@@ -667,6 +667,15 @@ impl CceEngine {
         let mut name_index: HashMap<String, Vec<crate::relations::SymbolCandidate>> =
             HashMap::new();
 
+        // One newest-first history walk feeds both the per-file
+        // `lastTouched` attribute below and the co-change pass in
+        // `add_derived_relations`.
+        let touched_commits = crate::history::changed_paths_per_commit(
+            &self.config.repository_root,
+            HISTORY_COMMIT_LIMIT,
+        );
+        let last_touched = crate::history::last_touched(&touched_commits);
+
         let mut texts_by_path = HashMap::new();
         for file in &scanned.files {
             let bytes = file.bytes()?;
@@ -725,7 +734,18 @@ impl CceEngine {
                 region_id: Some(file_region_id),
                 address: Some(file_address),
                 capabilities: vec!["source_truth".to_owned()],
-                attributes: serde_json::Map::new(),
+                // `lastTouched` is the newest commit timestamp touching this
+                // path — recency evidence for fault-localization priors.
+                // Files outside the indexed history window carry nothing.
+                attributes: last_touched.get(&file.relative_path).map_or_else(
+                    serde_json::Map::new,
+                    |timestamp| {
+                        serde_json::Map::from_iter([(
+                            "lastTouched".to_owned(),
+                            (*timestamp).into(),
+                        )])
+                    },
+                ),
             });
 
             if file.language.as_deref().is_some_and(SourceParser::supports) {
@@ -1114,6 +1134,7 @@ impl CceEngine {
                 parsed: &parsed_by_path,
                 unit_ids: &unit_ids_by_path,
                 name_index: &name_index,
+                touched: &touched_commits,
             },
             &mut records.relations,
         );
