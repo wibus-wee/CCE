@@ -19,6 +19,7 @@ chrono.workspace = true
 fastembed.workspace = true
 fs4.workspace = true
 gix.workspace = true
+imara-diff.workspace = true
 ignore.workspace = true
 protobuf = "3.7.2"
 regex.workspace = true

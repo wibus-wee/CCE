@@ -773,66 +773,76 @@ impl CceEngine {
             &mut records,
         )?;
 
-        let history_view_status = match crate::history::summarize(&self.config.repository_root, 512)
-        {
-            Ok(Some(summary)) => {
-                let artifact = self
-                    .store
-                    .artifacts()
-                    .put_bytes(ArtifactKind::Knowledge, summary.body.as_bytes())?;
-                let mut history_status = status(
+        let history_view_status =
+            match crate::history::summarize(&self.config.repository_root, HISTORY_COMMIT_LIMIT) {
+                Ok(Some(summary)) => {
+                    let artifact = self
+                        .store
+                        .artifacts()
+                        .put_bytes(ArtifactKind::Knowledge, summary.body.as_bytes())?;
+                    let diff_documents = self.index_commit_diffs(&scanned, &mut records)?;
+                    let mut history_status = status(
+                        &scanned.snapshot,
+                        ViewState::Ready,
+                        vec![
+                            Capability {
+                                name: "git_commit_messages".to_owned(),
+                                level: "historical_evidence".to_owned(),
+                                reason: Some(format!(
+                                    "{} reachable commits indexed with gitoxide",
+                                    summary.commit_count
+                                )),
+                            },
+                            Capability {
+                                name: "git_diff_hunks".to_owned(),
+                                level: "historical_evidence".to_owned(),
+                                reason: Some(format!(
+                                    "{diff_documents} commits contributed extracted diff hunks"
+                                )),
+                            },
+                        ],
+                        None,
+                    );
+                    history_status.artifact_digest = Some(artifact.digest.clone());
+                    records.artifacts.push(artifact.clone());
+                    records.documents.push(IndexedDocument {
+                        document: RetrievalDocument {
+                            id: document_id(
+                                &repository_entity_id,
+                                "commit_summary",
+                                0,
+                                summary.body.len(),
+                            ),
+                            entity_id: repository_entity_id.clone(),
+                            region_id: None,
+                            snapshot_id: scanned.snapshot.id.clone(),
+                            representation: RetrievalRepresentation::CommitSummary,
+                            body_artifact_digest: artifact.digest,
+                            address: None,
+                            embedding_profile: None,
+                            generated_by: Some("cce-gitoxide-history-v1".to_owned()),
+                            evidence: Vec::new(),
+                            terms: lexical_terms(&summary.body),
+                        },
+                        path: ".git".to_owned(),
+                        name: "commit history".to_owned(),
+                        body: summary.body,
+                    });
+                    history_status
+                }
+                Ok(None) => status(
                     &scanned.snapshot,
-                    ViewState::Ready,
-                    vec![Capability {
-                        name: "git_commit_messages".to_owned(),
-                        level: "historical_evidence".to_owned(),
-                        reason: Some(format!(
-                            "{} reachable commits indexed with gitoxide",
-                            summary.commit_count
-                        )),
-                    }],
-                    None,
-                );
-                history_status.artifact_digest = Some(artifact.digest.clone());
-                records.artifacts.push(artifact.clone());
-                records.documents.push(IndexedDocument {
-                    document: RetrievalDocument {
-                        id: document_id(
-                            &repository_entity_id,
-                            "commit_summary",
-                            0,
-                            summary.body.len(),
-                        ),
-                        entity_id: repository_entity_id.clone(),
-                        region_id: None,
-                        snapshot_id: scanned.snapshot.id.clone(),
-                        representation: RetrievalRepresentation::CommitSummary,
-                        body_artifact_digest: artifact.digest,
-                        address: None,
-                        embedding_profile: None,
-                        generated_by: Some("cce-gitoxide-history-v1".to_owned()),
-                        evidence: Vec::new(),
-                        terms: lexical_terms(&summary.body),
-                    },
-                    path: ".git".to_owned(),
-                    name: "commit history".to_owned(),
-                    body: summary.body,
-                });
-                history_status
-            }
-            Ok(None) => status(
-                &scanned.snapshot,
-                ViewState::Unavailable,
-                Vec::new(),
-                Some("Repository has no local .git object database".to_owned()),
-            ),
-            Err(error) => status(
-                &scanned.snapshot,
-                ViewState::Failed,
-                Vec::new(),
-                Some(format!("gitoxide could not read commit history: {error}")),
-            ),
-        };
+                    ViewState::Unavailable,
+                    Vec::new(),
+                    Some("Repository has no local .git object database".to_owned()),
+                ),
+                Err(error) => status(
+                    &scanned.snapshot,
+                    ViewState::Failed,
+                    Vec::new(),
+                    Some(format!("gitoxide could not read commit history: {error}")),
+                ),
+            };
 
         // External code-intelligence providers (SCIP indexers). Subprocess
         // runs happen on the blocking pool; ingestion into `records` is a
@@ -1174,6 +1184,84 @@ impl CceEngine {
         Ok(reports)
     }
 
+    /// Extract per-commit diff hunks into `EntityKind::Commit` nodes,
+    /// `CommitPatch` artifacts, and `CommitDiff` retrieval documents. All
+    /// ids derive from the commit id, so reindexing identical history
+    /// reproduces the same rows — never duplicates.
+    ///
+    /// # Errors
+    /// Storage error when an artifact cannot be persisted.
+    fn index_commit_diffs(
+        &self,
+        scanned: &ScannedRepository,
+        records: &mut SnapshotRecords,
+    ) -> Result<usize> {
+        let diffs = crate::history::commit_diffs(
+            &self.config.repository_root,
+            HISTORY_COMMIT_LIMIT,
+            &scanned.identity.id,
+            &scanned.snapshot.id,
+            self.config.index.include_sensitive,
+        );
+        let mut indexed = 0_usize;
+        for commit in diffs {
+            let artifact = self
+                .store
+                .artifacts()
+                .put_bytes(ArtifactKind::CommitPatch, commit.patch.as_bytes())?;
+            let commit_entity_id = entity_id(
+                &scanned.identity.id,
+                "",
+                0,
+                0,
+                &format!("commit:{}", commit.id),
+            );
+            let mut attributes = serde_json::Map::new();
+            attributes.insert("committerTime".to_owned(), commit.timestamp.into());
+            attributes.insert(
+                "patchArtifactDigest".to_owned(),
+                artifact.digest.clone().into(),
+            );
+            records.entities.push(CodeEntity {
+                id: commit_entity_id.clone(),
+                kind: EntityKind::Commit,
+                name: commit.id.clone(),
+                qualified_name: Some(format!("commit:{}", commit.id)),
+                signature: None,
+                language: None,
+                region_id: None,
+                address: None,
+                capabilities: vec!["historical_evidence".to_owned()],
+                attributes,
+            });
+            records.documents.push(IndexedDocument {
+                document: RetrievalDocument {
+                    id: digest_id("doc", &[&commit_entity_id, "commit_diff", &commit.id]),
+                    entity_id: commit_entity_id,
+                    region_id: None,
+                    snapshot_id: scanned.snapshot.id.clone(),
+                    representation: RetrievalRepresentation::CommitDiff,
+                    body_artifact_digest: artifact.digest.clone(),
+                    address: None,
+                    embedding_profile: None,
+                    generated_by: Some("cce-git-history-diff-v1".to_owned()),
+                    evidence: commit.evidence,
+                    terms: lexical_terms(&commit.body),
+                },
+                path: ".git".to_owned(),
+                name: format!(
+                    "commit {} {}",
+                    commit.id.get(..12).unwrap_or(&commit.id),
+                    commit.subject
+                ),
+                body: commit.body,
+            });
+            records.artifacts.push(artifact);
+            indexed += 1;
+        }
+        Ok(indexed)
+    }
+
     /// Detect-state report for every known provider (no execution).
     #[must_use]
     pub fn providers(&self) -> Vec<crate::providers::ProviderReport> {
@@ -1390,6 +1478,10 @@ fn graph_view_status(
     status.artifact_digest = digest;
     (status, scip_edges)
 }
+
+/// Commits walked for history extraction (message summary and diff
+/// content), newest first.
+const HISTORY_COMMIT_LIMIT: usize = 512;
 
 fn status(
     snapshot: &SnapshotIdentity,

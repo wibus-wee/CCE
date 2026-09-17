@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::Path;
 
-use cce_core::{SearchRequest, ViewKind, ViewState};
+use cce_core::{RetrievalRepresentation, SearchRequest, ViewKind, ViewState};
 use cce_engine::{CceEngine, ContextRequest, EngineConfig};
 
 fn write(dir: &Path, relative: &str, contents: &str) {
@@ -685,4 +685,183 @@ async fn worktree_grep_is_fresh_and_policy_aware() {
             .all(|hit| hit.path.starts_with("src/"))
     );
     assert!(!filtered.matches.is_empty());
+}
+
+// --- history diff content ----------------------------------------------------
+
+/// Run `git` inside `dir`; the fixture is invalid when the binary or the
+/// command fails, so failures panic rather than degrade.
+fn git(dir: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-c")
+        .arg("commit.gpgsign=false")
+        .arg("-c")
+        .arg("user.email=cce@test")
+        .arg("-c")
+        .arg("user.name=cce test")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A repo with two commits; the second changes one line and adds a marker
+/// function, giving history one extractable diff hunk.
+fn history_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        dir.path(),
+        "src/lib.rs",
+        "pub fn first_marker() -> u32 {\n    compute_first()\n}\n",
+    );
+    write(dir.path(), "README.md", "# fixture repository\n");
+    git(dir.path(), &["init"]);
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-m", "add first_marker"]);
+    write(
+        dir.path(),
+        "src/lib.rs",
+        "pub fn first_marker() -> u32 {\n    compute_second()\n}\n\npub fn second_lineage_marker() -> u32 {\n    7\n}\n",
+    );
+    git(dir.path(), &["add", "-A"]);
+    git(
+        dir.path(),
+        &[
+            "commit",
+            "-m",
+            "switch to compute_second and add second_lineage_marker",
+        ],
+    );
+    dir
+}
+
+fn commit_diff_documents(engine: &CceEngine, snapshot_id: &str) -> Vec<cce_store::DocumentContent> {
+    engine
+        .store()
+        .documents_for_snapshot(snapshot_id)
+        .expect("documents")
+        .into_iter()
+        .filter(|document| document.representation == RetrievalRepresentation::CommitDiff)
+        .collect()
+}
+
+#[tokio::test]
+async fn history_diff_content_is_indexed_and_retrievable() {
+    let repo = history_repo();
+    let engine = engine(repo.path());
+    let report = engine.index().await.expect("index");
+
+    let history = report
+        .manifest
+        .views
+        .get(&ViewKind::History)
+        .expect("history view status");
+    assert_eq!(history.state, ViewState::Ready);
+    assert!(
+        history
+            .capabilities
+            .iter()
+            .any(|capability| capability.name == "git_diff_hunks")
+    );
+
+    // The root commit is its own whole tree; only the second commit
+    // produces a diff document.
+    let diffs = commit_diff_documents(&engine, &report.snapshot.id);
+    assert_eq!(diffs.len(), 1);
+    let diff = diffs.first().expect("one commit diff document");
+    assert!(diff.text.contains("diff --git a/src/lib.rs"));
+    assert!(diff.text.contains("+pub fn second_lineage_marker"));
+    assert!(diff.text.contains("-    compute_first()"));
+    assert!(diff.text.contains("@@"));
+    assert!(
+        diff.evidence
+            .iter()
+            .any(|address| address.path == "src/lib.rs" && address.start_line > 0),
+        "expected evidence addresses on src/lib.rs, got {:?}",
+        diff.evidence
+    );
+
+    // The extracted changed line is reachable through lexical search.
+    let hits = engine
+        .store()
+        .lexical_search(&report.snapshot.id, "second_lineage_marker", 10, &cce_core::QueryFilters::default())
+        .expect("lexical search");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.representation == RetrievalRepresentation::CommitDiff),
+        "commit diff document must match the changed line, got {:?}",
+        hits.iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn sensitive_files_stay_out_of_history_documents() {
+    let repo = history_repo();
+    // Commit a credential-shaped file through git so it exists in history
+    // even though the scanner skips the worktree copy.
+    write(
+        repo.path(),
+        ".env",
+        "CCE_HISTORY_SECRET=hunter2-not-for-index\n",
+    );
+    write(repo.path(), "src/extra.rs", "pub fn third_marker() {}\n");
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-m", "add env and extra"]);
+    let engine = engine(repo.path());
+    let report = engine.index().await.expect("index");
+
+    let diffs = commit_diff_documents(&engine, &report.snapshot.id);
+    assert!(!diffs.is_empty());
+    for document in &diffs {
+        assert!(
+            !document.text.contains("hunter2"),
+            "secret leaked into patch artifact of {}",
+            document.document_id
+        );
+        assert!(
+            !document.text.contains(".env"),
+            "sensitive path leaked into patch artifact of {}",
+            document.document_id
+        );
+    }
+    let hits = engine
+        .store()
+        .lexical_search(&report.snapshot.id, "hunter2 CCE_HISTORY_SECRET", 10, &cce_core::QueryFilters::default())
+        .expect("lexical search");
+    assert!(hits.is_empty(), "secret must not be searchable: {hits:?}");
+}
+
+#[tokio::test]
+async fn history_indexing_is_idempotent() {
+    let repo = history_repo();
+    let engine = engine(repo.path());
+    let first = engine.index().await.expect("first index");
+    let first_ids = commit_diff_documents(&engine, &first.snapshot.id)
+        .iter()
+        .map(|document| document.document_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(first_ids.len(), 1);
+
+    let second = engine.index().await.expect("second index");
+    assert!(second.reused_snapshot);
+    assert_eq!(second.snapshot.id, first.snapshot.id);
+
+    // A worktree change forces a fresh snapshot; identical history must
+    // reproduce identical document ids rather than duplicating rows.
+    write(repo.path(), "README.md", "# changed\n");
+    let third = engine.index().await.expect("third index");
+    assert_ne!(third.snapshot.id, first.snapshot.id);
+    let third_ids = commit_diff_documents(&engine, &third.snapshot.id)
+        .iter()
+        .map(|document| document.document_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(third_ids, first_ids);
 }
