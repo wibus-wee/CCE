@@ -776,12 +776,19 @@ const fn expansion_policy(
 /// evidence than sharing the file a top hit already lives in.
 const CO_CHANGE_SCALE: f64 = 0.3;
 
+/// Same-package bonus: a top-3 hit's package is likely the task's package,
+/// so sibling files get a small lift — below the same-file 0.25 and the
+/// co-change ceiling.
+const PACKAGE_BONUS: f64 = 0.15;
+
 /// Structural priors layered on the fused ranking:
 /// - exact symbol/word agreement between the query and a hit's symbol name;
 /// - same-file evidence aggregation (a file holding a top-3 hit makes its
 ///   other hits more likely to be task evidence);
 /// - git co-change neighborhood (files that keep landing in the same
 ///   commits as a top-3 file);
+/// - same-package membership (a file in a top-3 hit's package is likelier
+///   task evidence than a cross-package one);
 /// - git recency prior for issue/history intents (a recently touched file
 ///   is the likelier culprit — BugCache-style version-history evidence);
 /// - definition prior (Signature/TestBehavior representations beat stray
@@ -837,6 +844,26 @@ fn apply_structural_features(
             *confidence = confidence.max(relation.confidence);
         }
     }
+    // Workspace packages as (rootDir, name); the task package set is the
+    // owners of the top-3 files, mirroring the top_paths aggregation.
+    let packages = store
+        .entities_by_kind(snapshot_id, &EntityKind::Package)?
+        .into_iter()
+        .map(|entity| {
+            let root_dir = entity
+                .attributes
+                .get("rootDir")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            (root_dir, entity.name)
+        })
+        .collect::<Vec<_>>();
+    let task_packages: std::collections::HashSet<&str> = top_paths
+        .iter()
+        .filter_map(|path| package_of(path, &packages))
+        .collect();
+    let mut candidate_packages = HashMap::<String, Option<&str>>::new();
     // BugCache-style recency prior for fault-localization intents: a file
     // touched recently is the likelier culprit. A 90-day half-life keeps a
     // same-day touch near the 0.2 ceiling and a year-old touch near
@@ -868,6 +895,16 @@ fn apply_structural_features(
                 bonus = CO_CHANGE_SCALE.mul_add(f64::from(*confidence), bonus);
                 notes.push(format!(
                     "co-change partner of a top hit file (confidence {confidence:.2})"
+                ));
+            }
+            let package = *candidate_packages
+                .entry(path.clone())
+                .or_insert_with(|| package_of(path, &packages));
+            if package.is_some_and(|name| task_packages.contains(name)) {
+                bonus += PACKAGE_BONUS;
+                notes.push(format!(
+                    "same package as a top hit ({})",
+                    package.unwrap_or("")
                 ));
             }
             if recency_intent {
@@ -903,6 +940,24 @@ fn apply_structural_features(
         candidate.fused_score += bonus / RRF_K;
     }
     Ok(())
+}
+
+/// The package owning `path`: the longest matching `rootDir` prefix.
+/// A trailing-slash requirement keeps `crates/alpha` from claiming
+/// `crates/alpha2/…`, and the root package's empty rootDir matches every
+/// path but loses to any member root — so it claims only files no member
+/// package owns, mirroring `packages::emit`'s `Contains` edges.
+fn package_of<'a>(path: &str, packages: &'a [(String, String)]) -> Option<&'a str> {
+    packages
+        .iter()
+        .filter(|(root_dir, _)| {
+            root_dir.is_empty()
+                || path
+                    .strip_prefix(root_dir.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|(root_dir, _)| root_dir.len())
+        .map(|(_, name)| name.as_str())
 }
 
 /// The `File` entity whose name is exactly `path`, when one is indexed.
@@ -1220,6 +1275,21 @@ mod tests {
         entity
     }
 
+    fn package(name: &str, root_dir: &str) -> CodeEntity {
+        CodeEntity {
+            id: format!("package:{name}"),
+            kind: EntityKind::Package,
+            name: name.to_owned(),
+            qualified_name: None,
+            signature: None,
+            language: None,
+            region_id: None,
+            address: None,
+            capabilities: Vec::new(),
+            attributes: serde_json::Map::from_iter([("rootDir".to_owned(), root_dir.into())]),
+        }
+    }
+
     #[test]
     fn recency_prior_prefers_recently_touched_under_issue_intent() {
         let now = 1_700_000_000_i64;
@@ -1271,6 +1341,143 @@ mod tests {
         )
         .expect("structural features");
         assert!((behavior["r"].fused_score - behavior["s"].fused_score).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn same_package_candidate_outranks_cross_package() {
+        let records = SnapshotRecords {
+            entities: vec![
+                package("alpha", "crates/alpha"),
+                package("beta", "crates/beta"),
+                package("root", ""),
+            ],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, store, snapshot_id) = store_with(&records);
+
+        // All three top hits live in alpha, so the task package set is
+        // {alpha}; the compared candidates sit outside the top-3 entirely.
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            "a1".to_owned(),
+            candidate("a1", "crates/alpha/src/lib.rs", 0.5),
+        );
+        candidates.insert(
+            "a2".to_owned(),
+            candidate("a2", "crates/alpha/src/main.rs", 0.4),
+        );
+        candidates.insert(
+            "a3".to_owned(),
+            candidate("a3", "crates/alpha/src/mods.rs", 0.3),
+        );
+        candidates.insert(
+            "same".to_owned(),
+            candidate("same", "crates/alpha/src/helper.rs", 0.1),
+        );
+        candidates.insert(
+            "diff".to_owned(),
+            candidate("diff", "crates/beta/src/lib.rs", 0.1),
+        );
+        candidates.insert("root".to_owned(), candidate("root", "README.md", 0.1));
+        apply_structural_features(
+            &store,
+            &snapshot_id,
+            QueryIntent::NaturalLanguageBehavior,
+            0,
+            "query",
+            &mut candidates,
+        )
+        .expect("structural features");
+
+        // None of the three compared files is a top-3 hit, so the fused
+        // gap is exactly the package bonus.
+        let expected = PACKAGE_BONUS / RRF_K;
+        assert!(
+            (candidates["same"].fused_score - candidates["diff"].fused_score - expected).abs()
+                < 1e-9,
+            "same {} vs diff {}",
+            candidates["same"].fused_score,
+            candidates["diff"].fused_score
+        );
+        assert!(
+            candidates["same"]
+                .hit
+                .explanation
+                .iter()
+                .any(|line| line.contains("same package"))
+        );
+        for outsider in ["diff", "root"] {
+            assert!(
+                !candidates[outsider]
+                    .hit
+                    .explanation
+                    .iter()
+                    .any(|line| line.contains("same package")),
+                "{outsider} must not earn a package bonus"
+            );
+        }
+    }
+
+    #[test]
+    fn root_package_claims_only_unowned_files() {
+        let packages = vec![
+            ("crates/alpha".to_owned(), "alpha".to_owned()),
+            (String::new(), "root".to_owned()),
+        ];
+        // Longest-prefix ownership: a file under a member root belongs to
+        // the member, and the root package claims only leftovers.
+        assert_eq!(package_of("docs/a.md", &packages), Some("root"));
+        assert_eq!(
+            package_of("crates/alpha/src/lib.rs", &packages),
+            Some("alpha")
+        );
+        assert_eq!(
+            package_of("crates/alpha2/src/lib.rs", &packages),
+            Some("root")
+        );
+
+        let records = SnapshotRecords {
+            entities: vec![package("alpha", "crates/alpha"), package("root", "")],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, store, snapshot_id) = store_with(&records);
+
+        // The top-3 are all owned by the root package, so the task package
+        // set is {root}; a member-package file must not inherit the bonus
+        // through the root's match-everything prefix.
+        let mut candidates = HashMap::new();
+        candidates.insert("seed".to_owned(), candidate("seed", "README.md", 0.5));
+        candidates.insert("aroot".to_owned(), candidate("aroot", "docs/a.md", 0.1));
+        candidates.insert("broot".to_owned(), candidate("broot", "docs/b.md", 0.1));
+        candidates.insert(
+            "member".to_owned(),
+            candidate("member", "crates/alpha/src/lib.rs", 0.1),
+        );
+        apply_structural_features(
+            &store,
+            &snapshot_id,
+            QueryIntent::NaturalLanguageBehavior,
+            0,
+            "query",
+            &mut candidates,
+        )
+        .expect("structural features");
+
+        assert!(
+            !candidates["member"]
+                .hit
+                .explanation
+                .iter()
+                .any(|line| line.contains("same package")),
+            "member file must not be claimed by the root package"
+        );
+        assert!(
+            candidates["seed"]
+                .hit
+                .explanation
+                .iter()
+                .any(|line| line.contains("same package"))
+        );
     }
 
     #[test]
