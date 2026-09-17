@@ -167,7 +167,9 @@ fn union_plan(intent: QueryIntent, reasons: Vec<String>) -> QueryPlan {
 fn classify(original: &str, query: &str) -> QueryIntent {
     // Single ASCII keywords match on word boundaries so identifiers like
     // `commit_snapshot` or `workflow` don't trip "commit"/"flow". Multiword
-    // phrases and CJK terms keep substring semantics.
+    // phrases and CJK terms keep substring semantics. Ambiguous probes
+    // ("why"/"为什么", "break"/"breaks") need a second anchor word so they do
+    // not capture behavior or non-conditional uses.
     if has_any_word(query, &["taint", "taints"])
         || contains_any(
             query,
@@ -182,15 +184,45 @@ fn classify(original: &str, query: &str) -> QueryIntent {
     {
         return QueryIntent::PreciseDataflow;
     }
+    // History asks how the code came to be. Provenance words (commit, blame,
+    // 历史, 提交) stand alone, but a bare "why"/"为什么" probe is ambiguous —
+    // "why is call confidence lower" is about current behavior, not history —
+    // so it only counts paired with a change anchor ("why was it added",
+    // "为什么引入").
     if has_any_word(
         query,
-        &["why", "history", "commit", "commits", "committed", "blame"],
-    ) || contains_any(query, &["为什么", "为何", "历史", "什么时候改"])
+        &["history", "commit", "commits", "committed", "blame"],
+    ) || contains_any(query, &["历史", "什么时候改", "何时改", "谁改", "提交"])
+        || (has_any_word(query, &["why"])
+            && has_any_word(
+                query,
+                &[
+                    "added",
+                    "changed",
+                    "introduced",
+                    "removed",
+                    "deprecated",
+                    "renamed",
+                    "deleted",
+                    "modified",
+                    "reverted",
+                ],
+            ))
+        || (contains_any(query, &["为什么", "为何"])
+            && contains_any(
+                query,
+                &["修改", "改动", "引入", "添加", "删除", "重命名", "弃用"],
+            ))
     {
         return QueryIntent::History;
     }
+    // "What breaks if/when X changes" is the canonical impact phrasing; the
+    // break verb is word-boundary matched and needs a conditional anchor so
+    // "line break" or "break statement" alone does not escalate. Matching the
+    // words separately keeps inflections ("breaks if") from slipping through.
     if has_any_word(query, &["impact", "affected"])
-        || contains_any(query, &["break if", "影响", "会破坏", "哪些地方会"])
+        || (has_any_word(query, &["break", "breaks"]) && has_any_word(query, &["if", "when"]))
+        || contains_any(query, &["影响", "会破坏", "哪些地方会"])
     {
         return QueryIntent::Impact;
     }
@@ -350,5 +382,38 @@ mod tests {
         assert_eq!(plan.intent, QueryIntent::ExactEntity);
         let plan = QueryPlanner::new().plan("engine.rs", None);
         assert_eq!(plan.intent, QueryIntent::ExactEntity);
+    }
+
+    #[test]
+    fn inflected_breaks_if_is_impact() {
+        // "break if" as a literal phrase misses the canonical inflected
+        // phrasing; the break verb plus a conditional anchor must match.
+        let plan = QueryPlanner::new().plan(
+            "What breaks if ContextPack stops carrying snapshot identity?",
+            None,
+        );
+        assert_eq!(plan.intent, QueryIntent::Impact);
+        // Bare "break" without a conditional anchor stays behavior.
+        let plan = QueryPlanner::new().plan("how does the line break rendering work", None);
+        assert_eq!(plan.intent, QueryIntent::NaturalLanguageBehavior);
+    }
+
+    #[test]
+    fn bare_why_probe_is_behavior_not_history() {
+        // 为什么/why alone asks about current behavior; history needs a
+        // change or provenance anchor.
+        let plan = QueryPlanner::new().plan("为什么函数调用关系的置信度低于导入关系", None);
+        assert_eq!(plan.intent, QueryIntent::NaturalLanguageBehavior);
+        let plan =
+            QueryPlanner::new().plan("why is call confidence lower than import confidence", None);
+        assert_eq!(plan.intent, QueryIntent::NaturalLanguageBehavior);
+    }
+
+    #[test]
+    fn why_with_change_anchor_is_history() {
+        let plan = QueryPlanner::new().plan("why was the quarantine path added?", None);
+        assert_eq!(plan.intent, QueryIntent::History);
+        let plan = QueryPlanner::new().plan("为什么引入 quarantine 路径", None);
+        assert_eq!(plan.intent, QueryIntent::History);
     }
 }
