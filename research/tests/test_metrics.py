@@ -104,8 +104,77 @@ def test_compare_reports_paired_deltas() -> None:
     weak = _result(retrieved=[], abstained=True)
     strong = _result()
     deltas = compare([case], [weak], [strong])
-    assert deltas["recall@20"].value == 1.0
-    assert deltas["mrr"].value == 1.0
+    assert deltas["recall@20"].delta == 1.0
+    assert deltas["mrr"].delta == 1.0
+
+
+def test_bpref_ignores_unjudged_but_penalizes_judged_irrelevant() -> None:
+    from cce_research.metrics import bpref
+
+    def hit(path: str, rank: int) -> RetrievedRange:
+        return RetrievedRange(
+            path=path, start_line=1, end_line=5, route="lexical",
+            rank=rank, score=1.0, estimated_tokens=5,
+        )
+
+    # Gold at rank 2, one unjudged item above it: unjudged costs nothing.
+    case = _case(gold_files=["src/gold.rs"])
+    assert bpref(case, [hit("src/unknown.rs", 1), hit("src/gold.rs", 2)]) == 1.0
+    # Same shape but the item above is adjudicated irrelevant: penalty.
+    judged = _case(gold_files=["src/gold.rs"], judged_files=["src/unknown.rs"])
+    assert bpref(judged, [hit("src/unknown.rs", 1), hit("src/gold.rs", 2)]) == 0.0
+
+
+def test_unjudged_rate_counts_only_unverdicted_paths() -> None:
+    from cce_research.metrics import unjudged_rate
+
+    def hit(path: str, rank: int) -> RetrievedRange:
+        return RetrievedRange(
+            path=path, start_line=1, end_line=5, route="lexical",
+            rank=rank, score=1.0, estimated_tokens=5,
+        )
+
+    case = _case(gold_files=["src/gold.rs"], judged_files=["src/no.rs"])
+    rate = unjudged_rate(case, [hit("src/gold.rs", 1), hit("src/no.rs", 2), hit("src/?.rs", 3)])
+    assert rate == 1 / 3
+    assert unjudged_rate(case, []) == 0.0
+
+
+def test_claim_support_scores_facts_not_files() -> None:
+    from cce_research.metrics import claim_support
+    from cce_research.schema import GoldFact
+
+    case = _case(
+        gold_facts=[
+            GoldFact(
+                claim="status is written via set_view_status",
+                evidence=[LineRange(path="src/store.rs", start_line=10, end_line=30)],
+                symbols=["set_view_status"],
+            ),
+            GoldFact(claim="unreachable claim", evidence=[], symbols=["missing_fn"]),
+        ]
+    )
+    hit = RetrievedRange(
+        path="src/other.rs", start_line=1, end_line=5, symbol="set_view_status",
+        route="lexical", rank=1, score=1.0, estimated_tokens=5,
+    )
+    assert claim_support(case, [hit]) == 0.5
+    assert claim_support(case, []) == 0.0
+
+
+def test_evaluate_emits_intent_precision_and_recall() -> None:
+    withheld_a = _case(case_id="a", supply_intent=False, intent="impact")
+    withheld_b = _case(case_id="b", supply_intent=False, intent="impact")
+    withheld_c = _case(case_id="c", supply_intent=False, intent="trace")
+    results = [
+        _result("a", predicted_intent="impact"),
+        _result("b", predicted_intent="natural_language_behavior"),
+        _result("c", predicted_intent="trace"),
+    ]
+    summary = evaluate([withheld_a, withheld_b, withheld_c], results)
+    assert summary["intent_recall/impact"].value == 0.5
+    assert summary["intent_precision/natural_language_behavior"].value == 0.0
+    assert summary["intent_precision/impact"].value == 1.0
 
 
 def test_ndcg_never_exceeds_one_with_duplicate_gold_paths() -> None:

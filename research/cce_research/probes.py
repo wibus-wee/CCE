@@ -121,9 +121,9 @@ def run_staleness_probe(
     Restores (deletes) the marker file in `finally`. Reports freshness
     signals; the caller decides whether the behavior is acceptable.
     """
-    marker_dir = repository_root / ".cce-probe"
-    marker_dir.mkdir(exist_ok=True)
-    marker = marker_dir / f"marker-{int(time.time())}.md"
+    # Marker lives at the repository root: a `.cce-probe/` directory would be
+    # excluded by the repo's own `/.cce*/` ignore rules and never indexed.
+    marker = repository_root / f"cce-probe-marker-{int(time.time())}.md"
     token_a = f"cceprobe{int(time.time())}a"
     token_b = f"cceprobe{int(time.time())}b"
 
