@@ -658,9 +658,27 @@ fn entity_tokens(query: &str) -> Vec<String> {
         .filter(|token| !stop.contains(&token.to_ascii_lowercase().as_str()))
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    // Exact-symbol is an identity lookup: inside a multi-token natural
+    // language query a plain lowercase word ("from", "merged") colliding
+    // with an entity of the same name is coincidence, not intent — such
+    // terms are lexical evidence instead. Identifier-shaped tokens keep
+    // the route; a single-token query keeps its only token.
+    if tokens.len() > 1 {
+        tokens.retain(|token| is_identifier_like(token));
+    }
     tokens.sort_by_key(|token| std::cmp::Reverse(token.len()));
     tokens.truncate(8);
     tokens
+}
+
+fn is_identifier_like(token: &str) -> bool {
+    token.contains('_')
+        || token.contains("::")
+        || token.contains('.')
+        || token.chars().any(|character| character.is_ascii_digit())
+        || token
+            .chars()
+            .any(|character| character.is_ascii_uppercase())
 }
 
 fn truncate_chars(value: &str, maximum: usize) -> String {

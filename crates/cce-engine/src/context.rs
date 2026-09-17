@@ -277,7 +277,11 @@ fn render_item(
         id: hit.document_id.clone(),
         kind,
         title: hit.address.as_ref().map_or_else(
-            || hit.entity_id.clone(),
+            || {
+                hit.symbol_name
+                    .clone()
+                    .unwrap_or_else(|| hit.entity_id.clone())
+            },
             |address| {
                 format!(
                     "{}:{}-{}",
