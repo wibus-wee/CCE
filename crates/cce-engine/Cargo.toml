@@ -23,6 +23,7 @@ imara-diff.workspace = true
 ignore.workspace = true
 protobuf = "3.7.2"
 regex.workspace = true
+utoipa.workspace = true
 scip = "0.10.0"
 serde.workspace = true
 serde_json.workspace = true

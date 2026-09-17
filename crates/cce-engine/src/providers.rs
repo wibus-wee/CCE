@@ -11,6 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use utoipa::ToSchema;
 
 use cce_core::{CceError, Result};
 use serde::{Deserialize, Serialize};
@@ -48,7 +49,7 @@ pub(crate) struct ProviderOutput {
 
 /// Lifecycle state reported for one provider after an index pass (or a
 /// bare `detect` probe).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderState {
     /// Toolchain found / artifact produced; ran successfully.
@@ -63,7 +64,7 @@ pub enum ProviderState {
 
 /// Per-provider outcome, recorded in `IndexReport` and surfaced through
 /// `GET /v1/providers`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderReport {
     /// Provider identifier (`scip:rust-analyzer`, …).

@@ -1,12 +1,13 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::EntityKind;
 
 /// Canonical code-range identity for one snapshot. Every index — lexical
 /// documents, dense vectors, graph nodes, and citations — joins on this id,
 /// so a `RegionId` is the single object all views describe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RegionKind {
     /// Whole-file region; also the architecture-routing unit.
@@ -17,7 +18,7 @@ pub enum RegionKind {
     Subregion,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// A canonical code range within a snapshot — the join key across views.
 pub struct CodeRegion {

@@ -1,10 +1,11 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::SourceAddress;
 
 /// The kind of edge between two entities.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationKind {
     /// Containment (file contains symbol, directory contains file, …).
@@ -57,7 +58,7 @@ pub enum RelationKind {
 
 /// How an edge was derived — deterministic fact vs derived vs inferred must
 /// remain distinguishable for provenance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationOrigin {
     /// Emitted by a language compiler/frontend.
@@ -78,7 +79,7 @@ pub enum RelationOrigin {
 
 /// A directed edge between two entities within one snapshot, carrying
 /// provenance, confidence, and source evidence.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Relation {
     /// Deterministic identifier (function of source, target, kind).

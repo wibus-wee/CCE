@@ -262,8 +262,54 @@ export interface ContextPack {
   missingCapabilities: string[]
 }
 
+// --- gateway registry & code browsing -----------------------------------------
+
+export interface PushRecord {
+  pushId: string
+  at: string
+  revision?: string
+  fileCount: number
+  bytes: number
+}
+
+export interface RepoEntry {
+  id: string
+  name: string
+  slug: string
+  workerUrl: string
+  createdAt: string
+  lastPush?: PushRecord
+}
+
+export interface FileListEntry {
+  path: string
+  language?: string
+}
+
+export interface FileListReport {
+  snapshotId: string
+  files: FileListEntry[]
+}
+
+export interface FileContent {
+  snapshotId: string
+  path: string
+  language?: string
+  content: string
+  truncated: boolean
+  binary: boolean
+}
+
+// Request prefix: '' talks to a standalone daemon directly, '/{slug}' routes
+// through the gateway's per-repo proxy. Set once at startup after discovery.
+let base = ''
+
+export function setBase(prefix: string) {
+  base = prefix
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(base + path, {
     ...init,
     headers: { 'content-type': 'application/json', ...init?.headers },
   })
@@ -280,7 +326,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 // remedies, so keep them distinguishable in the UI.
 export function describeError(value: unknown): string {
   if (value instanceof TypeError) {
-    return 'Cannot reach the CCE daemon on 127.0.0.1:7734 — is `cce-daemon` running?'
+    return 'Cannot reach the CCE service — is `cce-daemon` or `cce-gateway` running?'
   }
   return value instanceof Error ? value.message : String(value)
 }
@@ -310,4 +356,30 @@ export const api = {
     request<DefinitionsReport>(`/v1/def/${encodeURIComponent(name)}`),
   references: (name: string) =>
     request<ReferencesReport>(`/v1/refs/${encodeURIComponent(name)}`),
+  files: () => request<FileListReport>('/v1/files'),
+  file: (path: string) => request<FileContent>(`/v1/file?path=${encodeURIComponent(path)}`),
+}
+
+// Gateway-only endpoints deliberately bypass the repo prefix: the registry
+// lives at the root, not under any repo — even after a repo is selected.
+export const gateway = {
+  repos: async (): Promise<RepoEntry[]> => {
+    const response = await fetch('/v1/repos')
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
+    return (await response.json()) as RepoEntry[]
+  },
+}
+
+export type ServiceMode = 'gateway' | 'daemon'
+
+// Probe the service shape once at startup: a registry answer means we're
+// behind cce-gateway (repo selection applies); a failure means a standalone
+// daemon where calls go straight through.
+export async function discover(): Promise<ServiceMode> {
+  try {
+    const response = await fetch('/v1/repos')
+    return response.ok ? 'gateway' : 'daemon'
+  } catch {
+    return 'daemon'
+  }
 }

@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// Stable identity of an indexed repository.
 pub struct RepositoryIdentity {
@@ -17,7 +18,7 @@ pub struct RepositoryIdentity {
     pub remote: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// Everything that distinguishes one index build configuration from
 /// another; hashed into `index_profile_hash` so config changes yield
@@ -42,7 +43,7 @@ pub struct IndexProfile {
     pub options: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// Immutable identity of one indexed snapshot: repository + base revision +
 /// worktree overlay + index profile.

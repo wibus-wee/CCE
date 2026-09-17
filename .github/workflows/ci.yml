@@ -115,3 +115,41 @@ jobs:
       - run: uv run --project research mypy research/cce_research
       - run: uv run --project research pytest
       - run: uv run --project research cce-research validate-dataset benchmarks/datasets/cce-self.jsonl
+
+  # The release image + runtime smoke. On PRs it only runs when packaging
+  # files changed (the rust job already gates code); on main it always runs.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: changes
+        if: github.event_name == 'pull_request'
+        run: |
+          git diff --name-only "${{ github.event.pull_request.base.sha }}..HEAD" \
+            | grep -qE '^(Dockerfile|\.dockerignore|docker-compose\.yml)$' \
+            && echo "docker=true" >> "$GITHUB_OUTPUT" || true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docker == 'true'
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docker == 'true'
+        with:
+          context: .
+          load: true
+          tags: cce:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke — daemon answers /healthz
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docker == 'true'
+        run: |
+          # Sparse mode: no model download in CI.
+          docker run -d --name cce -p 127.0.0.1:7734:7734 \
+            -e CCE_DENSE=disabled -e CCE_DATA_DIR=/var/lib/cce \
+            -v "$PWD:/repository:ro" cce:ci
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:7734/healthz && exit 0 || sleep 2
+          done
+          docker logs cce
+          exit 1

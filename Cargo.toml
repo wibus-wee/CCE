@@ -5,7 +5,9 @@ members = [
   "crates/cce-engine",
   "apps/cli",
   "apps/daemon",
+  "apps/gateway",
   "apps/mcp",
+  "apps/push",
 ]
 resolver = "3"
 
@@ -36,12 +38,21 @@ imara-diff = { package = "gix-imara-diff", version = "0.2.4", features = ["unifi
 ignore = "0.4"
 parking_lot = "0.12"
 regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "stream",
+  "blocking",
+  "json",
+] }
 fastembed = { version = "~6.0.3", default-features = false, features = [
   "hf-hub-rustls-tls",
   "ort-download-binaries-rustls-tls",
 ] }
 rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid"] }
 schemars = { version = "1.0", features = ["chrono04", "uuid1"] }
+utoipa = { version = "5", features = ["chrono", "uuid"] }
+utoipa-axum = "0.2"
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 smallvec = { version = "1.15", features = ["serde"] }

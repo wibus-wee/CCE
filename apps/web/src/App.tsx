@@ -1,43 +1,44 @@
-import { FormEvent, useCallback, useEffect, useState } from 'react'
-import {
-  api,
-  ContextPack,
-  describeError,
-  ProviderReport,
-  SearchResult,
-  ViewManifest,
-} from './api'
-import { ProvidersPanel } from './ProvidersPanel'
-import { SearchResults } from './SearchResults'
+import * as stylex from '@stylexjs/stylex'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { api, describeError, ProviderReport, ViewManifest } from './api'
+import { ContextScreen } from './screens/ContextScreen'
+import { IndexScreen } from './screens/IndexScreen'
+import { QueryScreen } from './screens/QueryScreen'
+import { ActionButton } from './ui/ActionButton'
+import { ActionIconButton } from './ui/ActionIconButton'
+import { IconBolt, IconDatabase, IconLayers, IconMoon, IconRefresh, IconSearch, IconSun, IconWarning } from './ui/icons'
+import { LayoutToolbar } from './ui/LayoutToolbar'
+import { fontMono, vars, type Severity } from './ui/tokens.stylex'
+import { useDark } from './ui/useDark'
+
+type Screen = 'query' | 'context' | 'index'
+
+const NAV: { id: Screen; label: string; icon: React.ReactNode; hint: string }[] = [
+  { id: 'query', label: 'Query', icon: <IconSearch size={15} />, hint: 'Search the index' },
+  { id: 'context', label: 'Context', icon: <IconLayers size={15} />, hint: 'Build a source-linked pack' },
+  { id: 'index', label: 'Index', icon: <IconDatabase size={15} />, hint: 'Views and providers' },
+]
 
 export function App() {
+  const { dark, toggle } = useDark()
+  const [screen, setScreen] = useState<Screen>('query')
   const [manifest, setManifest] = useState<ViewManifest>()
   const [providers, setProviders] = useState<ProviderReport[]>()
   const [providersError, setProvidersError] = useState<string>()
-  const [searchText, setSearchText] = useState('snapshot freshness')
-  const [searchType, setSearchType] = useState<'file' | 'diff' | 'commit'>('file')
-  const [limit, setLimit] = useState(25)
-  const [result, setResult] = useState<SearchResult>()
-  const [searchError, setSearchError] = useState<string>()
-  const [query, setQuery] = useState('Where is snapshot freshness decided?')
-  const [budget, setBudget] = useState(4096)
-  const [pack, setPack] = useState<ContextPack>()
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string>()
+  const [statusError, setStatusError] = useState<string>()
+  const [indexing, setIndexing] = useState(false)
+  const [refreshing, setRefreshing] = useState(true)
+  const searchRef = useRef<HTMLInputElement>(null)
 
   const refresh = useCallback(async () => {
-    setBusy(true)
-    setError(undefined)
     // Status and provider probes are independent: one failing must not
     // blank the other.
-    const [status, providerReports] = await Promise.allSettled([
-      api.status(),
-      api.providers(),
-    ])
+    const [status, providerReports] = await Promise.allSettled([api.status(), api.providers()])
     if (status.status === 'fulfilled') {
       setManifest(status.value)
+      setStatusError(undefined)
     } else {
-      setError(describeError(status.reason))
+      setStatusError(describeError(status.reason))
     }
     if (providerReports.status === 'fulfilled') {
       setProviders(providerReports.value)
@@ -45,16 +46,29 @@ export function App() {
     } else {
       setProvidersError(describeError(providerReports.reason))
     }
-    setBusy(false)
+    setRefreshing(false)
   }, [])
 
   useEffect(() => {
     void refresh()
   }, [refresh])
 
+  useEffect(() => {
+    function onKeydown(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        setScreen('query')
+        // wait a frame so the input is visible before focusing
+        requestAnimationFrame(() => searchRef.current?.focus())
+      }
+    }
+    window.addEventListener('keydown', onKeydown)
+    return () => window.removeEventListener('keydown', onKeydown)
+  }, [])
+
   async function reindex() {
-    setBusy(true)
-    setError(undefined)
+    setIndexing(true)
+    setStatusError(undefined)
     try {
       const report = await api.index()
       setManifest(report.manifest)
@@ -63,218 +77,273 @@ export function App() {
       setProviders(report.providers)
       setProvidersError(undefined)
     } catch (value) {
-      setError(describeError(value))
+      setStatusError(describeError(value))
     } finally {
-      setBusy(false)
+      setIndexing(false)
     }
   }
 
-  async function search(event: FormEvent) {
-    event.preventDefault()
-    const text = searchText.trim()
-    if (!text) return
-    setBusy(true)
-    setSearchError(undefined)
-    try {
-      const safeLimit = Number.isFinite(limit) ? Math.min(200, Math.max(1, Math.trunc(limit))) : 20
-      // A `type:` token typed by hand wins over the selector.
-      const effective =
-        searchType === 'file' || /\btype:\S+/i.test(text) ? text : `type:${searchType} ${text}`
-      setResult(await api.search({ query: effective, limit: safeLimit }))
-    } catch (value) {
-      setResult(undefined)
-      setSearchError(describeError(value))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function ask(event: FormEvent) {
-    event.preventDefault()
-    if (!query.trim()) return
-    setBusy(true)
-    setError(undefined)
-    try {
-      const result = await api.context(query, budget)
-      setPack(result)
-      setManifest((current) =>
-        current && current.snapshotId === result.snapshotId ? current : undefined,
-      )
-    } catch (value) {
-      setError(describeError(value))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const degradedViews = manifest
-    ? Object.entries(manifest.views).filter(([, view]) => view.state !== 'ready')
-    : []
+  const degraded = manifest ? Object.entries(manifest.views).filter(([, v]) => v.state !== 'ready') : []
 
   return (
-    <main>
-      <header>
-        <div>
-          <p className="eyebrow">Repository intelligence runtime</p>
-          <h1>CCE</h1>
-          <p className="subtitle">The smallest source-linked world sufficient for the task.</p>
-        </div>
-        <button type="button" onClick={() => void reindex()} disabled={busy}>
-          {busy ? 'Working…' : 'Refresh index'}
-        </button>
-      </header>
-
-      {error && <div className="error" role="alert">{error}</div>}
-
-      <section className="manifest" aria-label="Index views">
-        <div className="section-heading">
-          <h2>Materialized views</h2>
-          <code>{manifest?.snapshotId.slice(0, 21) ?? 'connecting…'}</code>
-        </div>
-        {degradedViews.length > 0 && (
-          <p className="stale-note" role="status">
-            Not fully current:{' '}
-            {degradedViews
-              .map(([name, view]) => `${name} (${view.state.replaceAll('_', ' ')})`)
-              .join(', ')}
-          </p>
-        )}
-        {manifest ? (
-          Object.keys(manifest.views).length === 0 ? (
-            <p className="empty">
-              No views reported yet — press “Refresh index” to build the first snapshot.
-            </p>
-          ) : (
-            <div className="view-grid">
-              {Object.entries(manifest.views).map(([name, view]) => (
-                <article className="view" key={name}>
-                  <div className="view-title">
-                    <h3>{name}</h3>
-                    <span className={`state state-${view.state}`}>
-                      {view.state.replaceAll('_', ' ')}
-                    </span>
-                  </div>
-                  {view.capabilities.map((capability) => (
-                    <p key={capability.name} title={capability.reason}>
-                      {capability.name} <small>{capability.level}</small>
-                    </p>
-                  ))}
-                  {view.message && <p className="muted">{view.message}</p>}
-                </article>
-              ))}
-            </div>
-          )
-        ) : error ? (
-          <p className="empty">Status unavailable — see the error above.</p>
-        ) : (
-          <div className="view-grid">
-            {Array.from({ length: 6 }, (_, index) => (
-              <div className="view skeleton" key={index} />
-            ))}
-          </div>
-        )}
-      </section>
-
-      <ProvidersPanel providers={providers} error={providersError} />
-
-      <section>
-        <h2>Search</h2>
-        <form onSubmit={(event) => void search(event)}>
-          <label>
-            Query
-            <input
-              value={searchText}
-              onChange={(event) => setSearchText(event.target.value)}
-              placeholder="symbol, path, or question — lang:rust path:crates/ narrows"
-            />
-          </label>
-          <label className="budget">
-            Type
-            <select
-              value={searchType}
-              onChange={(event) => setSearchType(event.target.value as 'file' | 'diff' | 'commit')}
+    <div {...stylex.props(styles.shell)}>
+      <LayoutToolbar
+        start={
+          <>
+            <span {...stylex.props(styles.mark)}>
+              <IconBolt size={14} />
+            </span>
+            <strong {...stylex.props(styles.wordmark)}>CCE</strong>
+            <span {...stylex.props(styles.tagline)}>repository intelligence</span>
+          </>
+        }
+        end={
+          <>
+            {manifest && (
+              <code {...stylex.props(styles.snapshot)} title={`snapshot ${manifest.snapshotId}`}>
+                {manifest.snapshotId.slice(0, 12)}
+              </code>
+            )}
+            {degraded.length > 0 && (
+              <span
+                {...stylex.props(styles.degraded)}
+                title={degraded.map(([name, v]) => `${name}: ${v.state.replaceAll('_', ' ')}`).join('\n')}
+              >
+                <IconWarning size={12} />
+                {degraded.length} degraded
+              </span>
+            )}
+            <ActionButton
+              variant="action"
+              icon={<IconRefresh size={13} />}
+              loading={indexing}
+              onClick={() => void reindex()}
             >
-              <option value="file">file</option>
-              <option value="diff">diff</option>
-              <option value="commit">commit</option>
-            </select>
-          </label>
-          <label className="budget">
-            Limit
-            <input
-              type="number"
-              min={1}
-              max={200}
-              value={limit}
-              onChange={(event) => setLimit(Number(event.target.value))}
-            />
-          </label>
-          <button disabled={busy || !searchText.trim()}>Search</button>
-        </form>
-        {searchError && <div className="error" role="alert">{searchError}</div>}
-      </section>
+              Reindex
+            </ActionButton>
+            <ActionIconButton tooltip={dark ? 'Light mode' : 'Dark mode'} onClick={toggle}>
+              {dark ? <IconSun size={15} /> : <IconMoon size={15} />}
+            </ActionIconButton>
+          </>
+        }
+      />
 
-      {result && <SearchResults result={result} />}
-
-      <section>
-        <h2>Build context</h2>
-        <form onSubmit={(event) => void ask(event)}>
-          <label>
-            Repository question
-            <textarea value={query} onChange={(event) => setQuery(event.target.value)} rows={3} />
-          </label>
-          <label className="budget">
-            Token budget
-            <input
-              type="number"
-              min={256}
-              max={128000}
-              value={budget}
-              onChange={(event) => setBudget(Number(event.target.value))}
-            />
-          </label>
-          <button disabled={busy || !query.trim()}>Build source-linked pack</button>
-        </form>
-      </section>
-
-      {pack && (
-        <section className="pack">
-          <div className="section-heading">
-            <div>
-              <p className="eyebrow">{pack.intent.replaceAll('_', ' ')}</p>
-              <h2>Context pack</h2>
-            </div>
-            <strong>
-              {pack.usedTokens.toLocaleString()} / {pack.budgetTokens.toLocaleString()} tokens
-            </strong>
-          </div>
-          {pack.items.map((item) => (
-            <details key={item.id} open={item.kind === 'orientation' || item.provenance.rank < 4}>
-              <summary>
-                <span>{item.title}</span>
-                <small>
-                  {item.kind} · {item.estimatedTokens}t
-                </small>
-              </summary>
-              <pre>{item.body}</pre>
-              <footer>
-                {item.provenance.route} · rank {item.provenance.rank} ·{' '}
-                {item.provenance.whyRetrieved}
-              </footer>
-            </details>
+      <div {...stylex.props(styles.body)}>
+        <nav {...stylex.props(styles.nav)} aria-label="Sections">
+          {NAV.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              title={item.hint}
+              aria-current={screen === item.id}
+              {...stylex.props(styles.navItem, screen === item.id && styles.navActive)}
+              onClick={() => setScreen(item.id)}
+            >
+              {item.icon}
+              <span>{item.label}</span>
+            </button>
           ))}
-          {pack.uncertainties.length > 0 && (
-            <aside>
-              <h3>Uncertainties</h3>
-              {pack.uncertainties.map((uncertainty) => (
-                <p key={`${uncertainty.capability}:${uncertainty.message}`}>
-                  <strong>{uncertainty.capability}</strong> — {uncertainty.message}
-                </p>
-              ))}
-            </aside>
-          )}
-        </section>
-      )}
-    </main>
+          <div {...stylex.props(styles.navFoot)}>
+            <HealthDot manifest={manifest} error={statusError} loading={refreshing} />
+          </div>
+        </nav>
+
+        <main {...stylex.props(styles.main)}>
+          <div {...stylex.props(styles.screen)} hidden={screen !== 'query'}>
+            <QueryScreen
+              ref={searchRef}
+              dark={dark}
+              onManifest={(m) => setManifest(m)}
+              onReindex={() => void reindex()}
+            />
+          </div>
+          <div {...stylex.props(styles.screen)} hidden={screen !== 'context'}>
+            <ContextScreen dark={dark} />
+          </div>
+          <div {...stylex.props(styles.screen)} hidden={screen !== 'index'}>
+            <IndexScreen
+              manifest={manifest}
+              providers={providers}
+              providersError={providersError}
+              statusError={statusError}
+              loading={refreshing}
+              onReindex={() => void reindex()}
+            />
+          </div>
+        </main>
+      </div>
+    </div>
   )
 }
+
+function HealthDot({
+  manifest,
+  error,
+  loading,
+}: {
+  manifest?: ViewManifest
+  error?: string
+  loading: boolean
+}) {
+  if (loading) {
+    return <span {...stylex.props(styles.health)} title="connecting…">connecting</span>
+  }
+  if (error) {
+    return (
+      <span {...stylex.props(styles.health, healthColor.critical)} title={error}>
+        daemon down
+      </span>
+    )
+  }
+  if (!manifest) return null
+  const degraded = Object.entries(manifest.views).filter(([, v]) => v.state !== 'ready')
+  const severity: Severity = degraded.length === 0 ? 'low' : degraded.length > 2 ? 'high' : 'medium'
+  return (
+    <span
+      {...stylex.props(styles.health, healthColor[severity])}
+      title={`snapshot ${manifest.snapshotId}`}
+    >
+      <span {...stylex.props(styles.dot)} />
+      {degraded.length === 0 ? 'all views ready' : `${degraded.length} degraded`}
+    </span>
+  )
+}
+
+const healthColor = stylex.create({
+  low: { color: vars.scaleLow },
+  medium: { color: vars.scaleMedium },
+  high: { color: vars.scaleHigh },
+  critical: { color: vars.scaleCritical },
+})
+
+const styles = stylex.create({
+  shell: {
+    minHeight: '100vh',
+    backgroundColor: vars.bgBase,
+    color: vars.colorBase,
+    display: 'flex',
+    flexDirection: 'column',
+  },
+  mark: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 24,
+    height: 24,
+    borderRadius: 6,
+    backgroundColor: vars.primary500,
+    color: vars.onPrimary,
+    flexShrink: 0,
+  },
+  wordmark: {
+    fontSize: 14,
+    fontWeight: 700,
+    letterSpacing: '0.02em',
+  },
+  tagline: {
+    fontSize: 11,
+    color: vars.colorFaint,
+    display: { default: 'inline', '@media (max-width: 640px)': 'none' },
+  },
+  snapshot: {
+    fontFamily: fontMono,
+    fontSize: 10,
+    color: vars.colorMuted,
+    backgroundColor: vars.bgSunken,
+    borderRadius: 4,
+    paddingTop: 2,
+    paddingBottom: 2,
+    paddingLeft: 6,
+    paddingRight: 6,
+    display: { default: 'inline-block', '@media (max-width: 720px)': 'none' },
+  },
+  degraded: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    fontSize: 11,
+    color: vars.scaleMedium,
+    whiteSpace: 'nowrap',
+  },
+  body: {
+    display: 'flex',
+    flex: 1,
+    minHeight: 0,
+  },
+  nav: {
+    width: 148,
+    flexShrink: 0,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+    padding: 10,
+    borderRightWidth: 1,
+    borderRightStyle: 'solid',
+    borderRightColor: vars.borderMute,
+    position: 'sticky',
+    top: 46,
+    height: 'calc(100vh - 46px)',
+    display: { default: 'flex', '@media (max-width: 640px)': 'none' },
+  },
+  navItem: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    paddingTop: 5,
+    paddingBottom: 5,
+    paddingLeft: 8,
+    paddingRight: 8,
+    borderRadius: 6,
+    border: 'none',
+    backgroundColor: {
+      default: 'transparent',
+      ':hover': vars.bgHover,
+    },
+    color: {
+      default: vars.colorMuted,
+      ':hover': vars.colorBase,
+    },
+    fontSize: 13,
+    cursor: 'pointer',
+    textAlign: 'left',
+    transitionProperty: 'background-color, color',
+    transitionDuration: '120ms',
+  },
+  navActive: {
+    backgroundColor: vars.bgActive,
+    color: vars.colorActive,
+  },
+  navFoot: {
+    marginTop: 'auto',
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopStyle: 'solid',
+    borderTopColor: vars.borderMute,
+  },
+  health: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 6,
+    fontSize: 10,
+    color: vars.colorFaint,
+    fontFamily: fontMono,
+    whiteSpace: 'nowrap',
+  },
+  dot: {
+    width: 6,
+    height: 6,
+    borderRadius: '50%',
+    backgroundColor: 'currentColor',
+    flexShrink: 0,
+  },
+  main: {
+    flex: 1,
+    minWidth: 0,
+    padding: 20,
+    paddingBottom: 64,
+    maxWidth: 1080px,
+  },
+  screen: {
+    maxWidth: 960px,
+  },
+})

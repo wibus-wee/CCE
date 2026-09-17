@@ -6,6 +6,7 @@
 //! indexing.
 
 use std::fmt::Write as _;
+use utoipa::ToSchema;
 
 use cce_core::{CceError, QueryFilters, Result};
 use serde::Serialize;
@@ -34,7 +35,7 @@ pub struct GrepRequest {
 }
 
 /// One regex match in the worktree.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GrepHit {
     /// Repository-relative path.
@@ -48,7 +49,7 @@ pub struct GrepHit {
 }
 
 /// Result of a worktree grep.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GrepReport {
     /// The pattern that ran.

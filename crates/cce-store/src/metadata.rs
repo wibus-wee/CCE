@@ -1437,6 +1437,27 @@ impl MetadataStore {
         String::from_utf8(slice.to_vec()).map_err(|_| CceError::ArtifactCorrupt(digest))
     }
 
+    /// Whole-file bytes for a `(snapshot, path)` pair — the same artifact
+    /// digest `source_text` slices into.
+    ///
+    /// # Errors
+    /// Artifact-corrupt when the path was never indexed on that snapshot;
+    /// storage error when the artifact itself is missing or unreadable.
+    pub fn source_file_bytes(&self, snapshot_id: &str, path: &str) -> Result<Vec<u8>> {
+        let digest = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT artifact_digest FROM source_files WHERE snapshot_id=?1 AND path=?2",
+                params![snapshot_id, path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| CceError::ArtifactCorrupt(format!("{snapshot_id}:{path}")))?;
+        self.artifacts.read(&digest)
+    }
+
     /// Materialize all documents for a snapshot (text included).
     ///
     /// # Errors

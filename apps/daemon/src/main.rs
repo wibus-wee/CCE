@@ -6,11 +6,10 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    Json, Router,
-    extract::{Path, State},
+    Json,
+    extract::{Path, Query, State},
     http::{HeaderName, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use cce_core::{QueryIntent, SearchRequest, SearchRoute};
 use cce_engine::{
@@ -23,6 +22,9 @@ use tower_http::{
     services::ServeDir,
     trace::TraceLayer,
 };
+use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::{router::OpenApiRouter, routes};
+use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(Debug, Parser)]
 #[command(name = "cce-daemon", version)]
@@ -69,7 +71,7 @@ enum DenseMode {
     Local,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct SearchInput {
     query: String,
@@ -90,7 +92,7 @@ const fn default_search_limit() -> usize {
 }
 
 /// `POST /v1/grep` request: a worktree regex, not an index query.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct GrepInput {
     /// Rust regex pattern.
@@ -114,7 +116,7 @@ const fn default_grep_limit() -> usize {
 
 /// `POST /v1/diff` request: a query-time regex over stored commit patches
 /// (Sourcegraph `type:diff`); bounded by history indexing, not the worktree.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct DiffInput {
     /// Rust regex pattern matched against `+`/`-` patch lines.
@@ -127,13 +129,13 @@ const fn default_diff_limit() -> usize {
     cce_engine::DEFAULT_DIFF_LIMIT
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct Health {
     status: &'static str,
     version: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ApiErrorBody {
     error: String,
 }
@@ -168,6 +170,13 @@ impl IntoResponse for ApiError {
     }
 }
 
+#[derive(utoipa::OpenApi)]
+#[openapi(info(
+    title = "cce-daemon",
+    description = "CCE worker API — one repository per process. Served unchanged behind a cce-gateway as `/{repo}/v1/*`."
+))]
+struct ApiDoc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -200,20 +209,27 @@ async fn main() -> anyhow::Result<()> {
     config.providers.enabled = !arguments.no_providers;
     let state = Arc::new(CceEngine::open(config)?);
     let request_id = HeaderName::from_static("x-request-id");
-    let mut router = Router::new()
-        .route("/healthz", get(health))
-        .route("/v1/index", post(index))
-        .route("/v1/status", get(status))
-        .route("/v1/search", post(search))
-        .route("/v1/context", post(context))
-        .route("/v1/map", get(codebase_map))
-        .route("/v1/explain/{name}", get(explain))
-        .route("/v1/impact/{name}", get(impact))
-        .route("/v1/def/{name}", get(definitions))
-        .route("/v1/refs/{name}", get(references))
-        .route("/v1/providers", get(providers))
-        .route("/v1/grep", post(grep))
-        .route("/v1/diff", post(diff))
+    let (api_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .routes(routes!(health))
+        .routes(routes!(index))
+        .routes(routes!(status))
+        .routes(routes!(search))
+        .routes(routes!(context))
+        .routes(routes!(codebase_map))
+        .routes(routes!(explain))
+        .routes(routes!(impact))
+        .routes(routes!(definitions))
+        .routes(routes!(references))
+        .routes(routes!(providers))
+        .routes(routes!(grep))
+        .routes(routes!(diff))
+        .routes(routes!(files))
+        .routes(routes!(file_source))
+        .split_for_parts();
+    let mut router = api_router
+        // SwaggerUi serves the generated OpenAPI JSON itself at this URL —
+        // no handwritten spec anywhere in the pipeline.
+        .merge(SwaggerUi::new("/docs").url("/openapi.json", api))
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
         .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
@@ -230,6 +246,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[utoipa::path(get, path = "/healthz", tag = "meta",
+    responses((status = 200, description = "liveness probe", body = Health)))]
 async fn health() -> Json<Health> {
     Json(Health {
         status: "ok",
@@ -237,18 +255,40 @@ async fn health() -> Json<Health> {
     })
 }
 
+#[utoipa::path(post, path = "/v1/index", tag = "worker",
+    summary = "reindex the worktree",
+    responses(
+        (status = 200, body = cce_engine::IndexReport),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn index(
     State(engine): State<Arc<CceEngine>>,
 ) -> Result<Json<cce_engine::IndexReport>, ApiError> {
     Ok(Json(engine.index().await?))
 }
 
+#[utoipa::path(get, path = "/v1/status", tag = "worker",
+    summary = "snapshot + view freshness manifest",
+    responses(
+        (status = 200, body = cce_core::ViewManifest),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn status(
     State(engine): State<Arc<CceEngine>>,
 ) -> Result<Json<cce_core::ViewManifest>, ApiError> {
     Ok(Json(engine.status()?))
 }
 
+#[utoipa::path(post, path = "/v1/search", tag = "worker",
+    request_body = SearchInput,
+    summary = "hybrid code search",
+    responses(
+        (status = 200, body = cce_engine::SearchResult),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn search(
     State(engine): State<Arc<CceEngine>>,
     Json(input): Json<SearchInput>,
@@ -269,6 +309,14 @@ async fn search(
     ))
 }
 
+#[utoipa::path(post, path = "/v1/context", tag = "worker",
+    request_body = ContextRequest,
+    summary = "packed context for an agent prompt",
+    responses(
+        (status = 200, body = cce_core::ContextPack),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn context(
     State(engine): State<Arc<CceEngine>>,
     Json(mut request): Json<ContextRequest>,
@@ -278,12 +326,26 @@ async fn context(
     Ok(Json(engine.context(request).await?))
 }
 
+#[utoipa::path(get, path = "/v1/map", tag = "worker",
+    summary = "package-level architecture map",
+    responses(
+        (status = 200, body = cce_engine::CodebaseMap),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn codebase_map(
     State(engine): State<Arc<CceEngine>>,
 ) -> Result<Json<cce_engine::CodebaseMap>, ApiError> {
     Ok(Json(engine.codebase_map()?))
 }
 
+#[utoipa::path(get, path = "/v1/explain/{name}", tag = "worker", params(("name" = String, Path, description = "symbol or component name")),
+    summary = "explain a component/package",
+    responses(
+        (status = 200, body = cce_engine::ComponentExplanation),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn explain(
     State(engine): State<Arc<CceEngine>>,
     Path(name): Path<String>,
@@ -291,6 +353,13 @@ async fn explain(
     Ok(Json(engine.explain_component(&name)?))
 }
 
+#[utoipa::path(get, path = "/v1/impact/{name}", tag = "worker", params(("name" = String, Path, description = "symbol or component name")),
+    summary = "impact analysis of a symbol",
+    responses(
+        (status = 200, body = cce_engine::ImpactReport),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn impact(
     State(engine): State<Arc<CceEngine>>,
     Path(name): Path<String>,
@@ -298,6 +367,13 @@ async fn impact(
     Ok(Json(engine.impact_analysis(&name)?))
 }
 
+#[utoipa::path(get, path = "/v1/def/{name}", tag = "worker", params(("name" = String, Path, description = "symbol or component name")),
+    summary = "go-to-definition",
+    responses(
+        (status = 200, body = cce_engine::DefinitionsReport),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn definitions(
     State(engine): State<Arc<CceEngine>>,
     Path(name): Path<String>,
@@ -305,6 +381,13 @@ async fn definitions(
     Ok(Json(engine.definitions(&name)?))
 }
 
+#[utoipa::path(get, path = "/v1/refs/{name}", tag = "worker", params(("name" = String, Path, description = "symbol or component name")),
+    summary = "find-references",
+    responses(
+        (status = 200, body = cce_engine::ReferencesReport),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn references(
     State(engine): State<Arc<CceEngine>>,
     Path(name): Path<String>,
@@ -312,12 +395,27 @@ async fn references(
     Ok(Json(engine.references(&name)?))
 }
 
+#[utoipa::path(get, path = "/v1/providers", tag = "worker",
+    summary = "SCIP/provider detection report",
+    responses(
+        (status = 200, body = Vec<cce_engine::ProviderReport>),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn providers(
     State(engine): State<Arc<CceEngine>>,
 ) -> Result<Json<Vec<cce_engine::ProviderReport>>, ApiError> {
     Ok(Json(engine.providers()))
 }
 
+#[utoipa::path(post, path = "/v1/grep", tag = "worker",
+    request_body = GrepInput,
+    summary = "worktree regex search",
+    responses(
+        (status = 200, body = cce_engine::GrepReport),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn grep(
     State(engine): State<Arc<CceEngine>>,
     Json(input): Json<GrepInput>,
@@ -334,6 +432,14 @@ async fn grep(
     })?))
 }
 
+#[utoipa::path(post, path = "/v1/diff", tag = "worker",
+    request_body = DiffInput,
+    summary = "search stored commit patches (type:diff)",
+    responses(
+        (status = 200, body = cce_engine::SearchResult),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
 async fn diff(
     State(engine): State<Arc<CceEngine>>,
     Json(input): Json<DiffInput>,
@@ -352,6 +458,42 @@ async fn diff(
             })
             .await?,
     ))
+}
+
+/// `GET /v1/file?path=` query — the repository-relative file path.
+#[derive(Debug, Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+#[serde(rename_all = "camelCase")]
+struct FileQuery {
+    /// Repository-relative path, e.g. `src/main.rs`.
+    path: String,
+}
+
+#[utoipa::path(get, path = "/v1/files", tag = "worker",
+    summary = "list indexed files for the current snapshot",
+    responses(
+        (status = 200, body = cce_engine::FileListReport),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
+async fn files(
+    State(engine): State<Arc<CceEngine>>,
+) -> Result<Json<cce_engine::FileListReport>, ApiError> {
+    Ok(Json(engine.files()?))
+}
+
+#[utoipa::path(get, path = "/v1/file", tag = "worker",
+    summary = "file content from the committed source view",
+    params(FileQuery),
+    responses(
+        (status = 200, body = cce_engine::FileContent),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
+async fn file_source(
+    State(engine): State<Arc<CceEngine>>,
+    Query(query): Query<FileQuery>,
+) -> Result<Json<cce_engine::FileContent>, ApiError> {
+    Ok(Json(engine.file(&query.path)?))
 }
 
 async fn shutdown_signal() {

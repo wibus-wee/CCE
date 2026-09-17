@@ -5,10 +5,11 @@ use cce_core::{
     SearchRequest, SearchRoute, Uncertainty,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::{CceEngine, SearchResult};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// Parameters for `CceEngine::context` — a token-budgeted context pack.
 pub struct ContextRequest {

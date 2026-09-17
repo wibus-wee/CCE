@@ -6,6 +6,7 @@ use cce_core::{
 };
 use cce_store::RelationDirection;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::{
     CceEngine, DenseIndex, Embedder, GraphPolicy, QueryPlan, QueryPlanner, RepositoryScanner,
@@ -29,7 +30,7 @@ const TOPICAL: [SearchRoute; 5] = [
     SearchRoute::Hybrid,
 ];
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// The full result of a search: the executed plan, view manifest, ranked
 /// hits, and explicit missing capabilities.

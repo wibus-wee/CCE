@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+use utoipa::ToSchema;
 
 use cce_core::{
     Capability, CceError, CodeEntity, CodeRegion, EntityKind, RegionKind, Relation, RelationKind,
@@ -20,7 +21,7 @@ use crate::{
 
 /// Everything an `index()` run produced: snapshot identity, counts, skip
 /// reasons, provider outcomes, and the resulting view manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexReport {
     /// Repository that was indexed.

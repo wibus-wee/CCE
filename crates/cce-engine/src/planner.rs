@@ -1,7 +1,8 @@
 use cce_core::{GraphPolicy, QueryIntent, SearchRoute, ViewKind};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// The planner's output: which routes to run, how much graph expansion is
 /// allowed, which views are required, and why.

@@ -1,6 +1,6 @@
 [package]
-name = "cce-core"
-description = "Stable data contracts for the CCE repository intelligence runtime"
+name = "cce-push"
+description = "Thin worktree uploader: scans a repo and pushes content-addressed blobs to a cce-gateway"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,13 +11,13 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-chrono.workspace = true
-schemars.workspace = true
-utoipa.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+ignore.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 
 [lints]
 workspace = true
-

@@ -1,10 +1,11 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::{GraphPolicy, QueryIntent, SearchRoute, SourceAddress};
 
 /// The role a packed context item plays for the consumer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextItemKind {
     /// High-level repository/task orientation.
@@ -28,7 +29,7 @@ pub enum ContextItemKind {
 }
 
 /// Why and how a context item was retrieved, with source linkage.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextProvenance {
     /// Human-readable reason this item was included.
@@ -55,7 +56,7 @@ pub struct ContextProvenance {
 }
 
 /// A single packed context item with provenance.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextItem {
     /// Item identifier (document id).
@@ -73,7 +74,7 @@ pub struct ContextItem {
 }
 
 /// A capability gap surfaced to the caller instead of silently degrading.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Uncertainty {
     /// Name of the missing/partial capability.
@@ -86,7 +87,7 @@ pub struct Uncertainty {
 }
 
 /// A token-budgeted bundle of context items plus explicit uncertainty.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextPack {
     /// Repository the pack was built from.

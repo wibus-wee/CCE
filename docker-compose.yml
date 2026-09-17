@@ -1,0 +1,145 @@
+# CCE central deployment — gateway (front door) + worker (index/query engine).
+#
+#   docker compose up -d --build
+#   cd /path/to/repo && cce-push --gateway http://127.0.0.1:7735 --repo worker
+#
+# The worker serves exactly one materialized repository, whose slug must
+# match CCE_WORKER_REPO (default "worker"); push with --repo of the same
+# name. Add more worker services for more repositories.
+#
+# No auth layer: the gateway port is published on loopback only. Put a
+# reverse proxy with auth in front before exposing it further.
+services:
+  gateway:
+    build: .
+    image: cce:latest
+    restart: unless-stopped
+    entrypoint: ["cce-gateway"]
+    command:
+      - --data-dir=/var/lib/gateway
+      - --bind=0.0.0.0:7735
+      - --allow-non-loopback
+      - --web-root=/opt/cce/web
+      - --default-worker=http://worker:7734
+    ports:
+      - "127.0.0.1:${CCE_GATEWAY_PORT:-7735}:7735"
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Registry + blob store (private to the gateway) …
+      - cce-gateway-state:/var/lib/gateway
+      # … and materialized sources, shared with workers (nested mount).
+      - cce-sources:/var/lib/gateway/sources
+    tmpfs:
+      - /tmp
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - worker
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7735/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  worker:
+    build: .
+    image: cce:latest
+    restart: unless-stopped
+    # Ensure the materialized-source dir exists before the daemon scans it;
+    # the daemon writes nothing there (state goes to --data-dir).
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - mkdir -p "/sources/${CCE_WORKER_REPO:-worker}" &&
+        exec cce-daemon
+        "/sources/${CCE_WORKER_REPO:-worker}"
+        --data-dir /var/lib/cce
+        --bind 0.0.0.0:7734
+        --allow-non-loopback
+    environment:
+      CCE_DENSE: ${CCE_DENSE:-local}
+      # CCE_EMBEDDING_MODEL: jinaai/jina-embeddings-v2-base-code
+      # CCE_NO_PROVIDERS: "1"
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - cce-sources:/sources
+      - cce-worker-data:/var/lib/cce
+    tmpfs:
+      - /tmp
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7734/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # First index may download the embedding model (~600 MB).
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: "4"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Original single-service layout — the daemon reads a live, read-only
+  # worktree mount instead of pushed snapshots. No gateway involved.
+  #   CCE_REPO=/path/to/repo docker compose --profile standalone up -d cce
+  cce:
+    profiles: ["standalone"]
+    build: .
+    image: cce:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${CCE_PORT:-7734}:7734"
+    environment:
+      CCE_DATA_DIR: /var/lib/cce
+      CCE_DENSE: ${CCE_DENSE:-local}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ${CCE_REPO:-.}:/repository:ro
+      - cce-standalone-data:/var/lib/cce
+    tmpfs:
+      - /tmp
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7734/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: "4"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  cce-gateway-state:
+  cce-sources:
+  cce-worker-data:
+  cce-standalone-data:

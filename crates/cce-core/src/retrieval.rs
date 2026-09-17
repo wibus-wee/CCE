@@ -1,11 +1,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::SourceAddress;
 
 /// Coarse classification of what a query is trying to accomplish, used by
 /// the planner to pick routes and graph policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryIntent {
     /// Looking up a specific named entity (symbol, type, file).
@@ -30,7 +31,7 @@ pub enum QueryIntent {
 }
 
 /// How much graph expansion the planner is allowed to apply to a query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphPolicy {
     /// No graph expansion.
@@ -46,7 +47,7 @@ pub enum GraphPolicy {
 }
 
 /// Which retrieval channel produced (or should produce) a result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchRoute {
     /// Planner decided no retrieval is needed (e.g. abstention cases).
@@ -74,7 +75,7 @@ pub enum SearchRoute {
 }
 
 /// What form a retrieval document's content takes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalRepresentation {
     /// Verbatim source text.
@@ -106,7 +107,7 @@ pub enum RetrievalRepresentation {
 
 /// A single retrievable document: content plus provenance linking it back to
 /// source addresses and (for generated content) its producing model/step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RetrievalDocument {
     /// Document identifier.
@@ -141,7 +142,7 @@ pub struct RetrievalDocument {
 }
 
 /// A search request scoped to one repository snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRequest {
     /// Repository to search in.
@@ -171,7 +172,7 @@ pub struct SearchRequest {
 
 /// Conjunctive hit filters parsed from `key:value` query tokens or set
 /// directly by API callers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryFilters {
     /// Repository-relative path prefix (`path:crates/cce-engine`).
@@ -230,7 +231,7 @@ const fn default_limit() -> usize {
 }
 
 /// One scored retrieval result with full provenance.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
     /// Identifier of the retrieved document.

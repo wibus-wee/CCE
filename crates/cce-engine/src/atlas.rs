@@ -5,6 +5,7 @@
 //! later layer and must be marked as candidate.
 
 use std::collections::HashMap;
+use utoipa::ToSchema;
 
 use cce_core::{EntityKind, RelationKind, Result};
 use cce_store::RelationDirection;
@@ -13,7 +14,7 @@ use serde::Serialize;
 use crate::CceEngine;
 use crate::repository::RepositoryScanner;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// One build-level package (crate/npm package) in the map.
 pub struct PackageNode {
@@ -33,7 +34,7 @@ pub struct PackageNode {
     pub dependents: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// Package-level architecture map for a snapshot.
 pub struct CodebaseMap {
@@ -50,7 +51,7 @@ pub struct CodebaseMap {
     pub provenance: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// Explanation of one named component: members, dependencies, dependents,
 /// and tests — all from persisted relations.
@@ -76,7 +77,7 @@ pub struct ComponentExplanation {
 }
 
 /// One resolved definition location for `definitions`/`references`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DefinitionHit {
     /// Symbol name.
@@ -106,7 +107,7 @@ impl From<&cce_core::CodeEntity> for DefinitionHit {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// Result of a `def` query: all entities matching the name.
 pub struct DefinitionsReport {
@@ -119,7 +120,7 @@ pub struct DefinitionsReport {
 }
 
 /// One inbound edge to a target entity.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReferenceHit {
     /// Name of the referencing entity.
@@ -139,7 +140,7 @@ pub struct ReferenceHit {
     pub evidence: Vec<cce_core::SourceAddress>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// Result of a `refs` query: resolved targets plus inbound edges.
 pub struct ReferencesReport {
@@ -155,7 +156,7 @@ pub struct ReferencesReport {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// Impact-analysis result: entities reaching the seed within two hops.
 pub struct ImpactReport {
@@ -176,7 +177,7 @@ pub struct ImpactReport {
     pub caveats: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// One entity impacted through the relation graph.
 pub struct ImpactedEntity {

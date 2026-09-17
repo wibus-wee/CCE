@@ -3,6 +3,7 @@
 //! CCE indexing and query engine.
 
 mod atlas;
+mod browse;
 mod config;
 mod context;
 mod dense;
@@ -27,6 +28,7 @@ pub use atlas::{
     CodebaseMap, ComponentExplanation, DefinitionHit, DefinitionsReport, ImpactReport,
     ImpactedEntity, PackageNode, ReferenceHit, ReferencesReport,
 };
+pub use browse::{FileContent, FileListEntry, FileListReport};
 pub use cce_core::GraphPolicy;
 pub use config::{
     DEFAULT_LOCAL_EMBEDDING_MODEL, DEFAULT_LOCAL_RERANKER_MODEL, DenseBackendConfig, EngineConfig,
