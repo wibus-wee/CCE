@@ -21,14 +21,14 @@ const ROUTE_CONFIDENCE: f32 = 0.85;
 /// argument. A `None` handler still yields a `Route` entity — the route
 /// itself is the deterministic fact.
 pub(crate) struct RouteBinding {
-    pub(crate) route_path: String,
-    pub(crate) method: String,
-    pub(crate) handler_name: Option<String>,
-    pub(crate) file_path: String,
-    pub(crate) start_byte: usize,
-    pub(crate) end_byte: usize,
-    pub(crate) start_line: u32,
-    pub(crate) end_line: u32,
+    pub route_path: String,
+    pub method: String,
+    pub handler_name: Option<String>,
+    pub file_path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: u32,
+    pub end_line: u32,
 }
 
 /// Scan Rust sources for axum `.route(path, get(handler))` bindings. Only
@@ -83,8 +83,8 @@ pub(crate) fn axum_routes(
 }
 
 pub(crate) struct LandmarkEmission {
-    pub(crate) entities: Vec<CodeEntity>,
-    pub(crate) relations: Vec<Relation>,
+    pub entities: Vec<CodeEntity>,
+    pub relations: Vec<Relation>,
 }
 
 /// Turn route bindings into `Route` entities addressed by the call site,
@@ -183,7 +183,9 @@ fn resolve_handler<'a>(
 }
 
 fn line_for_offset(text: &str, offset: usize) -> u32 {
-    text.as_bytes()[..offset.min(text.len())]
+    text.as_bytes()
+        .get(..offset.min(text.len()))
+        .unwrap_or(text.as_bytes())
         .iter()
         .filter(|byte| **byte == b'\n')
         .count() as u32

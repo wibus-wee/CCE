@@ -15,30 +15,50 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DenseBackendConfig, DenseIndex, Embedder, EmbeddingBackend, EngineConfig, RepositoryScanner,
-    ScannedFile, SourceParser,
+    ScannedFile, ScannedRepository, SourceParser,
 };
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Everything an `index()` run produced: snapshot identity, counts, skip
+/// reasons, provider outcomes, and the resulting view manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexReport {
+    /// Repository that was indexed.
     pub repository_id: String,
+    /// Identity of the committed snapshot.
     pub snapshot: SnapshotIdentity,
+    /// True when an identical snapshot already existed (no-op index).
     pub reused_snapshot: bool,
+    /// Files captured into the snapshot.
     pub indexed_files: usize,
+    /// Files that produced parsed units.
     pub parsed_files: usize,
+    /// Files whose analysis was reused from the scan cache.
     pub reused_file_analyses: usize,
+    /// Source units (symbols/regions) extracted.
     pub source_units: usize,
+    /// Relations committed for this snapshot.
     pub relations: usize,
+    /// Retrieval documents committed for FTS.
     pub retrieval_documents: usize,
+    /// Files skipped for exceeding `max_file_bytes`.
     pub skipped_large_files: Vec<String>,
+    /// Binary files skipped.
     pub skipped_binary_files: Vec<String>,
+    /// Sensitive files skipped (`.env`, keys, …).
     pub skipped_sensitive_files: Vec<String>,
     /// Files dropped by the unconditional built-in policy (lockfiles,
     /// minified assets), each paired with its skip reason.
     pub skipped_builtin_files: Vec<(String, String)>,
+    /// Per-provider outcomes from this index pass.
+    #[serde(default)]
+    pub providers: Vec<crate::providers::ProviderReport>,
+    /// View manifest after this run.
     pub manifest: ViewManifest,
 }
 
+/// The single-repository intelligence engine: indexing, views, retrieval,
+/// and provider orchestration for one repository root.
 #[derive(Debug)]
 pub struct CceEngine {
     config: EngineConfig,
@@ -55,6 +75,10 @@ pub struct CceEngine {
 }
 
 impl CceEngine {
+    /// Open an engine for `config`, initializing/migrating the store.
+    ///
+    /// # Errors
+    /// Storage/format errors on open.
     pub fn open(config: EngineConfig) -> Result<Self> {
         let store = MetadataStore::open(&config.data_root)?;
         Ok(Self {
@@ -113,16 +137,23 @@ impl CceEngine {
         }
     }
 
+    /// The underlying metadata store.
     #[must_use]
     pub const fn store(&self) -> &MetadataStore {
         &self.store
     }
 
+    /// The engine's configuration.
     #[must_use]
     pub const fn config(&self) -> &EngineConfig {
         &self.config
     }
 
+    /// Current view manifest, marking views `Stale` when the worktree has
+    /// drifted from the indexed snapshot.
+    ///
+    /// # Errors
+    /// `ViewUnavailable` when the repository was never indexed.
     pub fn status(&self) -> Result<ViewManifest> {
         let scanned = RepositoryScanner::new(self.config.clone()).scan(Some(&self.store))?;
         let current = self
@@ -147,6 +178,10 @@ impl CceEngine {
         Ok(manifest)
     }
 
+    /// Run store health checks (`SQLite` integrity, artifact presence).
+    ///
+    /// # Errors
+    /// Storage error when the checks cannot run.
     pub fn doctor(&self) -> Result<StoreHealth> {
         self.store.health()
     }
@@ -162,6 +197,13 @@ impl CceEngine {
         Ok(report)
     }
 
+    /// Run the full indexing pipeline: scan → parse → providers → ingest →
+    /// commit snapshot. Holds the index lease.
+    ///
+    /// # Errors
+    /// `IndexBusy` when another index operation holds the lease; storage,
+    /// parse, or provider errors surface in the report/status rather than
+    /// aborting where recoverable.
     pub async fn index(&self) -> Result<IndexReport> {
         // Scan before taking the write lease: an unchanged repository returns
         // without ever contending with concurrent readers or writers.
@@ -189,6 +231,7 @@ impl CceEngine {
                     .into_iter()
                     .map(|(path, reason)| (path, reason.to_owned()))
                     .collect(),
+                providers: Vec::new(),
                 manifest,
             });
         }
@@ -452,9 +495,15 @@ impl CceEngine {
                 }
             }
 
-            for (index, unit) in parsed.units.iter().enumerate() {
-                let unit_id = unit_ids[index].clone();
-                let unit_region_id = unit_region_ids[index].clone();
+            for (index, ((unit, unit_id), unit_region_id)) in parsed
+                .units
+                .iter()
+                .zip(&unit_ids)
+                .zip(&unit_region_ids)
+                .enumerate()
+            {
+                let unit_id = unit_id.clone();
+                let unit_region_id = unit_region_id.clone();
                 let parent_region = unit
                     .parent_unit
                     .and_then(|parent| unit_region_ids.get(parent))
@@ -628,10 +677,10 @@ impl CceEngine {
                 });
             }
 
-            for (index, unit) in parsed.units.iter().enumerate() {
+            for (unit, unit_id) in parsed.units.iter().zip(&unit_ids) {
                 name_index.entry(unit.name.clone()).or_default().push(
                     crate::relations::SymbolCandidate {
-                        entity_id: unit_ids[index].clone(),
+                        entity_id: unit_id.clone(),
                         path: file.relative_path.clone(),
                         kind: unit.kind.clone(),
                     },
@@ -785,6 +834,21 @@ impl CceEngine {
             ),
         };
 
+        // External code-intelligence providers (SCIP indexers). Subprocess
+        // runs happen on the blocking pool; ingestion into `records` is a
+        // pure in-memory merge — a failed provider degrades its report and
+        // view status, never the snapshot.
+        let provider_reports = self
+            .ingest_providers(
+                &scanned,
+                &texts_by_path,
+                &parsed_by_path,
+                &unit_ids_by_path,
+                &file_entities,
+                &mut records,
+            )
+            .await?;
+
         self.store.commit_snapshot(&scanned.snapshot, &records)?;
         let syntax_coverage = if parse_candidates == 0 {
             1.0
@@ -844,27 +908,12 @@ impl CceEngine {
                 None,
             ),
         )?;
+        let (graph_status, scip_edges) = graph_view_status(&scanned.snapshot, &provider_reports);
         self.store.set_view_status(
             &scanned.identity.id,
             &scanned.snapshot.id,
             ViewKind::Graph,
-            &status(
-                &scanned.snapshot,
-                ViewState::Partial,
-                vec![
-                    Capability {
-                        name: "contains".to_owned(),
-                        level: "syntax_fact".to_owned(),
-                        reason: None,
-                    },
-                    Capability {
-                        name: "relative_imports".to_owned(),
-                        level: "framework_derived".to_owned(),
-                        reason: Some("relative imports only; no compiler resolution".to_owned()),
-                    },
-                ],
-                Some("Compiler/SCIP resolved references are not built".to_owned()),
-            ),
+            &graph_status,
         )?;
         if let Some(embedder) = self.embedder().await? {
             self.store.set_view_status(
@@ -993,15 +1042,32 @@ impl CceEngine {
             &scanned.identity.id,
             &scanned.snapshot.id,
             ViewKind::Dataflow,
-            &status(
-                &scanned.snapshot,
-                ViewState::Unavailable,
-                Vec::new(),
-                Some(
-                    "No evidence-backed SCIP or static-analysis dataflow artifact was supplied"
-                        .to_owned(),
-                ),
-            ),
+            &if scip_edges > 0 {
+                status(
+                    &scanned.snapshot,
+                    ViewState::Partial,
+                    vec![Capability {
+                        name: "scip_def_ref_substrate".to_owned(),
+                        level: "compiler_derived".to_owned(),
+                        reason: Some(format!("{scip_edges} definition/reference edges ingested")),
+                    }],
+                    Some(
+                        "SCIP definition/reference graph available; no source→sink \
+                         taint analysis yet"
+                            .to_owned(),
+                    ),
+                )
+            } else {
+                status(
+                    &scanned.snapshot,
+                    ViewState::Unavailable,
+                    Vec::new(),
+                    Some(
+                        "No evidence-backed SCIP or static-analysis dataflow artifact was supplied"
+                            .to_owned(),
+                    ),
+                )
+            },
         )?;
         if let Err(error) = self
             .store
@@ -1033,8 +1099,81 @@ impl CceEngine {
                 .into_iter()
                 .map(|(path, reason)| (path, reason.to_owned()))
                 .collect(),
+            providers: provider_reports,
             manifest,
         })
+    }
+
+    /// Run every applicable provider, store the produced artifacts, and
+    /// merge ingested relations into the pending snapshot records. SCIP
+    /// edges replace same-id `TreeSitter` rows (higher trust wins).
+    async fn ingest_providers(
+        &self,
+        scanned: &ScannedRepository,
+        texts: &HashMap<String, String>,
+        parsed: &HashMap<String, crate::ParsedFile>,
+        unit_ids: &HashMap<String, Vec<String>>,
+        file_entities: &HashMap<String, String>,
+        records: &mut SnapshotRecords,
+    ) -> Result<Vec<crate::providers::ProviderReport>> {
+        if !self.config.providers.enabled {
+            return Ok(Vec::new());
+        }
+        let ranges = scip_ranges(texts, parsed, unit_ids, file_entities);
+        let context = crate::scip::ScipContext {
+            repository_id: &scanned.identity.id,
+            snapshot_id: &scanned.snapshot.id,
+            ranges: &ranges,
+            texts,
+        };
+        let repo_root = self.config.repository_root.clone();
+        let work_root = self.config.data_root.join("providers");
+        let timeout = std::time::Duration::from_secs(self.config.providers.timeout_secs);
+        let produced = tokio::task::spawn_blocking(move || {
+            crate::providers::produce(&repo_root, &work_root, timeout)
+        })
+        .await
+        .map_err(|error| CceError::Configuration(format!("provider runner failed: {error}")))?;
+        let mut reports = Vec::with_capacity(produced.len());
+        for (mut report, artifact) in produced {
+            let Some(crate::providers::ProviderArtifact::ScipIndex { bytes }) = artifact else {
+                reports.push(report);
+                continue;
+            };
+            let artifact_record = self
+                .store
+                .artifacts()
+                .put_bytes(ArtifactKind::ScipIndex, &bytes)?;
+            report.artifact_digest = Some(artifact_record.digest.clone());
+            records.artifacts.push(artifact_record);
+            match crate::scip::ingest(&bytes, &context) {
+                Ok(outcome) => {
+                    report.scip_documents = outcome.documents;
+                    report.scip_definitions = outcome.definitions;
+                    report.scip_reference_edges = outcome.relations.len();
+                    merge_relations(&mut records.relations, outcome.relations);
+                    if outcome.foreign_documents > 0 {
+                        report.message = Some(format!(
+                            "{} documents skipped — not part of this snapshot",
+                            outcome.foreign_documents
+                        ));
+                    }
+                }
+                Err(error) => {
+                    report.state = crate::providers::ProviderState::Failed;
+                    report.message = Some(format!("artifact rejected: {error}"));
+                }
+            }
+            reports.push(report);
+        }
+        Ok(reports)
+    }
+
+    /// Live provider probe — detection only, runs nothing.
+    /// Detect-state report for every known provider (no execution).
+    #[must_use]
+    pub fn providers(&self) -> Vec<crate::providers::ProviderReport> {
+        crate::providers::detect_all(&self.config.repository_root)
     }
 
     fn model_cache_dir(&self) -> std::path::PathBuf {
@@ -1101,6 +1240,132 @@ struct CachedFileAnalysis {
     language: Option<String>,
     content_hash: String,
     parsed: crate::ParsedFile,
+}
+
+/// path → entity byte ranges ascending by span (innermost symbol first,
+/// whole-file entity last) for SCIP occurrence → enclosing-entity mapping.
+fn scip_ranges(
+    texts: &HashMap<String, String>,
+    parsed: &HashMap<String, crate::ParsedFile>,
+    unit_ids: &HashMap<String, Vec<String>>,
+    file_entities: &HashMap<String, String>,
+) -> HashMap<String, Vec<(usize, usize, String)>> {
+    let mut map = HashMap::new();
+    for (path, text) in texts {
+        let Some(file_id) = file_entities.get(path) else {
+            continue;
+        };
+        let mut ranges: Vec<(usize, usize, String)> = Vec::new();
+        if let (Some(file), Some(ids)) = (parsed.get(path), unit_ids.get(path)) {
+            for (index, unit) in file.units.iter().enumerate() {
+                if let Some(id) = ids.get(index) {
+                    ranges.push((unit.start_byte, unit.end_byte, id.clone()));
+                }
+            }
+        }
+        ranges.push((0, text.len().max(1), file_id.clone()));
+        ranges.sort_by_key(|(start, end, _)| end.saturating_sub(*start));
+        map.insert(path.clone(), ranges);
+    }
+    map
+}
+
+/// Merge provider-derived relations into pending records. Relation ids are
+/// pure functions of (source, target, kind), so a same-id provider edge
+/// replaces the lower-trust row in place; new edges append.
+fn merge_relations(existing: &mut Vec<Relation>, incoming: Vec<Relation>) -> usize {
+    let positions: HashMap<&str, usize> = existing
+        .iter()
+        .enumerate()
+        .map(|(index, relation)| (relation.id.as_str(), index))
+        .collect();
+    let mut replaces = Vec::new();
+    let mut appends = Vec::new();
+    for relation in incoming {
+        match positions.get(relation.id.as_str()) {
+            Some(&index) => replaces.push((index, relation)),
+            None => appends.push(relation),
+        }
+    }
+    let replaced = replaces.len();
+    for (index, relation) in replaces {
+        if let Some(slot) = existing.get_mut(index) {
+            *slot = relation;
+        }
+    }
+    existing.extend(appends);
+    replaced
+}
+
+/// Graph view status driven by provider outcomes: `Ready` when every
+/// applicable provider produced an index, `Partial` when coverage is
+/// incomplete or no provider applies.
+fn graph_view_status(
+    snapshot: &SnapshotIdentity,
+    reports: &[crate::providers::ProviderReport],
+) -> (ViewStatus, usize) {
+    use crate::providers::ProviderState;
+    let mut capabilities = vec![
+        Capability {
+            name: "contains".to_owned(),
+            level: "syntax_fact".to_owned(),
+            reason: None,
+        },
+        Capability {
+            name: "relative_imports".to_owned(),
+            level: "framework_derived".to_owned(),
+            reason: Some("relative imports only; no compiler resolution".to_owned()),
+        },
+    ];
+    let mut uncovered = Vec::new();
+    let mut scip_edges = 0_usize;
+    let mut digest = None;
+    for report in reports {
+        match report.state {
+            ProviderState::NotApplicable => {}
+            ProviderState::Ready => {
+                scip_edges += report.scip_reference_edges;
+                digest = digest.or_else(|| report.artifact_digest.clone());
+                capabilities.push(Capability {
+                    name: report.provider_id.clone(),
+                    level: "compiler_derived".to_owned(),
+                    reason: Some(format!(
+                        "{} definitions, {} reference edges",
+                        report.scip_definitions, report.scip_reference_edges
+                    )),
+                });
+            }
+            ProviderState::Missing | ProviderState::Failed => {
+                uncovered.push(format!(
+                    "{}: {}",
+                    report.provider_id,
+                    report.message.as_deref().unwrap_or("unavailable")
+                ));
+            }
+        }
+    }
+    let any_applicable = reports
+        .iter()
+        .any(|report| report.state != ProviderState::NotApplicable);
+    let (state, message) = if !any_applicable {
+        (
+            ViewState::Partial,
+            Some("Compiler/SCIP resolved references are not built".to_owned()),
+        )
+    } else if uncovered.is_empty() {
+        (ViewState::Ready, None)
+    } else {
+        (
+            ViewState::Partial,
+            Some(format!(
+                "SCIP coverage incomplete — {}",
+                uncovered.join("; ")
+            )),
+        )
+    };
+    let mut status = status(snapshot, state, capabilities, message);
+    status.artifact_digest = digest;
+    (status, scip_edges)
 }
 
 fn status(
@@ -1259,11 +1524,16 @@ fn address(
         start as u64..end as u64,
         start_line..=end_line,
     )?;
-    Ok(symbol_id.map_or(value.clone(), |id| value.with_symbol(id)))
+    Ok(match symbol_id {
+        Some(id) => value.with_symbol(id),
+        None => value,
+    })
 }
 
 fn line_for_offset(text: &str, offset: usize) -> u32 {
-    text.as_bytes()[..offset.min(text.len())]
+    text.as_bytes()
+        .get(..offset.min(text.len()))
+        .unwrap_or(text.as_bytes())
         .iter()
         .filter(|byte| **byte == b'\n')
         .count() as u32
@@ -1282,7 +1552,10 @@ fn chunk_ranges(text: &str, start: usize, end: usize, maximum: usize) -> Vec<(us
             chunk_end -= 1;
         }
         if chunk_end < end {
-            if let Some(newline) = text[cursor..chunk_end].rfind('\n') {
+            if let Some(newline) = text
+                .get(cursor..chunk_end)
+                .and_then(|slice| slice.rfind('\n'))
+            {
                 if newline > maximum / 2 {
                     chunk_end = cursor + newline + 1;
                 }
@@ -1298,11 +1571,17 @@ fn chunk_ranges(text: &str, start: usize, end: usize, maximum: usize) -> Vec<(us
 }
 
 fn qualified_name(path: &str, parsed: &crate::ParsedFile, index: usize) -> String {
-    let mut names = vec![parsed.units[index].name.as_str()];
-    let mut parent = parsed.units[index].parent_unit;
+    let Some(root) = parsed.units.get(index) else {
+        return path.to_owned();
+    };
+    let mut names = vec![root.name.as_str()];
+    let mut parent = root.parent_unit;
     while let Some(parent_index) = parent {
-        names.push(parsed.units[parent_index].name.as_str());
-        parent = parsed.units[parent_index].parent_unit;
+        let Some(unit) = parsed.units.get(parent_index) else {
+            break;
+        };
+        names.push(unit.name.as_str());
+        parent = unit.parent_unit;
     }
     names.reverse();
     format!("{}::{}", path, names.join("::"))
@@ -1323,7 +1602,9 @@ fn symbol_descriptor(
     parsed: &crate::ParsedFile,
     index: usize,
 ) -> String {
-    let unit = &parsed.units[index];
+    let Some(unit) = parsed.units.get(index) else {
+        return path.to_owned();
+    };
     let kind = format!("{:?}", unit.kind).to_ascii_lowercase();
     let qualified = qualified_name(path, parsed, index);
     let mut descriptor = format!("{kind} {qualified} in {path}");
@@ -1377,7 +1658,9 @@ fn leading_doc_comment(file_text: &str, start_line: u32) -> Option<String> {
     let mut collected: Vec<String> = Vec::new();
     while cursor > 0 && collected.len() < 4 {
         cursor -= 1;
-        let trimmed = lines[cursor].trim();
+        let Some(trimmed) = lines.get(cursor).map(|line| line.trim()) else {
+            break;
+        };
         if trimmed.is_empty() {
             if collected.is_empty() {
                 continue;
@@ -1408,7 +1691,9 @@ fn leading_doc_comment(file_text: &str, start_line: u32) -> Option<String> {
         if trimmed.ends_with("*/") {
             // Walk back to the block comment opener, collecting content.
             while cursor > 0 {
-                let inner = lines[cursor].trim();
+                let Some(inner) = lines.get(cursor).map(|line| line.trim()) else {
+                    break;
+                };
                 let is_open = inner.contains("/*");
                 let body = inner
                     .trim_end_matches("*/")

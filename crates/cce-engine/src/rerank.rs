@@ -27,6 +27,13 @@ impl std::fmt::Debug for LocalReranker {
 }
 
 impl LocalReranker {
+    /// Initialize a local ONNX cross-encoder for `model_code`. Model files
+    /// download once into `cache_dir` on first use (the documented network
+    /// opt-in); the session then runs fully offline.
+    ///
+    /// # Errors
+    /// Configuration error for an unknown model code; embedding error when
+    /// the ONNX session cannot start.
     pub fn new(model_code: &str, cache_dir: &Path) -> Result<Self> {
         let model = fastembed::TextRerank::list_supported_models()
             .into_iter()
@@ -58,6 +65,7 @@ impl LocalReranker {
             .collect()
     }
 
+    /// The fastembed model code this reranker was built with.
     #[must_use]
     pub fn model_code(&self) -> &str {
         &self.model_code

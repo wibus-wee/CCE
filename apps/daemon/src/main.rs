@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+//! `cce-daemon` HTTP service: the engine API over `/v1/*` plus the web
+//! dashboard's static assets, bound to loopback by default.
+
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
@@ -50,6 +53,10 @@ struct Arguments {
         default_missing_value = cce_engine::DEFAULT_LOCAL_RERANKER_MODEL
     )]
     reranker: Option<String>,
+    /// Skip external code-intelligence providers (SCIP indexers) during
+    /// indexing.
+    #[arg(long, env = "CCE_NO_PROVIDERS")]
+    no_providers: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -146,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         },
     };
     config.reranker_model = arguments.reranker;
+    config.providers.enabled = !arguments.no_providers;
     let state = Arc::new(CceEngine::open(config)?);
     let request_id = HeaderName::from_static("x-request-id");
     let mut router = Router::new()
@@ -157,6 +165,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/map", get(codebase_map))
         .route("/v1/explain/{name}", get(explain))
         .route("/v1/impact/{name}", get(impact))
+        .route("/v1/def/{name}", get(definitions))
+        .route("/v1/refs/{name}", get(references))
+        .route("/v1/providers", get(providers))
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
         .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
@@ -238,6 +249,26 @@ async fn impact(
     Path(name): Path<String>,
 ) -> Result<Json<cce_engine::ImpactReport>, ApiError> {
     Ok(Json(engine.impact_analysis(&name)?))
+}
+
+async fn definitions(
+    State(engine): State<Arc<CceEngine>>,
+    Path(name): Path<String>,
+) -> Result<Json<cce_engine::DefinitionsReport>, ApiError> {
+    Ok(Json(engine.definitions(&name)?))
+}
+
+async fn references(
+    State(engine): State<Arc<CceEngine>>,
+    Path(name): Path<String>,
+) -> Result<Json<cce_engine::ReferencesReport>, ApiError> {
+    Ok(Json(engine.references(&name)?))
+}
+
+async fn providers(
+    State(engine): State<Arc<CceEngine>>,
+) -> Result<Json<Vec<cce_engine::ProviderReport>>, ApiError> {
+    Ok(Json(engine.providers()))
 }
 
 async fn shutdown_signal() {

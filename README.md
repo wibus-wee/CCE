@@ -31,4 +31,4 @@ CCE stores repository-local state in `.cce/` by default. Set `CCE_DATA_DIR` to m
 
 Indexing is local and network-free by default. Dense retrieval and reranking are opt-in: `--dense local` and `--reranker` run in-process ONNX models whose files are downloaded once (the only network operation, and the explicit opt-in point) into the data directory and served offline thereafter. See `SECURITY.md` for the threat model and disclosure process.
 
-For service deployment and recovery, see `docs/operations.md`. HTTP and MCP contracts are documented in `docs/api.md`; benchmark methodology is in `docs/benchmarking.md`.
+For service deployment and recovery, see `docs/operations.md`. HTTP and MCP contracts are documented in `docs/api.md`; benchmark methodology is in `docs/benchmarking.md`. The service topology and external-toolchain provider framework are in `docs/service.md`.

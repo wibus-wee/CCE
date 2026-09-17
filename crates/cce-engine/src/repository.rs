@@ -14,18 +14,26 @@ use crate::{
     ignore::{builtin_skip_reason, is_internal_or_generated, is_sensitive_name},
 };
 
+/// One file discovered by the repository scan, with content-hash identity.
 #[derive(Debug, Clone)]
 pub struct ScannedFile {
+    /// Repository-relative path.
     pub relative_path: String,
+    /// Absolute filesystem path.
     pub absolute_path: PathBuf,
+    /// Detected language, when known.
     pub language: Option<String>,
+    /// BLAKE3 content hash.
     pub content_hash: String,
+    /// File size.
     pub size_bytes: u64,
+    /// Modification time (epoch ms).
     pub mtime_ms: i64,
+    /// Line count.
     pub line_count: u64,
     /// Bytes read during the scan when the mtime/size cache missed. `None`
     /// means the hash came from the cache and the content has not been read.
-    pub(crate) cached_bytes: Option<Vec<u8>>,
+    pub cached_bytes: Option<Vec<u8>>,
 }
 
 impl ScannedFile {
@@ -47,6 +55,10 @@ impl ScannedFile {
         Ok(Cow::Owned(bytes))
     }
 
+    /// UTF-8 view of `bytes()`.
+    ///
+    /// # Errors
+    /// `Configuration` when the file is not UTF-8 or changed mid-index.
     pub fn text(&self) -> Result<Cow<'_, str>> {
         match self.bytes()? {
             Cow::Borrowed(bytes) => {
@@ -84,25 +96,36 @@ pub struct RepositoryAnchor {
     pub base_revision: Option<String>,
 }
 
+/// Result of a full repository scan: identity, snapshot key, files, and
+/// per-reason skip lists.
 #[derive(Debug, Clone)]
 pub struct ScannedRepository {
+    /// Repository identity derived from the root path.
     pub identity: RepositoryIdentity,
+    /// Snapshot identity the scan implies (content hash + profile).
     pub snapshot: SnapshotIdentity,
+    /// Files eligible for indexing.
     pub files: Vec<ScannedFile>,
+    /// Files skipped for exceeding `max_file_bytes`.
     pub skipped_large_files: Vec<String>,
+    /// Binary files skipped.
     pub skipped_binary_files: Vec<String>,
+    /// Sensitive files skipped (`.env`, keys, …).
     pub skipped_sensitive_files: Vec<String>,
     /// Files dropped by the unconditional built-in policy (lockfiles,
     /// minified assets), each paired with its skip reason.
     pub skipped_builtin_files: Vec<(String, &'static str)>,
 }
 
+/// Walks the repository honoring ignore rules, size limits, and sensitive-
+/// file policy; computes content hashes and the snapshot identity.
 #[derive(Debug, Clone)]
 pub struct RepositoryScanner {
     config: EngineConfig,
 }
 
 impl RepositoryScanner {
+    /// Create a scanner bound to `config`.
     #[must_use]
     pub const fn new(config: EngineConfig) -> Self {
         Self { config }

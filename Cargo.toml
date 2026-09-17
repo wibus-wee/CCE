@@ -15,7 +15,10 @@ edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
 repository = "https://github.com/wibus-wee/CCE"
+readme = "README.md"
 authors = ["CCE Contributors"]
+keywords = ["code-search", "code-intelligence", "retrieval", "mcp", "indexing"]
+categories = ["development-tools"]
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -63,13 +66,62 @@ zerocopy = { version = "0.8", features = ["derive"] }
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
+# Public API is a contract: every reachable item carries a doc string.
+missing_docs = "warn"
+# --- cheap correctness/style hygiene ---------------------------------------
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+keyword_idents = { level = "warn", priority = -1 }
+non_ascii_idents = "warn"
+single_use_lifetimes = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+variant_size_differences = "warn"
+
+[workspace.lints.rustdoc]
+bare_urls = "warn"
+broken_intra_doc_links = "warn"
+invalid_codeblock_attributes = "warn"
+invalid_rust_codeblocks = "warn"
+private_intra_doc_links = "warn"
+redundant_explicit_links = "warn"
+unescaped_backticks = "warn"
 
 [workspace.lints.clippy]
-# Strict profile: `all` + `pedantic` at warn, with `clippy -D warnings` in CI
-# promoting them to errors. `pedantic` is noisy by design; each allow below is
-# a deliberate trade-off for this codebase, not a blanket exemption.
+# Strict profile: `all` + `pedantic` + `nursery` + `cargo` at warn, with
+# `clippy -D warnings` in CI promoting them to errors. `pedantic`/`nursery`
+# are noisy by design; each allow below is a deliberate trade-off for this
+# codebase, not a blanket exemption.
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -2 }
+nursery = { level = "warn", priority = -3 }
+cargo = { level = "warn", priority = -4 }
+# --- restriction subset: panic paths and unchecked indexing -----------------
+# Panicking sugar is allowed in tests via clippy.toml; production code returns
+# Result or uses explicit `unwrap_or`/`expect`-free control flow.
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+panic = "warn"
+unreachable = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+# --- deliberate restriction non-adoptions -----------------------------------
+# `as_conversions`/`arithmetic_side_effects` conflict with the deliberate cast
+# allows below: score math is intentionally lossy and documented as such.
+# `exit` is not adopted: CLI entry points may terminate the process.
+# --- deliberate cargo allows ------------------------------------------------
+# Duplicate dependency versions are owned by deny.toml [bans]
+# (`multiple-versions = "warn"`); one owner per fact.
+multiple_crate_versions = "allow"
+# --- deliberate nursery allows ----------------------------------------------
+# `redundant_pub_crate` conflicts with rustc's `unreachable_pub`: both lint the
+# same visibility spelling in opposite directions. The crate convention is
+# `unreachable_pub` — crate-internal items say `pub(crate)`, not `pub`.
+redundant_pub_crate = "allow"
 # --- deliberate pedantic allows -------------------------------------------
 # `if cond {}` blocks are often clearer than `let ... else` / bool chains here.
 collapsible_if = "allow"

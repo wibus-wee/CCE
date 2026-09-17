@@ -9,13 +9,23 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Classification of stored payloads for accounting and GC policy.
 pub enum ArtifactKind {
+    /// Raw source file contents.
     Source,
+    /// Dense embedding vectors/index data.
     VectorIndex,
+    /// Generated knowledge content.
     Knowledge,
+    /// Execution/benchmark traces.
     Trace,
+    /// Benchmark result bundles.
     Benchmark,
+    /// Downloaded model files.
     Model,
+    /// Provider-produced indexes (e.g. `index.scip`).
+    ScipIndex,
+    /// Anything not in the known set.
     Other,
 }
 
@@ -28,6 +38,7 @@ impl std::fmt::Display for ArtifactKind {
             Self::Trace => "trace",
             Self::Benchmark => "benchmark",
             Self::Model => "model",
+            Self::ScipIndex => "scip_index",
             Self::Other => "other",
         };
         f.write_str(value)
@@ -36,13 +47,21 @@ impl std::fmt::Display for ArtifactKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Metadata for one stored artifact object.
 pub struct ArtifactRecord {
+    /// BLAKE3 hex digest — the content address.
     pub digest: String,
+    /// Payload classification.
     pub kind: ArtifactKind,
+    /// Payload size.
     pub size_bytes: u64,
+    /// Path relative to the store root (`artifacts/blake3/xx/rest`).
     pub relative_path: String,
 }
 
+/// Content-addressed on-disk store for large payloads. Objects live under
+/// `artifacts/blake3/<2-byte-prefix>/<rest>`; writes are atomic via
+/// persist-noclobber temp files.
 #[derive(Debug, Clone)]
 pub struct ArtifactStore {
     root: PathBuf,
@@ -51,6 +70,10 @@ pub struct ArtifactStore {
 }
 
 impl ArtifactStore {
+    /// Open (creating if needed) the artifact store under `root`.
+    ///
+    /// # Errors
+    /// I/O error if the object/temp directories cannot be created.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let objects = root.join("artifacts").join("blake3");
@@ -64,6 +87,11 @@ impl ArtifactStore {
         })
     }
 
+    /// Store `bytes` under its BLAKE3 digest; idempotent and atomic.
+    ///
+    /// # Errors
+    /// `ArtifactCorrupt` if an existing object with the same digest fails
+    /// integrity verification; I/O error on write failure.
     pub fn put_bytes(&self, kind: ArtifactKind, bytes: &[u8]) -> Result<ArtifactRecord> {
         let digest = blake3::hash(bytes).to_hex().to_string();
         let destination = self.path_for(&digest)?;
@@ -114,6 +142,10 @@ impl ArtifactStore {
         })
     }
 
+    /// Read and integrity-check the object at `digest`.
+    ///
+    /// # Errors
+    /// `ArtifactCorrupt` on digest mismatch or malformed digest.
     pub fn read(&self, digest: &str) -> Result<Vec<u8>> {
         let path = self.path_for(digest)?;
         let bytes = fs::read(&path).map_err(|error| CceError::io(&path, error))?;
@@ -124,6 +156,10 @@ impl ArtifactStore {
         Ok(bytes)
     }
 
+    /// Whether an object exists for `digest` (without reading it).
+    ///
+    /// # Errors
+    /// `ArtifactCorrupt` if the digest is malformed.
     pub fn contains(&self, digest: &str) -> Result<bool> {
         Ok(self.path_for(digest)?.is_file())
     }

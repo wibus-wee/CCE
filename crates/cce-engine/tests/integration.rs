@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// Test fixtures panic freely: an unmet test precondition is a test bug, not a
+// recoverable error path.
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
 
 //! End-to-end coverage for the engine lifecycle: index → status → stale
 //! detection → retrieval → context → GC. Every test builds its own
@@ -397,6 +400,37 @@ async fn zero_evidence_query_abstains() {
             .any(|hit| hit.symbol_name.as_deref() == Some("resume_attempt")),
         "expected a resume_attempt hit, got {:?}",
         control
+            .hits
+            .iter()
+            .map(|hit| hit.symbol_name.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Code-switched CJK+Latin queries: unicode61 indexes a CJK run as one
+/// monolithic token, so CJK terms can never match Latin-script source —
+/// requiring them vetoes every real document. The embedded Latin word is
+/// the deliberate anchor and must carry the retrieval load on its own.
+#[tokio::test]
+async fn code_switched_query_reaches_latin_anchor() {
+    let repo = fixture_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // "cursor" is a parameter name — present in source but not an entity —
+    // so only the lexical Latin-anchor stages can find it. The CJK phrase
+    // matches nothing and must not veto it.
+    let result = engine
+        .search(search_request("cursor 在哪里被使用", true))
+        .await
+        .expect("code-switched search");
+    assert!(
+        result
+            .hits
+            .iter()
+            .any(|hit| hit.symbol_name.as_deref() == Some("resume_attempt")),
+        "latin anchor must surface the fixture symbol, got {:?}",
+        result
             .hits
             .iter()
             .map(|hit| hit.symbol_name.clone())

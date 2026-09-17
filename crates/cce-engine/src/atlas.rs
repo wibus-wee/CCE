@@ -15,64 +15,182 @@ use crate::repository::RepositoryScanner;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+/// One build-level package (crate/npm package) in the map.
 pub struct PackageNode {
+    /// Package name from its manifest.
     pub name: String,
+    /// Ecosystem tag (`cargo`, `npm`, …).
     pub ecosystem: String,
+    /// Path to the manifest file.
     pub manifest_path: String,
+    /// Package root directory.
     pub root_dir: String,
+    /// Files contained by this package.
     pub member_files: usize,
+    /// Packages this one depends on.
     pub dependencies: Vec<String>,
+    /// Packages depending on this one.
     pub dependents: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+/// Package-level architecture map for a snapshot.
 pub struct CodebaseMap {
+    /// Snapshot the map was read from.
     pub snapshot_id: String,
+    /// All packages found.
     pub packages: Vec<PackageNode>,
+    /// Number of `BuildDependsOn` edges between packages.
     pub dependency_edges: usize,
     /// Boundary violations detected at the package level — currently empty;
     /// direction rules arrive with the declared-architecture layer.
     pub violations: Vec<String>,
+    /// How the map was produced.
     pub provenance: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+/// Explanation of one named component: members, dependencies, dependents,
+/// and tests — all from persisted relations.
 pub struct ComponentExplanation {
+    /// Component name.
     pub name: String,
+    /// Entity kind of the component.
     pub kind: String,
+    /// Qualified name when known.
     pub qualified_name: Option<String>,
+    /// Source address of the component.
     pub address: Option<cce_core::SourceAddress>,
+    /// Files contained by the component.
     pub member_files: Vec<String>,
+    /// What the component depends on.
     pub dependencies: Vec<String>,
+    /// What depends on the component.
     pub dependents: Vec<String>,
+    /// Tests covering the component.
     pub tests: Vec<String>,
+    /// Provenance note for the explanation.
     pub provenance: String,
+}
+
+/// One resolved definition location for `definitions`/`references`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionHit {
+    /// Symbol name.
+    pub name: String,
+    /// Entity kind of the definition.
+    pub kind: String,
+    /// Qualified name when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualified_name: Option<String>,
+    /// Definition language.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Definition site address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<cce_core::SourceAddress>,
+}
+
+impl From<&cce_core::CodeEntity> for DefinitionHit {
+    fn from(entity: &cce_core::CodeEntity) -> Self {
+        Self {
+            name: entity.name.clone(),
+            kind: format!("{:?}", entity.kind),
+            qualified_name: entity.qualified_name.clone(),
+            language: entity.language.clone(),
+            address: entity.address.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ImpactReport {
+/// Result of a `def` query: all entities matching the name.
+pub struct DefinitionsReport {
+    /// The queried name.
     pub query: String,
+    /// Snapshot the lookup ran against.
     pub snapshot_id: String,
+    /// Resolved definition sites.
+    pub definitions: Vec<DefinitionHit>,
+}
+
+/// One inbound edge to a target entity.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceHit {
+    /// Name of the referencing entity.
+    pub from_name: String,
+    /// Qualified name of the referencing entity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_qualified_name: Option<String>,
+    /// Entity kind of the referencing entity.
+    pub from_kind: String,
+    /// Edge kind (`references`, `calls`, `implements`, `type_uses`).
+    pub via: String,
+    /// Provenance (`scip`, `tree_sitter`, …) — compiler truth vs syntax guess.
+    pub origin: String,
+    /// Edge confidence (1.0 for compiler-derived, <1 for syntax).
+    pub confidence: f32,
+    /// Source addresses where the reference occurs.
+    pub evidence: Vec<cce_core::SourceAddress>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Result of a `refs` query: resolved targets plus inbound edges.
+pub struct ReferencesReport {
+    /// The queried name.
+    pub query: String,
+    /// Snapshot the lookup ran against.
+    pub snapshot_id: String,
+    /// Entities the name resolved to.
+    pub targets: Vec<DefinitionHit>,
+    /// Inbound reference/call/implement edges.
+    pub references: Vec<ReferenceHit>,
+    /// Whether the edge cap truncated the list.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Impact-analysis result: entities reaching the seed within two hops.
+pub struct ImpactReport {
+    /// The queried name.
+    pub query: String,
+    /// Snapshot the analysis ran against.
+    pub snapshot_id: String,
+    /// Seed entities the name resolved to.
     pub matched_entities: Vec<String>,
     /// Entities that reach the target through impact edges (callers,
     /// references, tests, implementations) within two hops.
     pub impacted: Vec<ImpactedEntity>,
+    /// Edge kinds counted as impact edges.
     pub edge_kinds: Vec<String>,
+    /// How the report was produced.
     pub provenance: String,
+    /// Limitations the caller should know (heuristic edges, hop cap, …).
     pub caveats: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+/// One entity impacted through the relation graph.
 pub struct ImpactedEntity {
+    /// Entity name.
     pub name: String,
+    /// Entity kind.
     pub kind: String,
+    /// Source path when known.
     pub path: Option<String>,
+    /// Distance in edges from the seed.
     pub hops: usize,
+    /// Edge kind connecting it.
     pub via: String,
+    /// Confidence of the connecting edge.
     pub confidence: f32,
 }
 
@@ -299,14 +417,17 @@ impl CceEngine {
                     frontier.push((neighbor.clone(), hops + 1));
                 }
                 if let Some(entity) = self.store().entity_by_id(&snapshot_id, &neighbor)? {
-                    let entry = impacted.entry(neighbor.clone()).or_insert(ImpactedEntity {
-                        name: entity.name,
-                        kind: format!("{:?}", entity.kind),
-                        path: entity.address.map(|address| address.path),
-                        hops: hops + 1,
-                        via: format!("{:?}", edge.kind),
-                        confidence: edge.confidence,
-                    });
+                    let entry =
+                        impacted
+                            .entry(neighbor.clone())
+                            .or_insert_with(|| ImpactedEntity {
+                                name: entity.name,
+                                kind: format!("{:?}", entity.kind),
+                                path: entity.address.map(|address| address.path),
+                                hops: hops + 1,
+                                via: format!("{:?}", edge.kind),
+                                confidence: edge.confidence,
+                            });
                     if hops + 1 < entry.hops {
                         entry.hops = hops + 1;
                         entry.via = format!("{:?}", edge.kind);
@@ -337,6 +458,85 @@ impl CceEngine {
                 .collect(),
             provenance: "persisted typed relation graph".to_owned(),
             caveats,
+        })
+    }
+
+    /// Resolve a name to its definition entities — `cce def`.
+    pub fn definitions(&self, name: &str) -> Result<DefinitionsReport> {
+        let snapshot_id = self.current_snapshot_id()?;
+        let entities = self.store().entity_by_name(&snapshot_id, name, 32)?;
+        Ok(DefinitionsReport {
+            query: name.to_owned(),
+            snapshot_id,
+            definitions: entities.iter().map(DefinitionHit::from).collect(),
+        })
+    }
+
+    /// Everything referencing a named symbol — `cce refs`. Incoming
+    /// `References`/`Calls`/`Implements`/`TypeUses` edges, origin-tagged so
+    /// compiler-derived (SCIP) rows are distinguishable from syntax guesses.
+    pub fn references(&self, name: &str) -> Result<ReferencesReport> {
+        const MAX_REFERENCES: usize = 256;
+        let snapshot_id = self.current_snapshot_id()?;
+        let targets = self.store().entity_by_name(&snapshot_id, name, 32)?;
+        let mut hits = Vec::new();
+        let mut truncated = false;
+        'outer: for target in &targets {
+            let incoming = self.store().relations_for_entity(
+                &snapshot_id,
+                &target.id,
+                RelationDirection::Incoming,
+                4096,
+            )?;
+            for relation in incoming {
+                let covered = matches!(
+                    relation.kind,
+                    RelationKind::References
+                        | RelationKind::Calls
+                        | RelationKind::Implements
+                        | RelationKind::TypeUses
+                );
+                if !covered {
+                    continue;
+                }
+                if hits.len() >= MAX_REFERENCES {
+                    truncated = true;
+                    break 'outer;
+                }
+                let source = self
+                    .store()
+                    .entity_by_id(&snapshot_id, &relation.source_entity_id)?;
+                hits.push(ReferenceHit {
+                    from_name: source.as_ref().map_or_else(
+                        || relation.source_entity_id.clone(),
+                        |entity| entity.name.clone(),
+                    ),
+                    from_qualified_name: source
+                        .as_ref()
+                        .and_then(|entity| entity.qualified_name.clone()),
+                    from_kind: source.as_ref().map_or_else(
+                        || "unknown".to_owned(),
+                        |entity| format!("{:?}", entity.kind),
+                    ),
+                    via: serde_json::to_value(&relation.kind)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "other".to_owned()),
+                    origin: serde_json::to_value(relation.origin)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    confidence: relation.confidence,
+                    evidence: relation.evidence,
+                });
+            }
+        }
+        Ok(ReferencesReport {
+            query: name.to_owned(),
+            snapshot_id,
+            targets: targets.iter().map(DefinitionHit::from).collect(),
+            references: hits,
+            truncated,
         })
     }
 

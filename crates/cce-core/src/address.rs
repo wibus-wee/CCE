@@ -5,19 +5,34 @@ use crate::{CceError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+/// Canonical pointer to a source range: repository + snapshot + path +
+/// byte/line span (+ optional symbol pin). Every result maps to one.
 pub struct SourceAddress {
+    /// Owning repository id.
     pub repository_id: String,
+    /// Snapshot the address was captured in.
     pub snapshot_id: String,
+    /// Normalized repository-relative path (`/`-separated, no `.`/`..`).
     pub path: String,
+    /// Inclusive start byte offset.
     pub start_byte: u64,
+    /// Exclusive end byte offset.
     pub end_byte: u64,
+    /// 1-based start line.
     pub start_line: u32,
+    /// 1-based end line (inclusive).
     pub end_line: u32,
+    /// Entity id of the enclosing symbol, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_id: Option<String>,
 }
 
 impl SourceAddress {
+    /// Build an address; rejects parent traversal and inverted ranges.
+    ///
+    /// # Errors
+    /// `PathEscape` for `..`/empty paths, `InvalidSourceRange` for
+    /// `start > end`.
     pub fn new(
         repository_id: impl Into<String>,
         snapshot_id: impl Into<String>,
@@ -45,12 +60,14 @@ impl SourceAddress {
         })
     }
 
+    /// Attach the enclosing symbol's entity id.
     #[must_use]
     pub fn with_symbol(mut self, symbol_id: impl Into<String>) -> Self {
         self.symbol_id = Some(symbol_id.into());
         self
     }
 
+    /// Length of the byte span.
     #[must_use]
     pub const fn byte_len(&self) -> u64 {
         self.end_byte.saturating_sub(self.start_byte)

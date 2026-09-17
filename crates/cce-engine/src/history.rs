@@ -7,8 +7,8 @@ use gix::bstr::{BString, ByteSlice};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HistorySummary {
-    pub(crate) body: String,
-    pub(crate) commit_count: usize,
+    pub body: String,
+    pub commit_count: usize,
 }
 
 pub(crate) fn summarize(

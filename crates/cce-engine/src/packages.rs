@@ -13,11 +13,11 @@ use crate::engine::{entity_id as engine_entity_id, relation_id as engine_relatio
 use crate::repository::ScannedFile;
 
 pub(crate) struct PackageInfo {
-    pub(crate) name: String,
-    pub(crate) manifest_path: String,
-    pub(crate) root_dir: String,
-    pub(crate) ecosystem: &'static str,
-    pub(crate) dependencies: Vec<String>,
+    pub name: String,
+    pub manifest_path: String,
+    pub root_dir: String,
+    pub ecosystem: &'static str,
+    pub dependencies: Vec<String>,
 }
 
 /// Discover packages from build manifests. Every manifest that declares a
@@ -90,8 +90,8 @@ fn npm_package(manifest_path: &str, text: &str) -> Option<PackageInfo> {
 }
 
 pub(crate) struct PackageEmission {
-    pub(crate) entities: Vec<CodeEntity>,
-    pub(crate) relations: Vec<Relation>,
+    pub entities: Vec<CodeEntity>,
+    pub relations: Vec<Relation>,
 }
 
 /// Turn discovered packages into graph entities and edges:

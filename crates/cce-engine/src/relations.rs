@@ -367,12 +367,18 @@ fn call_site_address(
     start: usize,
     end: usize,
 ) -> Option<SourceAddress> {
-    let start_line = text.as_bytes()[..start.min(text.len())]
+    let start_line = text
+        .as_bytes()
+        .get(..start.min(text.len()))
+        .unwrap_or(text.as_bytes())
         .iter()
         .filter(|byte| **byte == b'\n')
         .count() as u32
         + 1;
-    let end_line = text.as_bytes()[..end.min(text.len())]
+    let end_line = text
+        .as_bytes()
+        .get(..end.min(text.len()))
+        .unwrap_or(text.as_bytes())
         .iter()
         .filter(|byte| **byte == b'\n')
         .count() as u32
@@ -467,7 +473,7 @@ fn resolve_type_reference<'a>(
         })
 }
 
-fn is_type_kind(kind: &EntityKind) -> bool {
+const fn is_type_kind(kind: &EntityKind) -> bool {
     matches!(
         kind,
         EntityKind::Struct
@@ -510,7 +516,7 @@ fn changed_with_relations(context: &RelationContext<'_>) -> Vec<Relation> {
             *appearances.entry(path.clone()).or_default() += 1;
         }
         for (index, left) in paths.iter().enumerate() {
-            for right in &paths[index + 1..] {
+            for right in paths.iter().skip(index + 1) {
                 *co_changes.entry((left.clone(), right.clone())).or_default() += 1;
             }
         }
@@ -548,7 +554,12 @@ fn changed_with_relations(context: &RelationContext<'_>) -> Vec<Relation> {
         ) else {
             continue;
         };
-        let appearances_of_pair = appearances[left].max(appearances[right]).max(1);
+        let appearances_of_pair = appearances
+            .get(left)
+            .copied()
+            .unwrap_or(0)
+            .max(appearances.get(right).copied().unwrap_or(0))
+            .max(1);
         let confidence = (*count as f32 / appearances_of_pair as f32).min(0.7);
         // Symmetric edge stored once, with the smaller id as source.
         let (source, target) = if left_id <= right_id {

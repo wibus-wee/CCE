@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+//! `cce` command-line client: index, status, search, context packs, and the
+//! architecture atlas over a repository's `.cce/` state.
+
 use std::path::PathBuf;
 
 use cce_core::{QueryIntent, SearchRequest, SearchRoute};
@@ -32,6 +35,10 @@ struct Arguments {
         default_missing_value = cce_engine::DEFAULT_LOCAL_RERANKER_MODEL
     )]
     reranker: Option<String>,
+    /// Skip external code-intelligence providers (SCIP indexers) during
+    /// indexing. Query commands are unaffected.
+    #[arg(long, global = true, env = "CCE_NO_PROVIDERS")]
+    no_providers: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -97,6 +104,15 @@ enum Command {
     Explain { repository: PathBuf, name: String },
     /// Blast radius of a symbol or package: impact edges within two hops.
     Impact { repository: PathBuf, name: String },
+    /// Definition sites for a symbol.
+    Def { repository: PathBuf, name: String },
+    /// Inbound references/calls/implementations for a symbol, origin-tagged.
+    Refs { repository: PathBuf, name: String },
+    /// Probe external code-intelligence providers (SCIP toolchains).
+    Providers {
+        #[arg(default_value = ".")]
+        repository: PathBuf,
+    },
     /// List local embedding model codes usable with --dense local.
     Models,
     /// Prune old snapshots and unreferenced artifacts.
@@ -278,6 +294,18 @@ async fn main() -> anyhow::Result<()> {
             let engine = engine(&arguments, repository)?;
             print_value(&engine.impact_analysis(name)?)?;
         }
+        Command::Def { repository, name } => {
+            let engine = engine(&arguments, repository)?;
+            print_value(&engine.definitions(name)?)?;
+        }
+        Command::Refs { repository, name } => {
+            let engine = engine(&arguments, repository)?;
+            print_value(&engine.references(name)?)?;
+        }
+        Command::Providers { repository } => {
+            let engine = engine(&arguments, repository)?;
+            print_value(&engine.providers())?;
+        }
         Command::Models => {
             println!("# embedding models (--embedding-model)");
             for code in cce_engine::LocalEmbedder::supported_model_codes() {
@@ -312,6 +340,7 @@ fn engine(arguments: &Arguments, repository: &PathBuf) -> anyhow::Result<CceEngi
         },
     };
     config.reranker_model.clone_from(&arguments.reranker);
+    config.providers.enabled = !arguments.no_providers;
     CceEngine::open(config).map_err(Into::into)
 }
 

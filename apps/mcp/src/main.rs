@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+//! `cce-mcp` Model Context Protocol adapter: exposes the engine's index,
+//! status, search, context, map, explain, and impact operations as MCP tools
+//! over stdio JSON-RPC.
+
 use std::{path::PathBuf, sync::Arc};
 
 use cce_core::{QueryIntent, SearchRequest};

@@ -14,12 +14,17 @@ mod lock;
 mod packages;
 mod parser;
 mod planner;
+mod providers;
 mod relations;
 mod repository;
 mod rerank;
 mod retrieval;
+mod scip;
 
-pub use atlas::{CodebaseMap, ComponentExplanation, ImpactReport, ImpactedEntity, PackageNode};
+pub use atlas::{
+    CodebaseMap, ComponentExplanation, DefinitionHit, DefinitionsReport, ImpactReport,
+    ImpactedEntity, PackageNode, ReferenceHit, ReferencesReport,
+};
 pub use cce_core::GraphPolicy;
 pub use config::{
     DEFAULT_LOCAL_EMBEDDING_MODEL, DEFAULT_LOCAL_RERANKER_MODEL, DenseBackendConfig, EngineConfig,
@@ -30,6 +35,7 @@ pub use dense::{DenseIndex, DenseSearchHit, EmbedRole, Embedder, EmbeddingBacken
 pub use engine::{CceEngine, IndexReport};
 pub use parser::{ParsedFile, ParsedUnit, SourceParser};
 pub use planner::{QueryPlan, QueryPlanner};
+pub use providers::{ProviderReport, ProviderState};
 pub use repository::{RepositoryScanner, ScannedFile, ScannedRepository};
 pub use rerank::LocalReranker;
 pub use retrieval::SearchResult;

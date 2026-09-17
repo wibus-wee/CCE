@@ -14,24 +14,39 @@ const FORMAT_VERSION: u32 = 1;
 /// model families (E5) require different prefixes for each role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedRole {
+    /// Embedding a document for the index.
     Document,
+    /// Embedding a user query.
     Query,
 }
 
+/// An embedding model behind a small async surface.
 #[async_trait]
 pub trait Embedder: Send + Sync {
+    /// Profile string persisted with the index (query/index must match).
     fn profile(&self) -> &str;
+    /// Whether vectors are benchmark-meaningful (real model vs baseline).
     fn production_ready(&self) -> bool;
+    /// Embed `inputs`; returns one vector per input, normalized.
     async fn embed(&self, inputs: &[String], role: EmbedRole) -> Result<Vec<Vec<f32>>>;
 }
 
+/// The selected dense backend implementation.
 #[derive(Debug, Clone)]
 pub enum EmbeddingBackend {
+    /// Hash-based offline baseline.
     Deterministic(DeterministicEmbedder),
+    /// In-process ONNX model via fastembed.
     Local(LocalEmbedder),
 }
 
 impl EmbeddingBackend {
+    /// Build the backend for a config; `None` when dense is disabled.
+    /// `Local` may download model files into `model_cache_dir` (opt-in
+    /// network) then runs fully offline.
+    ///
+    /// # Errors
+    /// Configuration/embedding errors on invalid config or model init.
     pub fn from_config(
         config: &DenseBackendConfig,
         model_cache_dir: &Path,
@@ -73,6 +88,8 @@ impl Embedder for EmbeddingBackend {
     }
 }
 
+/// Hash-of-token baseline embedder — deterministic, offline, used for
+/// tests and pipeline plumbing checks; never production.
 #[derive(Debug, Clone)]
 pub struct DeterministicEmbedder {
     dimensions: usize,
@@ -80,6 +97,10 @@ pub struct DeterministicEmbedder {
 }
 
 impl DeterministicEmbedder {
+    /// Create a baseline embedder with `dimensions` (32..=16384).
+    ///
+    /// # Errors
+    /// `Configuration` on out-of-range dimensions.
     pub fn new(dimensions: usize) -> Result<Self> {
         if !(32..=16_384).contains(&dimensions) {
             return Err(CceError::Configuration(format!(
@@ -111,10 +132,18 @@ impl Embedder for DeterministicEmbedder {
                 for token in tokens(input) {
                     let hash = blake3::hash(token.as_bytes());
                     let bytes = hash.as_bytes();
-                    let slot = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8])) as usize
-                        % self.dimensions;
-                    let sign = if bytes[8] & 1 == 0 { 1.0 } else { -1.0 };
-                    vector[slot] += sign;
+                    let slot =
+                        u64::from_le_bytes(bytes.first_chunk::<8>().copied().unwrap_or_default())
+                            as usize
+                            % self.dimensions;
+                    let sign = if bytes.get(8).copied().unwrap_or(0) & 1 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    if let Some(value) = vector.get_mut(slot) {
+                        *value += sign;
+                    }
                 }
                 normalize(&mut vector);
                 vector
@@ -145,6 +174,11 @@ impl std::fmt::Debug for LocalEmbedder {
 }
 
 impl LocalEmbedder {
+    /// Load a fastembed model by code, downloading to `cache_dir` on first
+    /// use (explicit network opt-in at `--dense local` selection time).
+    ///
+    /// # Errors
+    /// `Configuration` for unknown models; `Embedding` on init failure.
     pub fn new(model_code: &str, cache_dir: &Path) -> Result<Self> {
         let model = fastembed::TextEmbedding::list_supported_models()
             .into_iter()
@@ -232,12 +266,17 @@ impl Embedder for LocalEmbedder {
     }
 }
 
+/// One dense-index match.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseSearchHit {
+    /// Matched document id.
     pub document_id: String,
+    /// Cosine similarity score.
     pub score: f32,
 }
 
+/// An in-memory flat dense index (brute-force dot product over normalized
+/// vectors); serialized to the artifact store as a versioned blob.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseIndex {
     profile: String,
@@ -247,6 +286,11 @@ pub struct DenseIndex {
 }
 
 impl DenseIndex {
+    /// Embed all documents and build the index.
+    ///
+    /// # Errors
+    /// `Embedding` on model failure or inconsistent dimensions;
+    /// `Configuration` when `batch_size` is 0.
     pub async fn build(
         documents: &[DocumentContent],
         embedder: &impl Embedder,
@@ -286,6 +330,11 @@ impl DenseIndex {
         })
     }
 
+    /// Brute-force top-`limit` search; `embedder` profile must match the
+    /// index's build profile.
+    ///
+    /// # Errors
+    /// `Configuration` on profile mismatch; `Embedding` on query failure.
     pub async fn search(
         &self,
         query: &str,
@@ -327,6 +376,10 @@ impl DenseIndex {
         Ok(hits)
     }
 
+    /// Serialize to the `CCEVEC1` binary format for artifact storage.
+    ///
+    /// # Errors
+    /// `Configuration` when sizes exceed format limits.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let dimension = u32::try_from(self.dimensions)
             .map_err(|_| CceError::Configuration("vector dimension exceeds format".to_owned()))?;
@@ -363,6 +416,10 @@ impl DenseIndex {
         Ok(bytes)
     }
 
+    /// Parse a `CCEVEC1` blob back into an index, with integrity checks.
+    ///
+    /// # Errors
+    /// `ArtifactCorrupt`/`UnsupportedFormat` on malformed input.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut reader = SliceReader::new(bytes);
         if reader.take(8)? != MAGIC {

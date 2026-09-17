@@ -1,0 +1,8 @@
+# Test code may panic/index freely; the restriction lints below gate
+# production code only. Integration tests under tests/ are covered too.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true

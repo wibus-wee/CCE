@@ -3,23 +3,34 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// The planner's output: which routes to run, how much graph expansion is
+/// allowed, which views are required, and why.
 pub struct QueryPlan {
+    /// Classified intent (caller-supplied wins over guessing).
     pub intent: QueryIntent,
+    /// Retrieval routes to execute.
     pub routes: Vec<SearchRoute>,
+    /// Graph expansion policy.
     pub graph_policy: GraphPolicy,
+    /// Views that must be Ready for the plan to be satisfiable.
     pub required_views: Vec<ViewKind>,
+    /// Human-readable rationale for the plan.
     pub reasons: Vec<String>,
 }
 
+/// Deterministic query planner: text → `QueryPlan`. Heuristics only label
+/// intent; they never silently narrow routes.
 #[derive(Debug, Clone, Default)]
 pub struct QueryPlanner;
 
 impl QueryPlanner {
+    /// Create a planner.
     #[must_use]
     pub const fn new() -> Self {
         Self
     }
 
+    /// Plan routes and graph policy for a query.
     #[must_use]
     pub fn plan(&self, query: &str, requested_intent: Option<QueryIntent>) -> QueryPlan {
         let normalized = query.to_ascii_lowercase();

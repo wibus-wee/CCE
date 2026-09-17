@@ -4,16 +4,26 @@ use tree_sitter::{Language, Node, Parser};
 
 use crate::ScannedFile;
 
+/// One extracted source unit (symbol) from a parsed file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedUnit {
+    /// Entity kind of the unit.
     pub kind: EntityKind,
+    /// Symbol name.
     pub name: String,
+    /// Declaration signature when extractable.
     pub signature: Option<String>,
+    /// Inclusive start byte.
     pub start_byte: usize,
+    /// Exclusive end byte.
     pub end_byte: usize,
+    /// 1-based start line.
     pub start_line: u32,
+    /// 1-based end line.
     pub end_line: u32,
+    /// Index of the enclosing unit, if nested.
     pub parent_unit: Option<usize>,
+    /// Tree-sitter node kind for diagnostics.
     pub syntax_kind: String,
     /// Identifier spellings appearing in type positions inside this unit's
     /// range (sorted, deduplicated) — `fn f(x: &Token)` contributes `Token`.
@@ -26,30 +36,43 @@ pub struct ParsedUnit {
 /// file scope (outside any extracted symbol).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedCall {
+    /// Index of the calling unit; `None` = file scope.
     pub caller: Option<usize>,
+    /// Callee name as written.
     pub name: String,
+    /// Inclusive start byte of the call expression.
     pub start_byte: usize,
+    /// Exclusive end byte of the call expression.
     pub end_byte: usize,
 }
 
+/// Everything extracted from one file: units, calls, and parse status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedFile {
+    /// Extracted source units.
     pub units: Vec<ParsedUnit>,
+    /// Call expressions with caller attribution.
     pub calls: Vec<ParsedCall>,
+    /// Whether a parser handled this file.
     pub parsed: bool,
+    /// Whether the parse reported syntax errors.
     pub has_syntax_errors: bool,
+    /// Parser/language identifier used.
     pub parser: Option<String>,
 }
 
+/// Tree-sitter source parser for supported languages.
 #[derive(Debug, Clone, Default)]
 pub struct SourceParser;
 
 impl SourceParser {
+    /// Create a parser.
     #[must_use]
     pub const fn new() -> Self {
         Self
     }
 
+    /// Whether a tree-sitter grammar exists for `language_name`.
     #[must_use]
     pub fn supports(language_name: &str) -> bool {
         language(language_name).is_some()
@@ -99,7 +122,7 @@ impl SourceParser {
     }
 }
 
-fn unparsed() -> ParsedFile {
+const fn unparsed() -> ParsedFile {
     ParsedFile {
         units: Vec::new(),
         calls: Vec::new(),
@@ -311,12 +334,20 @@ fn assign_parents(units: &mut [ParsedUnit]) {
     let mut ancestors: Vec<usize> = Vec::new();
     for index in 0..units.len() {
         while let Some(parent) = ancestors.last().copied() {
-            if units[parent].end_byte >= units[index].end_byte {
+            let (Some(parent_end), Some(index_end)) = (
+                units.get(parent).map(|unit| unit.end_byte),
+                units.get(index).map(|unit| unit.end_byte),
+            ) else {
+                break;
+            };
+            if parent_end >= index_end {
                 break;
             }
             ancestors.pop();
         }
-        units[index].parent_unit = ancestors.last().copied();
+        if let Some(unit) = units.get_mut(index) {
+            unit.parent_unit = ancestors.last().copied();
+        }
         ancestors.push(index);
     }
 }
@@ -342,8 +373,9 @@ fn signature(node: Node<'_>, source: &[u8]) -> Option<String> {
     let end = body_start
         .min(node.end_byte())
         .min(node.start_byte() + 2_048);
-    let value = std::str::from_utf8(&source[node.start_byte()..end])
-        .ok()?
+    let value = source
+        .get(node.start_byte()..end)
+        .and_then(|slice| std::str::from_utf8(slice).ok())?
         .trim();
     (!value.is_empty()).then(|| value.to_owned())
 }

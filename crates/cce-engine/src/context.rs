@@ -10,17 +10,25 @@ use crate::{CceEngine, SearchResult};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Parameters for `CceEngine::context` — a token-budgeted context pack.
 pub struct ContextRequest {
+    /// Query/task text to gather context for.
     pub query: String,
+    /// Optional pre-classified intent.
     pub intent: Option<QueryIntent>,
+    /// Token budget for the pack.
     pub budget_tokens: usize,
+    /// Search candidates feeding the packer.
     pub max_candidates: usize,
+    /// Refuse results from stale snapshots.
     pub require_fresh: bool,
+    /// Route allowlist; empty = planner chooses.
     #[serde(default)]
     pub routes: Vec<SearchRoute>,
 }
 
 impl ContextRequest {
+    /// A request with default candidate/freshness settings.
     #[must_use]
     pub fn new(query: impl Into<String>, budget_tokens: usize) -> Self {
         Self {
@@ -34,15 +42,19 @@ impl ContextRequest {
     }
 }
 
+/// Packs search hits into a `ContextPack` within a token budget.
 #[derive(Debug, Clone, Default)]
 pub struct ContextPacker;
 
 impl ContextPacker {
+    /// Create a packer.
     #[must_use]
     pub const fn new() -> Self {
         Self
     }
 
+    /// Assemble the pack: orientation first, then hits until budget runs
+    /// out, preserving per-item provenance.
     #[must_use]
     pub fn pack(&self, search: &SearchResult, budget_tokens: usize) -> ContextPack {
         let orientation = orientation(search);
@@ -159,6 +171,11 @@ impl ContextPacker {
 }
 
 impl CceEngine {
+    /// Search then pack into a token-budgeted `ContextPack` with explicit
+    /// uncertainty reporting.
+    ///
+    /// # Errors
+    /// Propagates search/storage errors.
     pub async fn context(&self, request: ContextRequest) -> Result<ContextPack> {
         let search = self
             .search(SearchRequest {
