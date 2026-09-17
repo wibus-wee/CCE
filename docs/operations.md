@@ -12,7 +12,7 @@ SQLite is canonical metadata. Back up `metadata.sqlite` together with the entire
 
 Artifact objects are immutable and deduplicated. Orphans can exist after a failed build and are safe; `cce gc` removes them — it prunes snapshots beyond `--keep` (the current snapshot is always retained) and deletes artifact objects no committed metadata row references. `cce index` also prunes automatically after each commit (retention: 8 completed snapshots). Do not manually remove objects referenced by SQLite.
 
-Embedding models for `--dense local` are downloaded once into `<data-dir>/models/` and reused offline afterward. If huggingface.co is unreachable, set `HF_ENDPOINT` to a mirror before the first index.
+Embedding models for `--dense local` and reranker models for `--reranker` are downloaded once into `<data-dir>/models/` and reused offline afterward. If huggingface.co is unreachable, set `HF_ENDPOINT` to a mirror before the first index or reranked search.
 
 ## Health and observability
 

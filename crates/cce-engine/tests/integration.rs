@@ -404,6 +404,89 @@ async fn zero_evidence_query_abstains() {
     );
 }
 
+/// Built-in ignore policy: lock files are unconditional skips regardless
+/// of .gitignore state, reported with a reason, and never reach FTS or
+/// retrieval documents.
+#[tokio::test]
+async fn lock_files_are_unconditionally_ignored() {
+    let repo = fixture_repo();
+    write(
+        repo.path(),
+        "Cargo.lock",
+        "# lockfile\n[[package]]\nname = \"zorblax_lockdep\"\nversion = \"9.9.9\"\n",
+    );
+    write(
+        repo.path(),
+        "package-lock.json",
+        "{\n  \"name\": \"zorblax_lockdep\",\n  \"lockfileVersion\": 3\n}\n",
+    );
+    let engine = engine(repo.path());
+
+    let report = engine.index().await.expect("index");
+    let skipped: Vec<&str> = report
+        .skipped_builtin_files
+        .iter()
+        .map(|(path, reason)| {
+            assert_eq!(reason, "lockfile");
+            path.as_str()
+        })
+        .collect();
+    assert!(skipped.contains(&"Cargo.lock"), "got {skipped:?}");
+    assert!(skipped.contains(&"package-lock.json"), "got {skipped:?}");
+
+    // A token that only exists inside lock files must not retrieve them.
+    let result = engine
+        .search(search_request("zorblax_lockdep", true))
+        .await
+        .expect("search");
+    assert!(
+        result.hits.is_empty(),
+        "lock-file content must not be indexed, got {:?}",
+        result
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A configured-but-broken reranker degrades to fused order with an
+/// explicit missing capability — never a silent drop or a hard error.
+#[tokio::test]
+async fn broken_reranker_falls_back_with_missing_capability() {
+    let repo = fixture_repo();
+    let mut config = EngineConfig::for_repository(repo.path());
+    config.reranker_model = Some("nonexistent/reranker-model".to_owned());
+    let engine = CceEngine::open(config).expect("open engine");
+    engine.index().await.expect("index");
+
+    let result = engine
+        .search(search_request("resume_attempt cursor", true))
+        .await
+        .expect("search must not fail on reranker init");
+    assert!(
+        result
+            .hits
+            .iter()
+            .any(|hit| hit.symbol_name.as_deref() == Some("resume_attempt")),
+        "fused ranking must still serve hits"
+    );
+    assert!(
+        result
+            .missing_capabilities
+            .iter()
+            .any(|message| message.contains("reranker")),
+        "expected explicit reranker missing-capability, got {:?}",
+        result.missing_capabilities
+    );
+    assert!(
+        result.hits.iter().all(|hit| !hit
+            .contributing_routes
+            .contains(&cce_core::SearchRoute::Reranked)),
+        "failed reranker must not stamp the Reranked route"
+    );
+}
+
 #[tokio::test]
 async fn atlas_on_unindexed_repository_is_an_explicit_error() {
     let repo = fixture_repo();

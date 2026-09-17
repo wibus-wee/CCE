@@ -13,6 +13,10 @@ use crate::{
 
 const RRF_K: f64 = 60.0;
 
+/// How many head hits the cross-encoder re-scores. Reranker cost is linear
+/// in pairs; beyond ~50 the fused prior is already thin.
+const RERANK_POOL: usize = 50;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
@@ -448,6 +452,67 @@ impl CceEngine {
                 break;
             }
         }
+
+        // Cross-encoder rerank: the fused order is a coarse prior from
+        // route-level rank fusion. A pairwise reranker re-scores the head
+        // of the list against the raw query text and reorders it; hits
+        // beyond the pool keep fused order. Configured-but-failed rerankers
+        // degrade to fused order with an explicit missing-capability note.
+        if hits.len() > 1 && self.config().reranker_model.is_some() {
+            match self.reranker().await {
+                Ok(Some(reranker)) => {
+                    let pool = hits.len().min(RERANK_POOL);
+                    let documents = hits[..pool]
+                        .iter()
+                        .map(|hit| {
+                            let location = hit.address.as_ref().map_or_else(
+                                || {
+                                    hit.symbol_name
+                                        .clone()
+                                        .unwrap_or_else(|| hit.document_id.clone())
+                                },
+                                |address| {
+                                    format!(
+                                        "{}:{}",
+                                        address.path,
+                                        hit.symbol_name.as_deref().unwrap_or("")
+                                    )
+                                },
+                            );
+                            format!("{location}\n{}", hit.snippet)
+                        })
+                        .collect::<Vec<_>>();
+                    match reranker.rerank(&request.query, &documents).await {
+                            Ok(order) => {
+                                let mut reranked = Vec::with_capacity(pool);
+                                for (index, score) in order {
+                                    let mut hit = hits[index].clone();
+                                    hit.explanation.push(format!(
+                                        "cross-encoder rerank by {}: fused {:.4} -> rerank {:.4}",
+                                        reranker.model_code(),
+                                        hit.score,
+                                        score
+                                    ));
+                                    hit.score = f64::from(score);
+                                    if !hit.contributing_routes.contains(&SearchRoute::Reranked) {
+                                        hit.contributing_routes.push(SearchRoute::Reranked);
+                                    }
+                                    reranked.push(hit);
+                                }
+                                hits.splice(..pool, reranked);
+                            }
+                            Err(error) => missing_capabilities.push(format!(
+                                "reranker configured but scoring failed: {error}; fused ranking order used"
+                            )),
+                        }
+                }
+                Ok(None) => {}
+                Err(error) => missing_capabilities.push(format!(
+                    "reranker configured but failed to initialize: {error}; fused ranking order used"
+                )),
+            }
+        }
+
         for (offset, hit) in hits.iter_mut().enumerate() {
             hit.rank = offset + 1;
         }

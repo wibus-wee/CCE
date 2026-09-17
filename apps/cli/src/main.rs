@@ -22,6 +22,16 @@ struct Arguments {
     embedding_model: Option<String>,
     #[arg(long, global = true)]
     embedding_dimensions: Option<usize>,
+    /// Local cross-encoder reranker model code; enables reranking. Bare
+    /// `--reranker` uses the default model.
+    #[arg(
+        long,
+        global = true,
+        env = "CCE_RERANKER_MODEL",
+        num_args = 0..=1,
+        default_missing_value = cce_engine::DEFAULT_LOCAL_RERANKER_MODEL
+    )]
+    reranker: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -269,7 +279,12 @@ async fn main() -> anyhow::Result<()> {
             print_value(&engine.impact_analysis(name)?)?;
         }
         Command::Models => {
+            println!("# embedding models (--embedding-model)");
             for code in cce_engine::LocalEmbedder::supported_model_codes() {
+                println!("{code}");
+            }
+            println!("# reranker models (--reranker)");
+            for code in cce_engine::LocalReranker::supported_model_codes() {
                 println!("{code}");
             }
         }
@@ -296,6 +311,7 @@ fn engine(arguments: &Arguments, repository: &PathBuf) -> anyhow::Result<CceEngi
                 .unwrap_or_else(|| DEFAULT_LOCAL_EMBEDDING_MODEL.to_owned()),
         },
     };
+    config.reranker_model.clone_from(&arguments.reranker);
     CceEngine::open(config).map_err(Into::into)
 }
 

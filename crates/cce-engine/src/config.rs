@@ -36,6 +36,11 @@ impl Default for IndexOptions {
 /// (Holm-significant) and recall@5 +0.10, at a small recall@20 tail cost.
 pub const DEFAULT_LOCAL_EMBEDDING_MODEL: &str = "jinaai/jina-embeddings-v2-base-code";
 
+/// Default local cross-encoder reranker for `--reranker`. Multilingual
+/// (the vocabulary-gap suite includes CJK queries); scored pairs are
+/// (query, source snippet).
+pub const DEFAULT_LOCAL_RERANKER_MODEL: &str = "rozgo/bge-reranker-v2-m3";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenseBackendConfig {
     Disabled,
@@ -74,6 +79,9 @@ pub struct EngineConfig {
     pub data_root: PathBuf,
     pub index: IndexOptions,
     pub dense: DenseBackendConfig,
+    /// Local cross-encoder reranker model code, e.g.
+    /// `rozgo/bge-reranker-v2-m3`. `None` keeps fused-order ranking only.
+    pub reranker_model: Option<String>,
 }
 
 impl EngineConfig {
@@ -87,6 +95,7 @@ impl EngineConfig {
             data_root,
             index: IndexOptions::default(),
             dense: DenseBackendConfig::Disabled,
+            reranker_model: None,
         }
     }
 

@@ -41,6 +41,15 @@ struct Arguments {
     embedding_model: Option<String>,
     #[arg(long)]
     embedding_dimensions: Option<usize>,
+    /// Local cross-encoder reranker model code; enables reranking. Bare
+    /// `--reranker` uses the default model.
+    #[arg(
+        long,
+        env = "CCE_RERANKER_MODEL",
+        num_args = 0..=1,
+        default_missing_value = cce_engine::DEFAULT_LOCAL_RERANKER_MODEL
+    )]
+    reranker: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -136,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| DEFAULT_LOCAL_EMBEDDING_MODEL.to_owned()),
         },
     };
+    config.reranker_model = arguments.reranker;
     let state = Arc::new(CceEngine::open(config)?);
     let request_id = HeaderName::from_static("x-request-id");
     let mut router = Router::new()

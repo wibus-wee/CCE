@@ -49,6 +49,9 @@ pub struct CceEngine {
     /// pool so a slow fetch never stalls the executor; the result — including
     /// failures — is cached so a bad model does not retry a download per query.
     embedder: tokio::sync::OnceCell<std::result::Result<Option<EmbeddingBackend>, String>>,
+    /// Lazily initialized cross-encoder reranker (`--reranker`). Same
+    /// lifecycle as `embedder`: one ONNX session, init result cached.
+    reranker: tokio::sync::OnceCell<std::result::Result<Option<crate::LocalReranker>, String>>,
 }
 
 impl CceEngine {
@@ -59,7 +62,34 @@ impl CceEngine {
             store,
             parser: SourceParser::new(),
             embedder: tokio::sync::OnceCell::new(),
+            reranker: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// Shared reranker backend, initialized on first use. `Ok(None)` when
+    /// no reranker model is configured.
+    pub async fn reranker(&self) -> Result<Option<crate::LocalReranker>> {
+        let model = self.config.reranker_model.clone();
+        let cache_dir = self.model_cache_dir();
+        let state = self
+            .reranker
+            .get_or_init(move || async move {
+                let Some(model) = model else {
+                    return Ok(None);
+                };
+                tokio::task::spawn_blocking(move || {
+                    crate::LocalReranker::new(&model, &cache_dir)
+                        .map(Some)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            })
+            .await;
+        match state {
+            Ok(reranker) => Ok(reranker.clone()),
+            Err(message) => Err(CceError::Embedding(message.clone())),
+        }
     }
 
     /// Shared dense backend, initialized on first use.
