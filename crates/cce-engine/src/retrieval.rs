@@ -214,7 +214,10 @@ impl CceEngine {
             ),
             (
                 SearchRoute::History,
-                &[RetrievalRepresentation::CommitSummary][..],
+                &[
+                    RetrievalRepresentation::CommitSummary,
+                    RetrievalRepresentation::CommitDiff,
+                ][..],
             ),
         ] {
             if !plan.routes.contains(&route) {

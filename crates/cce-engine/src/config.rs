@@ -168,6 +168,9 @@ impl EngineConfig {
             "respect_gitignore".to_owned(),
             self.index.respect_gitignore.to_string(),
         );
+        // History diff extraction changes document content; bump when the
+        // extractor changes shape.
+        options.insert("history_diff".to_owned(), "v1".to_owned());
         // Provider output changes the snapshot; toggling or upgrading the
         // ingest must produce a fresh profile hash.
         options.insert(

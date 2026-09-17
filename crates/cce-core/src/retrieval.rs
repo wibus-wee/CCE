@@ -94,6 +94,10 @@ pub enum RetrievalRepresentation {
     TestBehavior,
     /// Summary derived from a commit.
     CommitSummary,
+    /// Changed paths plus extracted added/removed lines from a commit diff.
+    /// Deterministic evidence (not a generated summary); the full patch text
+    /// lives in the artifact store under `body_artifact_digest`.
+    CommitDiff,
     /// A generated knowledge page.
     KnowledgePage,
 }

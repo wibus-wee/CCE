@@ -25,6 +25,9 @@ pub enum ArtifactKind {
     Model,
     /// Provider-produced indexes (e.g. `index.scip`).
     ScipIndex,
+    /// Full unified patch text captured for one commit during history
+    /// indexing.
+    CommitPatch,
     /// Anything not in the known set.
     Other,
 }
@@ -39,6 +42,7 @@ impl std::fmt::Display for ArtifactKind {
             Self::Benchmark => "benchmark",
             Self::Model => "model",
             Self::ScipIndex => "scip_index",
+            Self::CommitPatch => "commit_patch",
             Self::Other => "other",
         };
         f.write_str(value)

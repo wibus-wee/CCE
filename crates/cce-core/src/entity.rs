@@ -47,6 +47,9 @@ pub enum EntityKind {
     Configuration,
     /// A conceptual entity (documentation/knowledge).
     Concept,
+    /// A version-control commit — historical evidence, not current-source
+    /// truth.
+    Commit,
     /// Could not be classified.
     Unknown,
 }

@@ -327,7 +327,7 @@ fn normalized_relative(root: &Path, path: &Path) -> Result<String> {
         .map_err(|_| CceError::PathEscape(path.to_path_buf()))
 }
 
-fn is_probably_binary(bytes: &[u8]) -> bool {
+pub(crate) fn is_probably_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8_192).any(|byte| *byte == 0) || std::str::from_utf8(bytes).is_err()
 }
 
