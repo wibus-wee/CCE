@@ -10,8 +10,8 @@ use cce_core::{EntityKind, RelationKind, Result};
 use cce_store::RelationDirection;
 use serde::Serialize;
 
-use crate::repository::RepositoryScanner;
 use crate::CceEngine;
+use crate::repository::RepositoryScanner;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

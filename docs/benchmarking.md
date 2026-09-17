@@ -35,6 +35,10 @@ Additional optional fields:
 
 Each result records the retrieved source-linked ranges plus the plan the system actually executed: `predicted_intent`, `plan_routes`, `graph_policy`, and `missing_capabilities`. Misrouted queries are attributable instead of silently averaged away. `abstained` means the system returned no source-linked evidence.
 
+Result `metadata` carries the executed `command` and `engine_latency_ms` — the engine's own reported timing (`latencyMs` on search results and context packs), distinct from `query_ms`, which is subprocess wall-clock including spawn and model-session init. Latency comparisons should cite `engine_latency_ms` for engine compute and `query_ms` for end-to-end cost.
+
+Adapter YAMLs may declare `dense: baseline|local` plus `embedding_model`/`embedding_dimensions`; the adapter appends the corresponding global CLI flags and derives `model_identity` as `local:<model>` when unset, so bundles stay attributable to the model that produced them.
+
 ## Required metrics
 
 - ranked retrieval: Recall@5/10/20/50, MRR, nDCG@10, file success, symbol and line recall
@@ -42,6 +46,7 @@ Each result records the retrieved source-linked ranges plus the plan the system 
 - claim-level: `claim_support` over `gold_facts`
 - selective retrieval: abstention accuracy, no-context precision, false-positive rate
 - planner: `intent_accuracy`, `intent_recall/<intent>`, `intent_precision/<intent>` over `supply_intent: false` cases
+- architecture routing: `component_recall_at_5/20` and `component_mrr` — package-granularity Task→Component recall. `gold_components` annotates the packages a case's gold lives in; each run captures the system's `map` output once as `component_map` (package → rootDir) and resolves retrieved paths by longest-prefix match. Cases without `gold_components` are skipped, not zeroed. Annotation convention: a case's `gold_components` is the set of packages that own its `gold_files` — resolved by the same longest-prefix `rootDir` rule the metric applies (list names with `cce map`; e.g. `crates/cce-store/...` → `cce-store`, `apps/web/...` → `@cce/web`, top-level files → the workspace root package)
 - budgeted packs: coverage at 2K/4K/8K, relevant-line density, unique gold entities per token, redundancy, relation coverage, citation correctness
 - systems: cold index time, incremental p50/p95, stale window, query and rerank p50/p95, disk/LOC, peak memory, context tokens and model inference cost
 

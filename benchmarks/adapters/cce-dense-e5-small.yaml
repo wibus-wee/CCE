@@ -1,0 +1,17 @@
+name: cce-dense-e5-small
+command:
+  - target/release/cce
+  - --json
+  - context
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --budget
+  - "{budget}"
+timeout_seconds: 120
+model_revision: none
+dense: local
+embedding_model: intfloat/multilingual-e5-small
+environment:
+  CCE_DATA_DIR: .cce-benchmark

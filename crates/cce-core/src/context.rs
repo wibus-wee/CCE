@@ -68,6 +68,10 @@ pub struct ContextPack {
     pub graph_policy: Option<GraphPolicy>,
     pub budget_tokens: usize,
     pub used_tokens: usize,
+    /// Engine-side wall time for the underlying search plus packing, in ms.
+    /// Distinct from caller-observed latency, which also includes transport.
+    #[serde(default)]
+    pub latency_ms: u64,
     pub items: Vec<ContextItem>,
     #[serde(default)]
     pub uncertainties: Vec<Uncertainty>,

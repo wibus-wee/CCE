@@ -150,6 +150,7 @@ impl ContextPacker {
             graph_policy: Some(search.plan.graph_policy),
             budget_tokens,
             used_tokens,
+            latency_ms: search.latency_ms,
             items,
             uncertainties,
             missing_capabilities: search.missing_capabilities.clone(),
@@ -170,7 +171,9 @@ impl CceEngine {
                 routes: request.routes,
             })
             .await?;
-        Ok(ContextPacker::new().pack(&search, request.budget_tokens))
+        let mut pack = ContextPacker::new().pack(&search, request.budget_tokens);
+        pack.latency_ms = search.latency_ms;
+        Ok(pack)
     }
 }
 

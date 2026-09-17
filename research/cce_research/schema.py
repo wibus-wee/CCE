@@ -89,6 +89,11 @@ class BenchmarkCase(BaseModel):
     # `unjudged_rate` and the adjudication queue instead of counting as
     # false positives (gold sets are never complete; pooling lesson).
     judged_files: list[str] = Field(default_factory=list)
+    # Packages (L2 component proxy from `cce map`) the gold evidence lives
+    # in — e.g. "cce-store". Feeds component_recall@k / component_mrr, the
+    # package-granularity stand-in for Task→Component Recall. Empty = metric
+    # skipped for the case.
+    gold_components: list[str] = Field(default_factory=list)
     no_context: bool = False
     budget_tokens: int = Field(default=8192, ge=256, le=128_000)
     # When false the adapter must not pass the intent to the system; the
@@ -141,6 +146,9 @@ class CaseResult(BaseModel):
     missing_capabilities: list[str] = Field(default_factory=list)
     index_ms: float | None = Field(default=None, ge=0)
     query_ms: float = Field(ge=0)
+    # Package name → rootDir map captured once per run from `cce map`;
+    # shared by every result so retrieved paths resolve to components.
+    component_map: dict[str, str] = Field(default_factory=dict)
     peak_memory_bytes: int | None = Field(default=None, ge=0)
     index_bytes: int | None = Field(default=None, ge=0)
     metadata: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
@@ -166,6 +174,9 @@ class ResultBundleManifest(BaseModel):
     python_version: str
     dependency_lock_sha256: dict[str, str]
     environment_keys: list[str]
+    # Package count in the component_map captured for this run; None when
+    # the adapter could not produce one (no map support, map failed).
+    component_map_packages: int | None = None
 
 
 def load_jsonl[ModelT: BaseModel](path: Path, model: type[ModelT]) -> Iterator[ModelT]:

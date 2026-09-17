@@ -138,9 +138,16 @@ def run_adapter(
     adapter = Adapter.load(adapter_file)
     cases = list(load_jsonl(dataset, BenchmarkCase))
     output.parent.mkdir(parents=True, exist_ok=True)
+    component_map = adapter.component_map(repository)
+    if not component_map:
+        console.print(
+            "[yellow]![/yellow] adapter produced no component map; "
+            "component_* metrics will be skipped"
+        )
     with output.open("w", encoding="utf-8") as handle:
         for case in cases:
             result = adapter.run(case, repository, system_revision)
+            result.component_map = component_map
             handle.write(result.model_dump_json() + "\n")
             console.print(f"[green]✓[/green] {case.case_id}")
     dataset_revisions = {case.provenance.dataset_revision for case in cases}
@@ -170,6 +177,7 @@ def run_adapter(
             str(path.relative_to(repository)): sha256(path) for path in lockfiles if path.is_file()
         },
         environment_keys=sorted(adapter.environment),
+        component_map_packages=len(component_map) or None,
     )
     manifest_path = output.with_suffix(output.suffix + ".manifest.json")
     manifest_path.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")

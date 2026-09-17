@@ -1,5 +1,14 @@
 from cce_research.adapters import Adapter, normalize_payload, predicted_intent
-from cce_research.metrics import bootstrap, compare, evaluate, overlaps
+from cce_research.metrics import (
+    bootstrap,
+    case_observations,
+    compare,
+    component_mrr,
+    component_recall,
+    evaluate,
+    overlaps,
+    path_component,
+)
 from cce_research.schema import (
     BenchmarkCase,
     CaseResult,
@@ -279,3 +288,60 @@ def test_normalize_payload_handles_context_packs() -> None:
     retrieved = normalize_payload(payload)
     assert retrieved[0].path == "src/b.rs"
     assert predicted_intent(payload) == "natural_language_behavior"
+
+
+def _component_map() -> dict[str, str]:
+    return {"cce-store": "crates/cce-store", "cce-engine": "crates/cce-engine", "root": "."}
+
+
+def test_path_component_longest_prefix_wins() -> None:
+    component_map = {
+        "cce-store": "crates/cce-store",
+        "nested": "crates/cce-store/nested",
+        "root": ".",
+    }
+    assert path_component("crates/cce-store/nested/x.rs", component_map) == "nested"
+    assert path_component("crates/cce-store/src/a.rs", component_map) == "cce-store"
+    assert path_component("README.md", component_map) == "root"
+    assert path_component("other/a.rs", {k: v for k, v in component_map.items() if k != "root"}) is None
+
+
+def test_component_metrics_use_map() -> None:
+    case = _case(gold_components=["cce-store"])
+    result = _result(
+        retrieved=[
+            RetrievedRange(
+                path="crates/cce-engine/src/a.rs",
+                start_line=1,
+                end_line=5,
+                route="lexical",
+                rank=1,
+                score=1.0,
+                estimated_tokens=5,
+            ),
+            RetrievedRange(
+                path="crates/cce-store/src/b.rs",
+                start_line=1,
+                end_line=5,
+                route="lexical",
+                rank=2,
+                score=0.9,
+                estimated_tokens=5,
+            ),
+        ],
+        component_map=_component_map(),
+    )
+    assert component_recall(case, result.retrieved[:1], result.component_map) == 0.0
+    assert component_recall(case, result.retrieved[:5], result.component_map) == 1.0
+    assert component_mrr(case, result.retrieved, result.component_map) == 0.5
+
+
+def test_component_metrics_skip_when_unannotated_or_unmapped() -> None:
+    case = _case()
+    result = _result(component_map=_component_map())
+    observations = case_observations(case, result)
+    assert "component_recall_at_5" not in observations
+    case = _case(gold_components=["cce-store"])
+    result = _result(component_map={})
+    observations = case_observations(case, result)
+    assert "component_recall_at_5" not in observations

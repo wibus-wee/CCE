@@ -150,6 +150,16 @@ def case_observations(case: BenchmarkCase, result: CaseResult) -> dict[str, floa
     observations["abstention_accuracy"] = float(result.abstained == case.no_context)
     observations["relevant_line_density"] = relevant_line_density(case, result.retrieved)
     observations["citation_correctness"] = citation_correctness(result.retrieved)
+    if case.gold_components and result.component_map:
+        observations["component_recall_at_5"] = component_recall(
+            case, result.retrieved[:5], result.component_map
+        )
+        observations["component_recall_at_20"] = component_recall(
+            case, result.retrieved[:20], result.component_map
+        )
+        observations["component_mrr"] = component_mrr(
+            case, result.retrieved, result.component_map
+        )
     observations["query_ms"] = result.query_ms
     if result.index_ms is not None:
         observations["index_ms"] = result.index_ms
@@ -313,6 +323,53 @@ def relevant_line_density(case: BenchmarkCase, retrieved: list[RetrievedRange]) 
 
 def citation_correctness(retrieved: list[RetrievedRange]) -> float:
     return mean([float(item.citation_verified) for item in retrieved]) if retrieved else 1.0
+
+
+def path_component(path: str, component_map: dict[str, str]) -> str | None:
+    """Resolve a repo-relative path to its package via longest rootDir
+    prefix match. rootDir ''/'.' is the workspace root package and matches
+    everything, so deeper packages always win over it."""
+    best: str | None = None
+    best_depth = -1
+    for name, root in component_map.items():
+        prefix = "" if root in ("", ".") else root.rstrip("/") + "/"
+        if path == root.rstrip("/") or path.startswith(prefix):
+            depth = len(prefix)
+            if depth > best_depth:
+                best = name
+                best_depth = depth
+    return best
+
+
+def retrieved_components(
+    retrieved: list[RetrievedRange], component_map: dict[str, str]
+) -> list[str | None]:
+    return [path_component(item.path, component_map) for item in retrieved]
+
+
+def component_recall(
+    case: BenchmarkCase, retrieved: list[RetrievedRange], component_map: dict[str, str]
+) -> float:
+    """Task→Component Recall@K at package granularity: share of
+    `gold_components` whose package produced at least one top-K hit."""
+    gold = set(case.gold_components)
+    found = {component for component in retrieved_components(retrieved, component_map)}
+    found.discard(None)
+    return len(gold & found) / len(gold)
+
+
+def component_mrr(
+    case: BenchmarkCase, retrieved: list[RetrievedRange], component_map: dict[str, str]
+) -> float:
+    """Reciprocal rank of the first hit inside any gold component — the
+    'time to first correct component' of the report, as an MRR."""
+    gold = set(case.gold_components)
+    for index, component in enumerate(
+        retrieved_components(retrieved, component_map), start=1
+    ):
+        if component in gold:
+            return 1.0 / index
+    return 0.0
 
 
 def bootstrap(values: list[float], samples: int = 2000, seed: int = 0xCCE) -> MetricSummary:

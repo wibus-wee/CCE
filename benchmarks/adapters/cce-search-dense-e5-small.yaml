@@ -1,0 +1,19 @@
+name: cce-search-dense-e5-small
+# Retrieval stage only, dense local embedding enabled. Model identity is
+# derived as `local:<embedding_model>` in the bundle manifest.
+command:
+  - target/release/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 120
+model_revision: none
+dense: local
+embedding_model: intfloat/multilingual-e5-small
+environment:
+  CCE_DATA_DIR: .cce-benchmark

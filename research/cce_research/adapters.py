@@ -22,19 +22,39 @@ class Adapter:
     environment: dict[str, str]
     model_identity: str
     model_revision: str
+    dense: str | None = None
+    embedding_model: str | None = None
+    embedding_dimensions: int | None = None
 
     @classmethod
     def load(cls, path: Path) -> Adapter:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError(f"{path}: adapter must be an object")
+        dense = raw.get("dense")
+        if dense is not None and dense not in ("baseline", "local"):
+            raise ValueError(f"{path}: dense must be 'baseline' or 'local', got {dense!r}")
+        embedding_model = raw.get("embedding_model")
+        embedding_dimensions = (
+            int(raw["embedding_dimensions"]) if "embedding_dimensions" in raw else None
+        )
+        if dense is None and (embedding_model or embedding_dimensions is not None):
+            raise ValueError(
+                f"{path}: embedding_model/embedding_dimensions require a dense backend"
+            )
+        model_identity = str(raw.get("model_identity", "none"))
+        if model_identity == "none" and embedding_model:
+            model_identity = f"local:{embedding_model}"
         return cls(
             name=str(raw["name"]),
             command=[str(item) for item in raw["command"]],
             timeout_seconds=int(raw.get("timeout_seconds", 120)),
             environment={str(key): str(value) for key, value in raw.get("environment", {}).items()},
-            model_identity=str(raw.get("model_identity", "none")),
+            model_identity=model_identity,
             model_revision=str(raw.get("model_revision", "none")),
+            dense=str(dense) if dense else None,
+            embedding_model=str(embedding_model) if embedding_model else None,
+            embedding_dimensions=embedding_dimensions,
         )
 
     def build_command(self, case: BenchmarkCase, repository_root: Path) -> list[str]:
@@ -62,6 +82,14 @@ class Adapter:
                     command.extend(["--route", route])
                 continue
             command.append(part.format_map(scalars))
+        # All three flags are clap-global, so appending at the end is valid
+        # and cannot collide with template-expanded {intent_args}/{route_args}.
+        if self.dense:
+            command.extend(["--dense", self.dense])
+        if self.embedding_model:
+            command.extend(["--embedding-model", self.embedding_model])
+        if self.embedding_dimensions is not None:
+            command.extend(["--embedding-dimensions", str(self.embedding_dimensions)])
         return command
 
     def run(self, case: BenchmarkCase, repository_root: Path, system_revision: str) -> CaseResult:
@@ -98,8 +126,42 @@ class Adapter:
             graph_policy=graph_policy(payload),
             missing_capabilities=list(payload.get("missingCapabilities", [])),
             query_ms=elapsed_ms,
-            metadata={"command": shlex.join(command)},
+            metadata={
+                "command": shlex.join(command),
+                "engine_latency_ms": payload.get("latencyMs"),
+            },
         )
+
+    def component_map(self, repository_root: Path) -> dict[str, str]:
+        """Package name → rootDir from the system's architecture map, fetched
+        once per run. Any failure (no map support, nonzero exit, bad JSON)
+        yields an empty map — component metrics are skipped, never fatal."""
+        command = [self.command[0], "--json", "map", str(repository_root)]
+        environment = os.environ.copy()
+        environment.update(self.environment)
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=repository_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+            )
+            if completed.returncode != 0:
+                return {}
+            payload = json.loads(completed.stdout)
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            return {}
+        packages = payload.get("packages")
+        if not isinstance(packages, list):
+            return {}
+        return {
+            str(package["name"]): str(package.get("rootDir", ""))
+            for package in packages
+            if isinstance(package, dict) and package.get("name")
+        }
 
 
 def normalize_payload(payload: dict[str, Any]) -> list[RetrievedRange]:
