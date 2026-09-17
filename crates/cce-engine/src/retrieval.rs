@@ -1,10 +1,10 @@
 use std::{collections::HashMap, time::Instant};
 
 use cce_core::{
-    Result, RetrievalRepresentation, SearchHit, SearchRequest, SearchRoute, ViewKind, ViewManifest,
-    ViewState, has_cjk,
+    CodeEntity, EntityKind, Result, RetrievalRepresentation, SearchHit, SearchRequest, SearchRoute,
+    ViewKind, ViewManifest, ViewState, has_cjk,
 };
-use cce_store::RelationDirection;
+use cce_store::{MetadataStore, RelationDirection};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -510,7 +510,12 @@ impl CceEngine {
             );
         }
 
-        apply_structural_features(&request.query, &mut candidates);
+        apply_structural_features(
+            self.store(),
+            &request.snapshot_id,
+            &request.query,
+            &mut candidates,
+        )?;
 
         // Multiple retrieval documents can describe one source region (raw
         // chunk + symbol summary); the hit list presents regions, so the
@@ -717,6 +722,12 @@ impl CceEngine {
 
 /// Which edges count as evidence for each graph policy. The intent chooses
 /// the vocabulary of the expansion, not just its direction.
+///
+/// `ChangedWith` is deliberately absent: a co-change edge is stored once
+/// per pair with the smaller entity id as source, so a one-directional arm
+/// would only find it from the larger-id side. Co-change evidence feeds
+/// ranking through the partner bonus in `apply_structural_features`, which
+/// looks it up in both directions instead.
 const fn expansion_policy(
     policy: GraphPolicy,
 ) -> (RelationDirection, &'static [cce_core::RelationKind]) {
@@ -750,13 +761,26 @@ const fn expansion_policy(
     }
 }
 
+/// Scale for the co-change bonus. `ChangedWith` confidence is capped at
+/// 0.7, so a partner earns at most 0.3 × 0.7 = 0.21 — deliberately below
+/// the flat 0.25 a same-file sibling gets: sharing commits is weaker
+/// evidence than sharing the file a top hit already lives in.
+const CO_CHANGE_SCALE: f64 = 0.3;
+
 /// Structural priors layered on the fused ranking:
 /// - exact symbol/word agreement between the query and a hit's symbol name;
 /// - same-file evidence aggregation (a file holding a top-3 hit makes its
 ///   other hits more likely to be task evidence);
+/// - git co-change neighborhood (files that keep landing in the same
+///   commits as a top-3 file);
 /// - definition prior (Signature/TestBehavior representations beat stray
 ///   raw-code mentions for symbol-shaped queries).
-fn apply_structural_features(query: &str, candidates: &mut HashMap<String, Candidate>) {
+fn apply_structural_features(
+    store: &MetadataStore,
+    snapshot_id: &str,
+    query: &str,
+    candidates: &mut HashMap<String, Candidate>,
+) -> Result<()> {
     let query_words: std::collections::HashSet<String> = query
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .filter(|word| word.len() >= 3)
@@ -773,9 +797,37 @@ fn apply_structural_features(query: &str, candidates: &mut HashMap<String, Candi
                 .map(|address| address.path.clone())
         })
         .collect();
+    // Co-change partners of the top-3 files. The edge is stored once per
+    // pair (smaller entity id as source), so only a Both-direction lookup
+    // sees it from either endpoint.
+    let mut co_changed = HashMap::<String, f32>::new();
+    for path in &top_paths {
+        let Some(file) = file_entity(store, snapshot_id, path)? else {
+            continue;
+        };
+        for relation in
+            store.relations_for_entity(snapshot_id, &file.id, RelationDirection::Both, 16)?
+        {
+            if relation.kind != cce_core::RelationKind::ChangedWith {
+                continue;
+            }
+            let partner_id = if relation.source_entity_id == file.id {
+                &relation.target_entity_id
+            } else {
+                &relation.source_entity_id
+            };
+            let Some(partner) = store.entity_by_id(snapshot_id, partner_id)? else {
+                continue;
+            };
+            // File entity names are repository-relative paths.
+            let confidence = co_changed.entry(partner.name).or_default();
+            *confidence = confidence.max(relation.confidence);
+        }
+    }
     for candidate in candidates.values_mut() {
         let hit = &candidate.hit;
         let mut bonus = 0.0;
+        let mut notes = Vec::new();
         if let Some(name) = &hit.symbol_name {
             let lowered = name.to_ascii_lowercase();
             if query_words.contains(&lowered)
@@ -790,6 +842,12 @@ fn apply_structural_features(query: &str, candidates: &mut HashMap<String, Candi
             if top_paths.contains(path) {
                 bonus += 0.25;
             }
+            if let Some(confidence) = co_changed.get(path) {
+                bonus = CO_CHANGE_SCALE.mul_add(f64::from(*confidence), bonus);
+                notes.push(format!(
+                    "co-change partner of a top hit file (confidence {confidence:.2})"
+                ));
+            }
         }
         if matches!(
             hit.representation,
@@ -797,8 +855,20 @@ fn apply_structural_features(query: &str, candidates: &mut HashMap<String, Candi
         ) {
             bonus += 0.1;
         }
+        candidate.hit.explanation.extend(notes);
         candidate.fused_score += bonus / RRF_K;
     }
+    Ok(())
+}
+
+/// The `File` entity whose name is exactly `path`, when one is indexed.
+/// File entities are named by repository-relative path; a symbol sharing
+/// the spelling must not be mistaken for the file.
+fn file_entity(store: &MetadataStore, snapshot_id: &str, path: &str) -> Result<Option<CodeEntity>> {
+    Ok(store
+        .entity_by_name(snapshot_id, path, 4)?
+        .into_iter()
+        .find(|entity| entity.kind == EntityKind::File))
 }
 
 fn add_candidate(candidates: &mut HashMap<String, Candidate>, hit: SearchHit, contribution: f64) {
@@ -964,6 +1034,133 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cce_core::{RelationKind, RelationOrigin, SnapshotIdentity, SourceAddress};
+    use cce_store::SnapshotRecords;
+
+    // Test fixtures panic freely: an unmet precondition is a test bug.
+    fn store_with(records: &SnapshotRecords) -> (tempfile::TempDir, MetadataStore, String) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        store
+            .register_repository(&cce_core::RepositoryIdentity {
+                id: "repo_test".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            })
+            .expect("register repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_test".to_owned(),
+            repository_id: "repo_test".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: String::new(),
+            index_profile_hash: String::new(),
+            created_at: chrono::Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        store.begin_snapshot(&snapshot).expect("begin snapshot");
+        store
+            .commit_snapshot(&snapshot, records)
+            .expect("commit records");
+        (directory, store, snapshot.id)
+    }
+
+    fn file(path: &str) -> CodeEntity {
+        CodeEntity {
+            id: format!("file:{path}"),
+            kind: EntityKind::File,
+            name: path.to_owned(),
+            qualified_name: Some(path.to_owned()),
+            signature: None,
+            language: None,
+            region_id: None,
+            address: None,
+            capabilities: Vec::new(),
+            attributes: serde_json::Map::new(),
+        }
+    }
+
+    fn changed_with(source: &str, target: &str, confidence: f32) -> cce_core::Relation {
+        cce_core::Relation {
+            id: format!("rel:{source}:{target}"),
+            source_entity_id: source.to_owned(),
+            target_entity_id: target.to_owned(),
+            kind: RelationKind::ChangedWith,
+            origin: RelationOrigin::FrameworkRule,
+            confidence,
+            snapshot_id: "snap_test".to_owned(),
+            extractor: "test".to_owned(),
+            evidence: Vec::new(),
+            attributes: serde_json::Map::new(),
+        }
+    }
+
+    fn candidate(document_id: &str, path: &str, fused_score: f64) -> Candidate {
+        Candidate {
+            hit: SearchHit {
+                document_id: document_id.to_owned(),
+                entity_id: format!("file:{path}"),
+                region_id: None,
+                symbol_name: None,
+                representation: RetrievalRepresentation::RawCode,
+                route: SearchRoute::Lexical,
+                rank: 1,
+                score: 0.0,
+                contributing_routes: vec![SearchRoute::Lexical],
+                address: Some(
+                    SourceAddress::new("repo_test", "snap_test", path, 0..1, 1..=1)
+                        .expect("address"),
+                ),
+                evidence: Vec::new(),
+                snippet: String::new(),
+                verified_current: true,
+                explanation: Vec::new(),
+            },
+            fused_score,
+        }
+    }
+
+    #[test]
+    fn co_change_partner_receives_bonus() {
+        // The edge is stored once with the smaller id as source; the bonus
+        // must still find it from the larger-id endpoint.
+        let records = SnapshotRecords {
+            entities: vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")],
+            relations: vec![changed_with("file:src/a.rs", "file:src/b.rs", 0.6)],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, store, snapshot_id) = store_with(&records);
+
+        let mut candidates = HashMap::new();
+        candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
+        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.1));
+        candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.1));
+        apply_structural_features(&store, &snapshot_id, "query", &mut candidates)
+            .expect("structural features");
+
+        // All three files sit in top_paths and take the same-file 0.25, so
+        // the fused-score gap between a partner and the unrelated file is
+        // exactly the co-change bonus. Both endpoints are top hits and the
+        // lookup is bidirectional, so a is itself b's partner.
+        let expected = CO_CHANGE_SCALE * 0.6 / RRF_K;
+        for endpoint in ["a", "b"] {
+            let gap = candidates[endpoint].fused_score - candidates["c"].fused_score;
+            assert!(
+                (gap - expected).abs() < 1e-9,
+                "{endpoint} fused {} vs unrelated {}",
+                candidates[endpoint].fused_score,
+                candidates["c"].fused_score
+            );
+            assert!(
+                candidates[endpoint]
+                    .hit
+                    .explanation
+                    .iter()
+                    .any(|line| line.contains("co-change"))
+            );
+        }
+        assert!(candidates["c"].hit.explanation.is_empty());
+    }
 
     #[test]
     fn entity_tokens_gate_drops_plain_words_in_homogeneous_query() {
