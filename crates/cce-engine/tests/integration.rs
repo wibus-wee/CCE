@@ -350,3 +350,21 @@ async fn context_pack_is_bounded_and_source_linked() {
             .any(|item| item.provenance.verified_current)
     );
 }
+
+#[tokio::test]
+async fn atlas_on_unindexed_repository_is_an_explicit_error() {
+    let repo = fixture_repo();
+    let engine = engine(repo.path());
+
+    for outcome in [
+        engine.codebase_map().await.map(|_| ()),
+        engine.explain_component("anything").await.map(|_| ()),
+        engine.impact_analysis("anything").await.map(|_| ()),
+    ] {
+        let error = outcome.expect_err("atlas must fail without an index");
+        assert!(
+            matches!(error, cce_core::CceError::ViewUnavailable { .. }),
+            "expected ViewUnavailable, got {error:?}"
+        );
+    }
+}

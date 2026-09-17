@@ -6,10 +6,11 @@
 
 use std::collections::HashMap;
 
-use cce_core::{EntityKind, RelationKind, Result, SearchRequest};
+use cce_core::{EntityKind, RelationKind, Result};
 use cce_store::RelationDirection;
 use serde::Serialize;
 
+use crate::repository::RepositoryScanner;
 use crate::CceEngine;
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,7 +80,7 @@ impl CceEngine {
     /// Package-level map of the repository: hard build boundaries and the
     /// declared dependency direction between them.
     pub async fn codebase_map(&self) -> Result<CodebaseMap> {
-        let snapshot_id = self.current_snapshot_id().await?;
+        let snapshot_id = self.current_snapshot_id()?;
         let packages = self
             .store()
             .entities_by_kind(&snapshot_id, &EntityKind::Package)?;
@@ -165,7 +166,7 @@ impl CceEngine {
     /// Explain one named component: package or symbol entity, its members,
     /// declared dependencies, dependents, and tests.
     pub async fn explain_component(&self, name: &str) -> Result<ComponentExplanation> {
-        let snapshot_id = self.current_snapshot_id().await?;
+        let snapshot_id = self.current_snapshot_id()?;
         let entity = self
             .store()
             .entity_by_name(&snapshot_id, name, 1)?
@@ -258,7 +259,7 @@ impl CceEngine {
     /// Blast radius of a symbol or file: everything reaching it through
     /// impact edges within two hops, cheapest evidence first.
     pub async fn impact_analysis(&self, query: &str) -> Result<ImpactReport> {
-        let snapshot_id = self.current_snapshot_id().await?;
+        let snapshot_id = self.current_snapshot_id()?;
         let seeds = self.store().entity_by_name(&snapshot_id, query, 8)?;
         let mut impacted: HashMap<String, ImpactedEntity> = HashMap::new();
         let impact_kinds = [
@@ -338,20 +339,19 @@ impl CceEngine {
         })
     }
 
-    /// Snapshot id for the current committed index, reusing the search
-    /// path's freshness handling without running a retrieval.
-    async fn current_snapshot_id(&self) -> Result<String> {
-        let result = self
-            .search(SearchRequest {
-                repository_id: String::new(),
-                snapshot_id: String::new(),
-                query: "architecture orientation".to_owned(),
-                intent: None,
-                limit: 1,
-                require_fresh: false,
-                routes: Vec::new(),
-            })
-            .await?;
-        Ok(result.request.snapshot_id)
+    /// Snapshot id of the last committed index. Atlas reads committed state;
+    /// it never triggers indexing — an unindexed repository is an explicit
+    /// error, matching `status` semantics.
+    fn current_snapshot_id(&self) -> Result<String> {
+        let anchor = RepositoryScanner::new(self.config().clone()).identify()?;
+        match self.store().current_snapshot(&anchor.identity.id)? {
+            Some(snapshot_id) if self.store().snapshot_is_complete(&snapshot_id)? => {
+                Ok(snapshot_id)
+            }
+            _ => Err(cce_core::CceError::ViewUnavailable {
+                view: "atlas".to_owned(),
+                reason: "repository has not been indexed; run `cce index`".to_owned(),
+            }),
+        }
     }
 }
