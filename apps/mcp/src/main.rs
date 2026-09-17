@@ -3,7 +3,9 @@
 use std::{path::PathBuf, sync::Arc};
 
 use cce_core::{QueryIntent, SearchRequest};
-use cce_engine::{CceEngine, ContextRequest, DenseBackendConfig, EngineConfig};
+use cce_engine::{
+    CceEngine, ContextRequest, DEFAULT_LOCAL_EMBEDDING_MODEL, DenseBackendConfig, EngineConfig,
+};
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,8 +29,6 @@ struct Arguments {
     #[arg(long)]
     embedding_dimensions: Option<usize>,
 }
-
-const DEFAULT_LOCAL_MODEL: &str = "intfloat/multilingual-e5-small";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DenseMode {
@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         DenseMode::Local => DenseBackendConfig::Local {
             model: arguments
                 .embedding_model
-                .unwrap_or_else(|| DEFAULT_LOCAL_MODEL.to_owned()),
+                .unwrap_or_else(|| DEFAULT_LOCAL_EMBEDDING_MODEL.to_owned()),
         },
     };
     serve(Arc::new(CceEngine::open(config)?)).await

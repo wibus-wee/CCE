@@ -30,6 +30,12 @@ impl Default for IndexOptions {
     }
 }
 
+/// Default local embedding model for `--dense local`. Chosen on the
+/// cce-self v5.1 benchmark (same corpus, daemon session): vs
+/// `intfloat/multilingual-e5-small` this model improves nDCG@10 +0.09
+/// (Holm-significant) and recall@5 +0.10, at a small recall@20 tail cost.
+pub const DEFAULT_LOCAL_EMBEDDING_MODEL: &str = "jinaai/jina-embeddings-v2-base-code";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenseBackendConfig {
     Disabled,

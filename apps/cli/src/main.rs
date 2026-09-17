@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use cce_core::{QueryIntent, SearchRequest, SearchRoute};
-use cce_engine::{CceEngine, ContextRequest, DenseBackendConfig, EngineConfig};
+use cce_engine::{
+    CceEngine, ContextRequest, DEFAULT_LOCAL_EMBEDDING_MODEL, DenseBackendConfig, EngineConfig,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -23,8 +25,6 @@ struct Arguments {
     #[command(subcommand)]
     command: Command,
 }
-
-const DEFAULT_LOCAL_MODEL: &str = "intfloat/multilingual-e5-small";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DenseMode {
@@ -293,7 +293,7 @@ fn engine(arguments: &Arguments, repository: &PathBuf) -> anyhow::Result<CceEngi
             model: arguments
                 .embedding_model
                 .clone()
-                .unwrap_or_else(|| DEFAULT_LOCAL_MODEL.to_owned()),
+                .unwrap_or_else(|| DEFAULT_LOCAL_EMBEDDING_MODEL.to_owned()),
         },
     };
     CceEngine::open(config).map_err(Into::into)

@@ -1,0 +1,20 @@
+name: cce-search-daemon-dense-jina-code
+# Retrieval stage only, dense local embedding via a warm cce-daemon
+# session — ONNX init is paid once per run, not per case.
+session: daemon
+command:
+  - target/release/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 240
+model_revision: none
+dense: local
+embedding_model: jinaai/jina-embeddings-v2-base-code
+environment:
+  CCE_DATA_DIR: .cce-benchmark

@@ -20,7 +20,7 @@ mod retrieval;
 
 pub use atlas::{CodebaseMap, ComponentExplanation, ImpactReport, ImpactedEntity, PackageNode};
 pub use cce_core::GraphPolicy;
-pub use config::{DenseBackendConfig, EngineConfig, IndexOptions};
+pub use config::{DEFAULT_LOCAL_EMBEDDING_MODEL, DenseBackendConfig, EngineConfig, IndexOptions};
 pub use context::{ContextPacker, ContextRequest};
 pub use dense::{DenseIndex, DenseSearchHit, EmbedRole, Embedder, EmbeddingBackend, LocalEmbedder};
 pub use engine::{CceEngine, IndexReport};
