@@ -755,9 +755,11 @@ impl MetadataStore {
     }
 
     /// FTS5 retrieval over the snapshot's documents. Runs a strictness
-    /// cascade — all terms exact, then all terms as prefixes, then any prefix
-    /// term — so AND-matched documents always rank ahead of OR fallbacks.
-    /// Results are deduplicated by document id and capped at `limit`.
+    /// cascade — all terms exact, then all terms as prefixes, then prefix
+    /// pairs — so AND-matched documents always rank ahead of fallbacks, and
+    /// a fallback hit must cover at least two distinct query terms to count
+    /// as evidence. Results are deduplicated by document id and capped at
+    /// `limit`.
     pub fn lexical_search(
         &self,
         snapshot_id: &str,
@@ -1348,21 +1350,36 @@ fn usize_to_i64(value: usize) -> Result<i64> {
 }
 
 fn fts_terms(query: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
     query
         .split(|character: char| !character.is_alphanumeric() && character != '_')
         .filter(|term| !term.is_empty())
         .filter(|term| !is_query_stopword(term))
+        // Distinct content terms only: a repeated term must not count twice
+        // toward the evidence floor in `fts_match_queries`.
+        .filter(|term| seen.insert(term.to_ascii_lowercase()))
         .take(32)
         .map(|term| term.replace('"', "\"\""))
         .collect()
 }
 
-/// Strictness cascade for one lexical query: exact AND, prefix AND, prefix
-/// OR. Prefixes keep partial identifier matches ("fresh" → "freshness")
-/// reachable while exact AND still wins the top ranks.
+/// Strictness cascade for one lexical query: exact AND, prefix AND, then a
+/// prefix fallback with an evidence floor. Prefixes keep partial identifier
+/// matches ("fresh" → "freshness") reachable while exact AND still wins the
+/// top ranks.
+///
+/// The fallback stage used to be a plain prefix OR, which lets a document
+/// matching ANY single query term count as evidence — so a zero-evidence
+/// query whose only hit is a coincidental prefix ("stored" → "store") still
+/// surfaced noise. FTS5 has no "at least k of" operator, so the floor is
+/// expressed at the MATCH level as the OR of every pairwise AND: a fallback
+/// hit must cover at least two distinct content terms. With fewer than three
+/// terms the prefix-AND stage already enforces the floor (a two-term query
+/// requires both terms, a one-term query its only term), so no third stage
+/// is emitted.
 fn fts_match_queries(terms: &[String]) -> Vec<String> {
     let quoted = |term: &str| format!("\"{term}\"");
-    vec![
+    let mut queries = vec![
         terms
             .iter()
             .map(|term| quoted(term))
@@ -1373,12 +1390,17 @@ fn fts_match_queries(terms: &[String]) -> Vec<String> {
             .map(|term| format!("{}*", quoted(term)))
             .collect::<Vec<_>>()
             .join(" AND "),
-        terms
-            .iter()
-            .map(|term| format!("{}*", quoted(term)))
-            .collect::<Vec<_>>()
-            .join(" OR "),
-    ]
+    ];
+    if terms.len() >= 3 {
+        let mut pairs = Vec::new();
+        for (index, left) in terms.iter().enumerate() {
+            for right in &terms[index + 1..] {
+                pairs.push(format!("({}* AND {}*)", quoted(left), quoted(right)));
+            }
+        }
+        queries.push(pairs.join(" OR "));
+    }
+    queries
 }
 
 fn is_query_stopword(token: &str) -> bool {
@@ -1431,8 +1453,31 @@ mod tests {
             [
                 "\"snapshot\" AND \"freshness\" AND \"decided\"",
                 "\"snapshot\"* AND \"freshness\"* AND \"decided\"*",
-                "\"snapshot\"* OR \"freshness\"* OR \"decided\"*",
+                "(\"snapshot\"* AND \"freshness\"*) OR (\"snapshot\"* AND \"decided\"*) OR (\"freshness\"* AND \"decided\"*)",
             ]
+        );
+    }
+
+    #[test]
+    fn fts_fallback_requires_two_distinct_terms() {
+        // One- and two-term queries stop after the prefix-AND stage: it
+        // already requires every term, which is the tightest possible floor.
+        assert_eq!(
+            fts_match_queries(&fts_terms("freshness")),
+            ["\"freshness\"", "\"freshness\"*"]
+        );
+        assert_eq!(
+            fts_match_queries(&fts_terms("snapshot freshness")),
+            [
+                "\"snapshot\" AND \"freshness\"",
+                "\"snapshot\"* AND \"freshness\"*",
+            ]
+        );
+        // A repeated term is deduplicated so it cannot satisfy the two-term
+        // floor by matching the same word twice.
+        assert_eq!(
+            fts_match_queries(&fts_terms("freshness freshness")),
+            ["\"freshness\"", "\"freshness\"*"]
         );
     }
 }

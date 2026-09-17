@@ -339,6 +339,71 @@ async fn context_pack_is_bounded_and_source_linked() {
     );
 }
 
+/// Honest abstention: when no query terms — or only a single coincidental
+/// term — match the index, search must return zero hits rather than noise
+/// from the lexical prefix fallback. `abstained` in the benchmark adapter is
+/// derived from an empty hit list.
+///
+/// The nonsense tokens are invented words that appear nowhere in this
+/// repository: the cce-self benchmark indexes the working tree, so literal
+/// reuse of the dataset's control-case vocabulary here would turn this test
+/// file into genuine evidence and defeat the control.
+#[tokio::test]
+async fn zero_evidence_query_abstains() {
+    let repo = fixture_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // Nonsense control: no content term exists in the index at all.
+    let nonsense = engine
+        .search(search_request("zorblax quinthar vexmoor kraggle", true))
+        .await
+        .expect("nonsense search");
+    assert!(
+        nonsense.hits.is_empty(),
+        "zero-evidence query must abstain, got {:?}",
+        nonsense
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // One coincidental prefix hit ("cursor") among several unmatched terms is
+    // not evidence: the fallback requires at least two distinct terms.
+    let single_term = engine
+        .search(search_request("zorblax quinthar vexmoor cursor", true))
+        .await
+        .expect("single-term-overlap search");
+    assert!(
+        single_term.hits.is_empty(),
+        "single-term prefix overlap must not count as evidence, got {:?}",
+        single_term
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // Positive control: a real multi-term query still retrieves the fixture.
+    let control = engine
+        .search(search_request("resume_attempt cursor", true))
+        .await
+        .expect("control search");
+    assert!(
+        control
+            .hits
+            .iter()
+            .any(|hit| hit.symbol_name.as_deref() == Some("resume_attempt")),
+        "expected a resume_attempt hit, got {:?}",
+        control
+            .hits
+            .iter()
+            .map(|hit| hit.symbol_name.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn atlas_on_unindexed_repository_is_an_explicit_error() {
     let repo = fixture_repo();
