@@ -584,60 +584,7 @@ impl CceEngine {
             &mut candidates,
         )?;
 
-        // Multiple retrieval documents can describe one source region (raw
-        // chunk + symbol summary); the hit list presents regions, so the
-        // first — best-scored — document per region wins and later ones only
-        // contribute their routes. Per-file cap keeps cross-file coverage;
-        // hits beyond it stay in `candidates` for expansion seeds.
-        let mut hits: Vec<SearchHit> = Vec::new();
-        let mut per_file = HashMap::<String, usize>::new();
-        let mut seen_regions = HashMap::<String, usize>::new();
-        let mut language_cache = HashMap::<String, Option<String>>::new();
-        for candidate in ranked_candidates(&candidates) {
-            let mut hit = candidate.hit.clone();
-            if !self.hit_matches_filters(
-                &hit,
-                &request.filters,
-                &request.snapshot_id,
-                &mut language_cache,
-            )? {
-                continue;
-            }
-            hit.score = candidate.fused_score;
-            let region_key = hit.region_id.clone().unwrap_or_else(|| {
-                hit.address.as_ref().map_or_else(
-                    || hit.document_id.clone(),
-                    |address| {
-                        format!(
-                            "{}:{}:{}",
-                            address.path, address.start_byte, address.end_byte
-                        )
-                    },
-                )
-            });
-            if let Some(&kept) = seen_regions.get(&region_key) {
-                if let Some(kept_hit) = hits.get_mut(kept) {
-                    for route in &hit.contributing_routes {
-                        if !kept_hit.contributing_routes.contains(route) {
-                            kept_hit.contributing_routes.push(*route);
-                        }
-                    }
-                }
-                continue;
-            }
-            if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
-                let count = per_file.entry(path.clone()).or_default();
-                if *count >= 3 {
-                    continue;
-                }
-                *count += 1;
-            }
-            seen_regions.insert(region_key, hits.len());
-            hits.push(hit);
-            if hits.len() >= request.limit {
-                break;
-            }
-        }
+        let mut hits = self.select_hits(&request, &candidates)?;
 
         // Cross-encoder rerank: the fused order is a coarse prior from
         // route-level rank fusion. A pairwise reranker re-scores the head
@@ -738,6 +685,75 @@ impl CceEngine {
             missing_capabilities,
             latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         })
+    }
+
+    /// Fold fused candidates into the presented hit list.
+    ///
+    /// Multiple retrieval documents can describe one source region (raw
+    /// chunk + symbol summary); the hit list presents regions, so the
+    /// first — best-scored — document per region wins and later ones only
+    /// contribute their routes. The per-file cap is windowed by list
+    /// position (`per_file_cap`): the head users actually read enforces
+    /// cross-file diversity, the tail relaxes to the historical flat cap.
+    /// A hit skipped on the cap is dropped, not deferred — the file's
+    /// other documents can still fill later slots on their own merits once
+    /// the window relaxes — and everything skipped stays in `candidates`
+    /// for expansion seeds.
+    fn select_hits(
+        &self,
+        request: &SearchRequest,
+        candidates: &HashMap<String, Candidate>,
+    ) -> Result<Vec<SearchHit>> {
+        let mut hits: Vec<SearchHit> = Vec::new();
+        let mut per_file = HashMap::<String, usize>::new();
+        let mut seen_regions = HashMap::<String, usize>::new();
+        let mut language_cache = HashMap::<String, Option<String>>::new();
+        for candidate in ranked_candidates(candidates) {
+            let mut hit = candidate.hit.clone();
+            if !self.hit_matches_filters(
+                &hit,
+                &request.filters,
+                &request.snapshot_id,
+                &mut language_cache,
+            )? {
+                continue;
+            }
+            hit.score = candidate.fused_score;
+            let region_key = hit.region_id.clone().unwrap_or_else(|| {
+                hit.address.as_ref().map_or_else(
+                    || hit.document_id.clone(),
+                    |address| {
+                        format!(
+                            "{}:{}:{}",
+                            address.path, address.start_byte, address.end_byte
+                        )
+                    },
+                )
+            });
+            if let Some(&kept) = seen_regions.get(&region_key) {
+                if let Some(kept_hit) = hits.get_mut(kept) {
+                    for route in &hit.contributing_routes {
+                        if !kept_hit.contributing_routes.contains(route) {
+                            kept_hit.contributing_routes.push(*route);
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
+                let count = per_file.entry(path.clone()).or_default();
+                if *count >= per_file_cap(hits.len()) {
+                    continue;
+                }
+                *count += 1;
+            }
+            seen_regions.insert(region_key, hits.len());
+            hits.push(hit);
+            if hits.len() >= request.limit {
+                break;
+            }
+        }
+        Ok(hits)
     }
 
     /// Pseudo-relevance feedback (RM3-style): treat the fused topical head
@@ -1168,6 +1184,23 @@ fn ranked_candidates(candidates: &HashMap<String, Candidate>) -> Vec<&Candidate>
     ranked
 }
 
+/// Per-file cap by filled list length: the head enforces file diversity —
+/// 1 hit per file inside the top 5, 2 inside the top 10 — then relaxes to
+/// the historical flat cap of 3 for the tail. Measured on the v5.3
+/// bundle, this windowing is what lifts recall@5 without moving anything
+/// else. `filled` is `hits.len()` at the moment a candidate is judged, so
+/// a skipped hit is dropped, not deferred; when few files carry hits the
+/// head starves and the list just fills with what remains.
+const fn per_file_cap(filled: usize) -> usize {
+    if filled < 5 {
+        1
+    } else if filled < 10 {
+        2
+    } else {
+        3
+    }
+}
+
 const fn representation_weight(representation: &RetrievalRepresentation) -> f64 {
     match representation {
         RetrievalRepresentation::RoleSummary
@@ -1569,6 +1602,132 @@ mod tests {
             },
             fused_score,
         }
+    }
+
+    /// Same-file candidates need distinct byte ranges or region dedup
+    /// collapses them before the per-file cap is even consulted.
+    fn candidate_at(document_id: &str, path: &str, byte_start: u64, fused_score: f64) -> Candidate {
+        let mut candidate = candidate(document_id, path, fused_score);
+        candidate.hit.address = Some(
+            SourceAddress::new(
+                "repo_test",
+                "snap_test",
+                path,
+                byte_start..byte_start + 1,
+                1..=1,
+            )
+            .expect("address"),
+        );
+        candidate
+    }
+
+    /// A hit without a source path bypasses per-file accounting entirely.
+    fn candidate_pathless(document_id: &str, fused_score: f64) -> Candidate {
+        let mut candidate = candidate(document_id, "src/nowhere.rs", fused_score);
+        candidate.hit.address = None;
+        candidate
+    }
+
+    #[test]
+    fn windowed_per_file_cap_diversifies_top_five() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        let mut candidates = HashMap::new();
+        // One file owns the three best-scored candidates; under the flat
+        // 3-per-file cap it would sweep the head.
+        for (suffix, score) in [("1", 0.9), ("2", 0.8), ("3", 0.7)] {
+            let id = format!("a{suffix}");
+            candidates.insert(
+                id.clone(),
+                candidate_at(
+                    &id,
+                    "src/a.rs",
+                    suffix.parse::<u64>().expect("u64") * 10,
+                    score,
+                ),
+            );
+        }
+        for (name, score) in [("b", 0.6), ("c", 0.5), ("d", 0.4), ("e", 0.3)] {
+            candidates.insert(
+                name.to_owned(),
+                candidate_at(name, &format!("src/{name}.rs"), 0, score),
+            );
+        }
+
+        let hits = engine
+            .select_hits(&request("query", 5), &candidates)
+            .expect("select hits");
+        assert_eq!(hits.len(), 5);
+        let paths = hits
+            .iter()
+            .filter_map(|hit| hit.address.as_ref().map(|address| address.path.as_str()))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            paths.len(),
+            5,
+            "top-5 must show five distinct files: {paths:?}"
+        );
+        // The capped file keeps only its best hit, still ranked first.
+        assert_eq!(
+            hits.first()
+                .and_then(|hit| hit.address.as_ref())
+                .map(|a| a.path.as_str()),
+            Some("src/a.rs")
+        );
+    }
+
+    #[test]
+    fn windowed_per_file_cap_fills_limit_with_what_remains() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        let mut candidates = HashMap::new();
+        for (file, scores) in [
+            ("src/a.rs", [0.95_f64, 0.8, 0.65, 0.5]),
+            ("src/b.rs", [0.9_f64, 0.75, 0.6, 0.45]),
+        ] {
+            for (index, score) in scores.into_iter().enumerate() {
+                let id = format!("{file}:{index}");
+                candidates.insert(
+                    id.clone(),
+                    candidate_at(&id, file, index as u64 * 10, score),
+                );
+            }
+        }
+
+        // Only two files carry hits: the top-5 window caps each at one and
+        // the starved head is accepted — the list fills with what remains.
+        let starved = engine
+            .select_hits(&request("query", 5), &candidates)
+            .expect("select hits");
+        assert_eq!(starved.len(), 2);
+
+        // Hits without a source path are uncapped, so the same two files
+        // still fill up to the limit — and once the list crosses 5 the cap
+        // relaxes, letting a file's next document in on its own merits.
+        for (index, score) in [0.85_f64, 0.7, 0.55, 0.4].into_iter().enumerate() {
+            let id = format!("pathless:{index}");
+            candidates.insert(id.clone(), candidate_pathless(&id, score));
+        }
+        let filled = engine
+            .select_hits(&request("query", 6), &candidates)
+            .expect("select hits");
+        assert_eq!(filled.len(), 6);
+        let count_of = |path: &str| {
+            filled
+                .iter()
+                .filter(|hit| {
+                    hit.address
+                        .as_ref()
+                        .is_some_and(|address| address.path == path)
+                })
+                .count()
+        };
+        assert_eq!(
+            count_of("src/a.rs"),
+            2,
+            "cap relaxes to 2 past the top-5 window"
+        );
+        assert_eq!(count_of("src/b.rs"), 1);
     }
 
     #[test]
