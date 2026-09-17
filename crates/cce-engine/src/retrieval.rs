@@ -1031,6 +1031,18 @@ const CLUSTER_HEAD: usize = 30;
 const CLUSTER_SCALE: f64 = 0.12;
 const CLUSTER_CAP: f64 = 0.2;
 
+/// File-vote prior ceiling. Mechanism files recur across the candidate
+/// pool — the regions answering a query cluster in a handful of files —
+/// while an isolated vocabulary match occupies exactly one rank. The
+/// vote scales a file's best-rank mass by ln(1+occurrences): a single
+/// hit earns nothing (ln 2 damped by the cap check below would still
+/// score, so the prior only pays out past one occurrence), a file
+/// holding three ranks earns ≈1.4× its best-rank mass. Occurrences are
+/// capped so a large file's raw chunk count cannot dominate on size
+/// alone; the ceiling sits at the co-change/cluster tier.
+const FILE_VOTE_BONUS: f64 = 0.2;
+const FILE_VOTE_MAX_OCCURRENCES: usize = 8;
+
 /// Structural priors layered on the fused ranking:
 /// - exact symbol/word agreement between the query and a hit's symbol name;
 /// - same-file evidence aggregation (a file holding a top-3 hit makes its
@@ -1220,6 +1232,14 @@ fn apply_structural_features(
 /// file-level adjacency is visible at this granularity: symbol-level
 /// `Calls` never touch file entities as endpoints, so `Imports`/
 /// `ChangedWith` carry the cluster signal.
+///
+/// File vote: the files answering one query recur across the candidate
+/// pool — a mechanism's regions fill many ranks — while an isolated
+/// vocabulary match occupies exactly one. Each file is keyed by its
+/// best rank (a lucky tail hit cannot outvote a real head presence) and
+/// earns `FILE_VOTE_BONUS` × best-rank mass × ln(1+occurrences) once it
+/// holds more than one pooled rank. No store access: the pool itself is
+/// the evidence.
 fn apply_corroboration(
     store: &MetadataStore,
     snapshot_id: &str,
@@ -1261,6 +1281,22 @@ fn apply_corroboration(
             .count();
         support.insert(path.clone(), count);
     }
+    // File vote: occurrences per path across the whole pool, each file
+    // keyed by its best rank so a lucky tail hit cannot outvote a real
+    // head presence. Only the file's champion — the document holding
+    // that best rank — collects the bonus: it is the slot competing for
+    // the head; boosting the file's tail docs would just crowd the
+    // dedup-relaxed middle ranks.
+    let mut votes = HashMap::<String, (String, usize, usize)>::new(); // path → (champion doc, best rank, occurrences)
+    for (rank, candidate) in ranked_candidates(candidates).iter().enumerate() {
+        let Some(path) = candidate.hit.address.as_ref().map(|a| a.path.clone()) else {
+            continue;
+        };
+        let entry = votes
+            .entry(path)
+            .or_insert_with(|| (candidate.hit.document_id.clone(), rank, 0));
+        entry.2 += 1;
+    }
     for candidate in candidates.values_mut() {
         let hit = &candidate.hit;
         // Structural candidates ARE the expansion evidence; corroborating
@@ -1300,6 +1336,20 @@ fn apply_corroboration(
         {
             bonus += (CLUSTER_SCALE * (count as f64).ln_1p()).min(CLUSTER_CAP);
             notes.push(format!("{count} intra-candidate edges (mechanism cluster)"));
+        }
+        if let Some((_, best_rank, occurrences)) = hit
+            .address
+            .as_ref()
+            .and_then(|address| votes.get(&address.path))
+            .filter(|(champion, _, occurrences)| *occurrences > 1 && *champion == hit.document_id)
+        {
+            let strength = RRF_K / (RRF_K + *best_rank as f64 + 1.0)
+                * ((*occurrences).min(FILE_VOTE_MAX_OCCURRENCES) as f64).ln_1p()
+                / (FILE_VOTE_MAX_OCCURRENCES as f64).ln_1p();
+            bonus = FILE_VOTE_BONUS.mul_add(strength, bonus);
+            notes.push(format!(
+                "file vote: {occurrences} pooled occurrences (champion)"
+            ));
         }
         candidate.hit.explanation.extend(notes);
         candidate.fused_score += bonus / RRF_K;
@@ -2075,6 +2125,50 @@ mod tests {
             );
         }
         assert!((candidates["c"].fused_score - 0.1).abs() < f64::EPSILON);
+        assert!(candidates["c"].hit.explanation.is_empty());
+    }
+
+    #[test]
+    fn recurring_file_outranks_single_hit_file() {
+        // File vote: a.rs holds three pooled ranks, c.rs holds one — the
+        // recurring file's regions corroborate each other. Equal fused
+        // scores in, a.rs must come out ahead; the single-occurrence
+        // file earns nothing (occurrences > 1 gate).
+        let records = SnapshotRecords::default();
+        let (_dir, store, snapshot_id) = store_with(&records);
+
+        let mut candidates = HashMap::new();
+        candidates.insert("a1".to_owned(), candidate("a1", "src/a.rs", 0.1));
+        candidates.insert("a2".to_owned(), candidate("a2", "src/a.rs", 0.09));
+        candidates.insert("a3".to_owned(), candidate("a3", "src/a.rs", 0.08));
+        candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.1));
+        apply_corroboration(
+            &store,
+            &snapshot_id,
+            &ExpansionEvidence::default(),
+            &mut candidates,
+        )
+        .expect("corroboration");
+
+        // a1 is a.rs's champion — the document at the file's best rank —
+        // and alone collects the vote; a2/a3 are the tail the vote is
+        // measured on, not recipients. strength = best-rank mass ×
+        // ln(occ)/ln(cap); c has one occurrence and earns nothing.
+        let strength =
+            RRF_K / (RRF_K + 1.0) * 3.0_f64.ln_1p() / (FILE_VOTE_MAX_OCCURRENCES as f64).ln_1p();
+        let expected = FILE_VOTE_BONUS * strength / RRF_K;
+        assert!((candidates["a1"].fused_score - 0.1 - expected).abs() < 1e-9);
+        assert!(
+            candidates["a1"]
+                .hit
+                .explanation
+                .iter()
+                .any(|line| line.contains("file vote: 3 pooled occurrences"))
+        );
+        assert!((candidates["a2"].fused_score - 0.09).abs() < f64::EPSILON);
+        assert!((candidates["a3"].fused_score - 0.08).abs() < f64::EPSILON);
+        assert!((candidates["c"].fused_score - 0.1).abs() < f64::EPSILON);
+        assert!(candidates["a2"].hit.explanation.is_empty());
         assert!(candidates["c"].hit.explanation.is_empty());
     }
 
