@@ -850,6 +850,71 @@ async fn sensitive_files_stay_out_of_history_documents() {
 }
 
 #[tokio::test]
+async fn commit_documents_stay_off_the_lexical_route() {
+    let repo = history_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // The marker exists in current source AND in the commit-diff body.
+    // Current-source hits may surface it; commit documents must only ever
+    // arrive through the history route — never as `lexical` hits whose
+    // per-file evidence crowds out real files.
+    let result = engine
+        .search(search_request("second_lineage_marker", true))
+        .await
+        .expect("search");
+    assert!(
+        result.hits.iter().all(|hit| {
+            !(hit.route == cce_core::SearchRoute::Lexical
+                && matches!(
+                    hit.representation,
+                    RetrievalRepresentation::CommitSummary | RetrievalRepresentation::CommitDiff
+                ))
+        }),
+        "commit document reached the lexical route: {:?}",
+        result
+            .hits
+            .iter()
+            .map(|hit| (hit.route, hit.representation.clone()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn ignored_paths_leave_no_history_evidence() {
+    let repo = history_repo();
+    write(repo.path(), ".cceignore", "ignored.log\n");
+    write(repo.path(), "ignored.log", "lineage_secret_marker\n");
+    write(
+        repo.path(),
+        "src/extra.rs",
+        "pub fn third_visible_marker() {}\n",
+    );
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-m", "add ignored log and extra"]);
+    let engine = engine(repo.path());
+    let report = engine.index().await.expect("index");
+
+    let diffs = commit_diff_documents(&engine, &report.snapshot.id);
+    let latest = diffs
+        .iter()
+        .find(|document| document.text.contains("third_visible_marker"))
+        .expect("commit diff for the third commit");
+    // The path may be noted, but an ignored file contributes neither
+    // evidence rows nor diff content.
+    assert!(
+        latest
+            .evidence
+            .iter()
+            .all(|address| address.path != "ignored.log"),
+        "ignored path leaked into evidence: {:?}",
+        latest.evidence
+    );
+    assert!(!latest.text.contains("lineage_secret_marker"));
+    assert!(!latest.text.contains("diff --git a/ignored.log"));
+}
+
+#[tokio::test]
 async fn history_indexing_is_idempotent() {
     let repo = history_repo();
     let engine = engine(repo.path());

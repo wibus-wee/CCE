@@ -80,13 +80,26 @@ v1 registry:
 | provider | produces | installer | notes |
 |---|---|---|---|
 | `scip:rust-analyzer` | Dataflow substrate, Graph truth | rustup component / release binary | dogfood target — this repo |
-| `scip:typescript` | same | npx | requires fetched `node_modules` |
+| `scip:typescript` | same | project `node_modules/.bin` → repo `.bin` → PATH | monorepo-aware: indexes the largest workspace tsconfig when the root is a solution file |
 | `scip:file` | same | none | ingests a checked-in `index.scip`; always offline |
 
 SCIP supplies definition/reference/implementation truth and hover docs — it
 does **not** carry taint edges. With SCIP ingested, `ViewKind::Dataflow`
 moves to `Partial`; `DataflowRequired` stays unsatisfied until a
 path-search layer over the resolved call graph exists.
+
+### History evidence
+
+Each non-root commit produces a `CommitDiff` document (message, changed
+paths, identifier-carrying `+`/`-` lines, capped) plus a complete patch in
+the artifact store (`ArtifactKind::CommitPatch`, digest recorded on the
+`Commit` entity as `patchArtifactDigest`). The `history` view reports
+`git_commit_messages` + `git_diff_hunks` capabilities. Commit documents are
+owned by the `history` route — they never enter the plain `lexical` route,
+and each touched file contributes at most one covering evidence address per
+side. Historical payload obeys the same exclusions as the scan: sensitive
+names are withheld entirely and `.cceignore`/`.gitignore`-matched paths
+contribute a path note but no content or evidence.
 
 #### Core API
 

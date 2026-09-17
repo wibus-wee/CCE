@@ -186,6 +186,16 @@ impl CceEngine {
                     &request.filters,
                 )?
                 .into_iter()
+                // Commit documents are historical evidence owned by the
+                // history route; a commit must never crowd the lexical
+                // ranking of current-source results.
+                .filter(|hit| {
+                    !matches!(
+                        hit.representation,
+                        RetrievalRepresentation::CommitSummary
+                            | RetrievalRepresentation::CommitDiff
+                    )
+                })
                 .enumerate()
             {
                 let rank = offset + 1;

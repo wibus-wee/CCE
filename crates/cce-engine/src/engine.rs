@@ -1202,6 +1202,7 @@ impl CceEngine {
             &scanned.identity.id,
             &scanned.snapshot.id,
             self.config.index.include_sensitive,
+            self.config.index.respect_gitignore,
         );
         let mut indexed = 0_usize;
         for commit in diffs {

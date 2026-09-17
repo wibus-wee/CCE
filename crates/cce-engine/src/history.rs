@@ -197,7 +197,9 @@ const MAX_BODY_LINES_PER_FILE: usize = 32;
 const MAX_DOCUMENT_BODY_BYTES: usize = 16 * 1024;
 /// Commit-message bytes folded into the document body.
 const MAX_MESSAGE_BYTES: usize = 1024;
-/// Evidence addresses kept per commit document.
+/// Evidence addresses kept per commit document; each changed file emits at
+/// most one covering address per side, so this bound only guards
+/// pathological thousands-of-files commits.
 const MAX_EVIDENCE_PER_COMMIT: usize = 128;
 
 /// One commit's diff content prepared for indexing: `body` feeds FTS while
@@ -246,11 +248,15 @@ struct FileExtraction {
 }
 
 /// Where extracted evidence is anchored: the repository/snapshot the
-/// [`SourceAddress`]es point into, plus the sensitive-name policy flag.
+/// [`SourceAddress`]es point into, plus the sensitive-name and repository
+/// ignore policy. Historical payload must obey the same "never index" rules
+/// as the worktree scan — a diffed path matching `.cceignore`/`.gitignore`
+/// is recorded as a path note but contributes no content or evidence.
 struct HistoryScope<'a> {
     repository_id: &'a str,
     snapshot_id: &'a str,
     include_sensitive: bool,
+    ignores: &'a ignore::gitignore::Gitignore,
 }
 
 /// Per-commit diff content for lineage queries ("when did this line
@@ -265,6 +271,7 @@ pub(crate) fn commit_diffs(
     repository_id: &str,
     snapshot_id: &str,
     include_sensitive: bool,
+    respect_gitignore: bool,
 ) -> Vec<CommitDiff> {
     let mut commits = Vec::new();
     if !repository_root.join(".git").exists() {
@@ -279,10 +286,12 @@ pub(crate) fn commit_diffs(
     let Ok(walk) = head.ancestors().all() else {
         return commits;
     };
+    let ignores = history_ignores(repository_root, respect_gitignore);
     let scope = HistoryScope {
         repository_id,
         snapshot_id,
         include_sensitive,
+        ignores: &ignores,
     };
     for entry in walk.take(maximum_commits) {
         let Ok(entry) = entry else {
@@ -319,6 +328,24 @@ pub(crate) fn commit_diffs(
     commits
 }
 
+/// Build the path matcher for historical payload: `.cceignore` always
+/// applies (it is CCE's own "never index" contract), `.gitignore` and
+/// `.git/info/exclude` follow the scan-time `respect_gitignore` flag.
+fn history_ignores(
+    repository_root: &Path,
+    respect_gitignore: bool,
+) -> ignore::gitignore::Gitignore {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(repository_root);
+    let _ = builder.add(repository_root.join(".cceignore"));
+    if respect_gitignore {
+        let _ = builder.add(repository_root.join(".gitignore"));
+        let _ = builder.add(repository_root.join(".git/info/exclude"));
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+}
+
 /// Assemble one [`CommitDiff`]: render per-file patch sections into the
 /// artifact-bound patch text, then build the bounded FTS body and the
 /// evidence trail from the same extractions.
@@ -345,6 +372,14 @@ fn build_commit_diff(
         }
         if let Some(reason) = crate::ignore::builtin_skip_reason(file_name) {
             path_notes.push(format!("{} ({reason})", change.path));
+            continue;
+        }
+        if scope
+            .ignores
+            .matched_path_or_any_parents(&change.path, false)
+            .is_ignore()
+        {
+            path_notes.push(format!("{} (ignored)", change.path));
             continue;
         }
         if patched_files >= MAX_PATCHED_FILES_PER_COMMIT {
@@ -413,30 +448,32 @@ fn emit_patch_section(patch: &mut String, change: &TreeChange, extraction: &File
     patch.push_str(&extraction.patch);
 }
 
-/// Record hunk line ranges as evidence addresses: additions at post-image
-/// lines, removals at pre-image lines.
+/// Record one covering address per file side as evidence: additions merge
+/// into a post-image range, removals into a pre-image range. A commit hit
+/// surfaces each touched file once instead of once per hunk — evidence is
+/// drill-down, not a per-hunk result list.
 fn emit_evidence(
     evidence: &mut Vec<SourceAddress>,
     scope: &HistoryScope<'_>,
     path: &str,
     extraction: &FileExtraction,
 ) {
-    for range in extraction
-        .added_ranges
-        .iter()
-        .chain(extraction.removed_ranges.iter())
-    {
-        if evidence.len() >= MAX_EVIDENCE_PER_COMMIT {
-            return;
+    for ranges in [&extraction.added_ranges, &extraction.removed_ranges] {
+        if ranges.is_empty() || evidence.len() >= MAX_EVIDENCE_PER_COMMIT {
+            continue;
         }
-        if let Ok(address) = SourceAddress::new(
-            scope.repository_id,
-            scope.snapshot_id,
-            path,
-            0..0,
-            range.clone(),
-        ) {
-            evidence.push(address);
+        let start = ranges.iter().map(RangeInclusive::start).min().copied();
+        let end = ranges.iter().map(RangeInclusive::end).max().copied();
+        if let (Some(start), Some(end)) = (start, end) {
+            if let Ok(address) = SourceAddress::new(
+                scope.repository_id,
+                scope.snapshot_id,
+                path,
+                0..0,
+                start..=end,
+            ) {
+                evidence.push(address);
+            }
         }
     }
 }
