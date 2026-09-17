@@ -70,6 +70,44 @@ struct Candidate {
     fused_score: f64,
 }
 
+/// Where graph expansion went, recorded beside the candidate map on
+/// purpose: `add_candidate` keys hits by `document_id`, so the
+/// `entity:`-keyed hits expansion emits can never merge into — and thus
+/// never corroborate — the doc-keyed candidates describing the same
+/// code. This side channel lets the feature pass join the evidence back.
+#[derive(Debug, Default)]
+struct ExpansionEvidence {
+    /// entity id → (best propagated score, expansion edges surfacing it)
+    entities: HashMap<String, (f64, usize)>,
+    /// region id → same aggregation, for region-level document matches
+    regions: HashMap<String, (f64, usize)>,
+    /// file path → same aggregation; a file holding any surfaced entity
+    /// is graph-adjacent to a seed at either file- or symbol-level
+    /// granularity (a surfaced `ChangedWith` file entity and a surfaced
+    /// `Calls` symbol both map here through `address.path`).
+    paths: HashMap<String, (f64, usize)>,
+    /// Best propagated score overall — normalizes strength to (0, 1].
+    max_score: f64,
+}
+
+impl ExpansionEvidence {
+    fn record(&mut self, entity: &CodeEntity, propagated: f64) {
+        fn accumulate(map: &mut HashMap<String, (f64, usize)>, key: &str, score: f64) {
+            let entry = map.entry(key.to_owned()).or_default();
+            entry.0 = entry.0.max(score);
+            entry.1 += 1;
+        }
+        accumulate(&mut self.entities, &entity.id, propagated);
+        if let Some(region_id) = &entity.region_id {
+            accumulate(&mut self.regions, region_id, propagated);
+        }
+        if let Some(address) = &entity.address {
+            accumulate(&mut self.paths, &address.path, propagated);
+        }
+        self.max_score = self.max_score.max(propagated);
+    }
+}
+
 /// The snapshot a search will run against, with a record of whether the
 /// working tree was actually verified to match it.
 #[derive(Debug)]
@@ -431,6 +469,10 @@ impl CceEngine {
             missing_capabilities
                 .push("opportunistic graph expansion skipped: graph view is not ready".to_owned());
         }
+        // Surfaced neighbors land in `candidates` as `entity:`-keyed hits;
+        // the evidence map records the same visits keyed by entity,
+        // region, and file so document candidates can be corroborated.
+        let mut expansion_evidence = ExpansionEvidence::default();
         if plan.routes.contains(&SearchRoute::Structural)
             && !matches!(
                 plan.graph_policy,
@@ -483,6 +525,7 @@ impl CceEngine {
                         let hop_decay = 0.5_f64.powi(i32::try_from(hop).unwrap_or(0));
                         let propagated = seed_score * f64::from(relation.confidence) * hop_decay
                             / (1.0 + (degree as f64).ln());
+                        expansion_evidence.record(&entity, propagated);
                         let snippet = entity
                             .signature
                             .clone()
@@ -558,6 +601,7 @@ impl CceEngine {
             &request.query,
             &mut candidates,
         )?;
+        apply_corroboration(&expansion_evidence, &mut candidates);
 
         // Multiple retrieval documents can describe one source region (raw
         // chunk + symbol summary); the hit list presents regions, so the
@@ -908,6 +952,16 @@ const CO_CHANGE_SCALE: f64 = 0.3;
 /// co-change ceiling.
 const PACKAGE_BONUS: f64 = 0.15;
 
+/// Ceiling for the corroboration bonus: the lift a document candidate
+/// earns when graph expansion independently surfaced its entity, region,
+/// or file. 0.2 sits beside the co-change ceiling (0.21) and under the
+/// same-file 0.25 — corroboration confirms a vocabulary match, it does
+/// not replace one. Its fused effect (0.2 / `RRF_K` ≈ 0.003) is an order
+/// of magnitude under a rank-1 exact-symbol hit's RRF mass
+/// (2.0 / (`RRF_K` + 1) ≈ 0.033), so it can reorder the head but never
+/// leapfrog an identity match on its own.
+const CORROBORATION_BONUS: f64 = 0.2;
+
 /// Structural priors layered on the fused ranking:
 /// - exact symbol/word agreement between the query and a hit's symbol name;
 /// - same-file evidence aggregation (a file holding a top-3 hit makes its
@@ -1071,6 +1125,54 @@ fn apply_structural_features(
         candidate.fused_score += bonus / RRF_K;
     }
     Ok(())
+}
+
+/// Join expansion evidence back onto document candidates. Expansion hits
+/// are keyed `entity:{id}` while document candidates carry document ids,
+/// so the `add_candidate` merge can never connect them — before this
+/// pass a gold file confirmed by three graph edges scored identically to
+/// an isolated vocabulary match.
+///
+/// A candidate is corroborated when it IS a surfaced entity, shares a
+/// surfaced entity's region, or lives in a file any surfaced entity
+/// points into — path membership covers both the file-entity-adjacent
+/// (`ChangedWith`/`Imports`) and symbol-entity-adjacent (`Calls`/
+/// `References`) cases, since surfaced entities of either granularity
+/// carry the file's `address.path`. Strength is the best normalized
+/// propagated score reaching the candidate, so weak tail evidence lifts
+/// less than a head-confirmed hit.
+fn apply_corroboration(expansion: &ExpansionEvidence, candidates: &mut HashMap<String, Candidate>) {
+    if expansion.entities.is_empty() {
+        return;
+    }
+    for candidate in candidates.values_mut() {
+        let hit = &candidate.hit;
+        // Structural candidates ARE the expansion evidence; corroborating
+        // them with it would double-count.
+        if hit.contributing_routes.contains(&SearchRoute::Structural) {
+            continue;
+        }
+        let evidence = [
+            expansion.entities.get(&hit.entity_id),
+            hit.region_id
+                .as_ref()
+                .and_then(|region_id| expansion.regions.get(region_id)),
+            hit.address
+                .as_ref()
+                .and_then(|address| expansion.paths.get(&address.path)),
+        ]
+        .into_iter()
+        .flatten()
+        .max_by(|left, right| left.0.total_cmp(&right.0));
+        if let Some(&(score, edges)) = evidence {
+            let strength = (score / expansion.max_score).min(1.0);
+            candidate.fused_score += CORROBORATION_BONUS * strength / RRF_K;
+            candidate.hit.explanation.push(format!(
+                "corroborated by graph expansion ({edges} edge{})",
+                if edges == 1 { "" } else { "s" }
+            ));
+        }
+    }
 }
 
 /// The package owning `path`: the longest matching `rootDir` prefix.
@@ -1381,6 +1483,23 @@ mod tests {
         }
     }
 
+    fn symbol(name: &str, path: &str) -> CodeEntity {
+        CodeEntity {
+            id: format!("symbol:{name}"),
+            kind: EntityKind::Function,
+            name: name.to_owned(),
+            qualified_name: None,
+            signature: None,
+            language: None,
+            region_id: Some(format!("region:{name}")),
+            address: Some(
+                SourceAddress::new("repo_test", "snap_test", path, 0..1, 1..=1).expect("address"),
+            ),
+            capabilities: Vec::new(),
+            attributes: serde_json::Map::new(),
+        }
+    }
+
     fn changed_with(source: &str, target: &str, confidence: f32) -> cce_core::Relation {
         cce_core::Relation {
             id: format!("rel:{source}:{target}"),
@@ -1486,6 +1605,49 @@ mod tests {
                     .explanation
                     .iter()
                     .any(|line| line.contains("co-change"))
+            );
+        }
+        assert!(candidates["c"].hit.explanation.is_empty());
+    }
+
+    #[test]
+    fn corroborated_candidate_outranks_isolated() {
+        // The expansion set is the join key `add_candidate` cannot
+        // provide: a file entity surfaced as a co-change neighbor
+        // corroborates its document candidate through `entity_id`, and a
+        // surfaced symbol corroborates every candidate in its file
+        // through `address.path`.
+        let mut expansion = ExpansionEvidence::default();
+        expansion.record(&file("src/b.rs"), 0.05); // ChangedWith neighbor of a seed
+        expansion.record(&symbol("helper", "src/d.rs"), 0.04); // Calls neighbor
+
+        let mut candidates = HashMap::new();
+        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.1));
+        candidates.insert("d".to_owned(), candidate("d", "src/d.rs", 0.1));
+        candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.1));
+        let mut structural = candidate("s", "src/b.rs", 0.1);
+        structural.hit.route = SearchRoute::Structural;
+        structural.hit.contributing_routes = vec![SearchRoute::Structural];
+        candidates.insert("s".to_owned(), structural);
+
+        apply_corroboration(&expansion, &mut candidates);
+
+        // b matches its entity id at full strength; d matches through the
+        // symbol's file at 0.04/0.05 strength; c is isolated; the
+        // structural hit IS the evidence and must not corroborate itself.
+        let expected = |score: f64| CORROBORATION_BONUS * (score / 0.05) / RRF_K;
+        assert!((candidates["b"].fused_score - 0.1 - expected(0.05)).abs() < 1e-9);
+        assert!((candidates["d"].fused_score - 0.1 - expected(0.04)).abs() < 1e-9);
+        assert!((candidates["c"].fused_score - 0.1).abs() < f64::EPSILON);
+        assert!((candidates["s"].fused_score - 0.1).abs() < f64::EPSILON);
+        for key in ["b", "d"] {
+            assert!(
+                candidates[key]
+                    .hit
+                    .explanation
+                    .iter()
+                    .any(|line| line.contains("corroborated by graph expansion")),
+                "{key} must explain its corroboration"
             );
         }
         assert!(candidates["c"].hit.explanation.is_empty());
