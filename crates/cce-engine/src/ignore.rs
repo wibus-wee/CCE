@@ -21,10 +21,23 @@ pub(crate) fn is_internal_or_generated(entry: &DirEntry) -> bool {
     if entry.depth() == 0 {
         return false;
     }
-    matches!(
-        entry.file_name().to_str(),
-        Some(".git" | ".cce" | "target" | "node_modules" | ".venv" | "__pycache__")
-    )
+    let Some(name) = entry.file_name().to_str() else {
+        return false;
+    };
+    if matches!(
+        name,
+        ".git" | ".cce" | "target" | "node_modules" | ".venv" | "__pycache__"
+    ) {
+        return true;
+    }
+    // CCE state under a renamed data dir (`.cce-bench-*`, `.cce_*`, …) is
+    // still not source: artifact churn inside it would otherwise look like
+    // fresh content on every scan. `.cceignore` is a file and stays
+    // indexed.
+    entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_dir())
+        && (name.starts_with(".cce-") || name.starts_with(".cce_"))
 }
 
 /// Why a file name is skipped by the built-in policy. Returned as a

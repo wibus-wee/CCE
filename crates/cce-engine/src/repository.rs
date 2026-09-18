@@ -169,6 +169,16 @@ impl RepositoryScanner {
         let anchor = self.identify()?;
         let repository_id = anchor.identity.id.clone();
 
+        // The configured data dir is never source, whatever its name:
+        // artifacts inside it change on every request, and scanning them
+        // back in would make each `require_fresh` mint a new snapshot.
+        // Excluded by resolved path so `CCE_DATA_DIR` names the built-in
+        // name policy does not know are still pruned. A data dir equal to
+        // the root itself is left alone — the filter cannot prune the
+        // walker's own root entry.
+        let data_root =
+            resolve_data_root(&self.config.data_root).filter(|root| *root != anchor.root);
+
         let mut builder = WalkBuilder::new(&anchor.root);
         builder
             .hidden(!self.config.index.include_hidden)
@@ -178,7 +188,12 @@ impl RepositoryScanner {
             .parents(self.config.index.respect_gitignore)
             .add_custom_ignore_filename(".cceignore")
             .follow_links(false)
-            .filter_entry(|entry| !is_internal_or_generated(entry));
+            .filter_entry(move |entry| {
+                !is_internal_or_generated(entry)
+                    && data_root
+                        .as_ref()
+                        .is_none_or(|root| !entry.path().starts_with(root))
+            });
 
         let mut files = Vec::new();
         let mut skipped_large_files = Vec::new();
@@ -321,6 +336,30 @@ fn entry_file_name(path: &Path) -> &str {
         .map_or("", |name| name.to_str().unwrap_or(""))
 }
 
+/// The configured data dir as a path comparable to walk entries:
+/// canonicalized when it exists, else the deepest existing ancestor
+/// canonicalized with the missing tail re-attached — a not-yet-created
+/// data dir under a symlinked parent still resolves like the walker's
+/// canonical anchor root does.
+fn resolve_data_root(data_root: &Path) -> Option<PathBuf> {
+    if let Ok(path) = data_root.canonicalize() {
+        return Some(path);
+    }
+    let absolute = std::path::absolute(data_root).ok()?;
+    let mut tail = Vec::new();
+    let mut probe = absolute.as_path();
+    loop {
+        if let Ok(mut base) = probe.canonicalize() {
+            for component in tail.iter().rev() {
+                base.push(component);
+            }
+            return Some(base);
+        }
+        tail.push(probe.file_name()?.to_os_string());
+        probe = probe.parent()?;
+    }
+}
+
 fn normalized_relative(root: &Path, path: &Path) -> Result<String> {
     path.strip_prefix(root)
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
@@ -432,5 +471,50 @@ mod tests {
         assert!(is_sensitive_name("id_ed25519"));
         assert!(!is_sensitive_name("environment.rs"));
         assert!(!is_sensitive_name("keys.ts"));
+    }
+
+    #[test]
+    fn scan_prunes_cce_data_dirs() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").expect("source file");
+        fs::write(root.join(".cceignore"), b"# rules\n").expect("cceignore");
+        for name in [".cce", ".cce-bench-external", ".cce_sandbox"] {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).expect("state dir");
+            fs::write(dir.join("metadata.sqlite"), b"artifacts").expect("artifact");
+        }
+        // An arbitrarily-named configured data dir, not matching `.cce*`.
+        fs::create_dir_all(root.join("bench-data")).expect("data dir");
+        fs::write(root.join("bench-data/store.bin"), b"artifacts").expect("store");
+
+        let mut config = EngineConfig::for_repository(root);
+        config.data_root = root.join("bench-data");
+        let scanned = RepositoryScanner::new(config).scan(None).expect("scan");
+        let paths: Vec<&str> = scanned
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        assert!(paths.contains(&"src/main.rs"), "{paths:?}");
+        assert!(paths.contains(&".cceignore"), "{paths:?}");
+        for name in [".cce", ".cce-bench-external", ".cce_sandbox", "bench-data"] {
+            assert!(
+                !paths
+                    .iter()
+                    .any(|path| path.starts_with(&format!("{name}/"))),
+                "{name} leaked into scan: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_missing_data_root_through_existing_ancestor() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let canonical = directory.path().canonicalize().expect("canonical root");
+        let resolved =
+            resolve_data_root(&directory.path().join("missing/deep")).expect("data root resolves");
+        assert_eq!(resolved, canonical.join("missing/deep"));
     }
 }

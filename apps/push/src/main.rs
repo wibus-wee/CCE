@@ -179,10 +179,21 @@ fn is_internal_dir(entry: &ignore::DirEntry) -> bool {
     if entry.depth() == 0 {
         return false;
     }
-    matches!(
-        entry.file_name().to_str(),
-        Some(".git" | ".cce" | "target" | "node_modules" | ".venv" | "__pycache__")
-    )
+    let Some(name) = entry.file_name().to_str() else {
+        return false;
+    };
+    if matches!(
+        name,
+        ".git" | ".cce" | "target" | "node_modules" | ".venv" | "__pycache__"
+    ) {
+        return true;
+    }
+    // `.cce-*`/`.cce_*` state dirs from a renamed CCE_DATA_DIR are not
+    // source either; `.cceignore` is a file and stays in the scan.
+    entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_dir())
+        && (name.starts_with(".cce-") || name.starts_with(".cce_"))
 }
 
 /// Generated artifacts — lockfiles, minified assets — carry no retrievable
@@ -249,6 +260,18 @@ fn is_probably_binary(bytes: &[u8]) -> bool {
 }
 
 fn scan(root: &Path, cache: &mut ScanCache) -> anyhow::Result<Vec<FileEntry>> {
+    // A configured CCE data dir is not source whatever its name — artifact
+    // churn inside it would make every push look dirty. Resolved to match
+    // the canonicalized root; a data dir equal to the root itself is left
+    // alone since the filter cannot prune the walker's own root entry.
+    let data_root = std::env::var_os("CCE_DATA_DIR")
+        .map(PathBuf::from)
+        .and_then(|path| {
+            path.canonicalize()
+                .ok()
+                .or_else(|| std::path::absolute(&path).ok())
+        })
+        .filter(|resolved| resolved != root);
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
@@ -258,7 +281,12 @@ fn scan(root: &Path, cache: &mut ScanCache) -> anyhow::Result<Vec<FileEntry>> {
         .parents(true)
         .add_custom_ignore_filename(".cceignore")
         .follow_links(false)
-        .filter_entry(|entry| !is_internal_dir(entry));
+        .filter_entry(move |entry| {
+            !is_internal_dir(entry)
+                && data_root
+                    .as_ref()
+                    .is_none_or(|dir| !entry.path().starts_with(dir))
+        });
     let mut files = Vec::new();
     let mut seen = HashMap::new();
     for entry in builder.build() {
