@@ -1102,6 +1102,215 @@ impl CceEngine {
         Ok(hits)
     }
 
+    /// Pack-time evidence backlink: the hits a query surfaced are pointers
+    /// too — a test asserting freshness semantics calls the function that
+    /// decides it, and "where is X decided" asks for exactly that callee.
+    /// Each top callable hit contributes its strongest mechanism-pointing
+    /// edge (`Calls`/`References`/`Tests`) to a non-test function. The
+    /// returned pairs carry the source hit's index so the caller can
+    /// insert each subject right after its pointer — the packer's caller
+    /// quota then delivers the code the evidence *points at* beside the
+    /// evidence, and bounded emission means backlinks corroborate the
+    /// pack rather than flood it.
+    pub(crate) fn subject_backlinks(
+        &self,
+        search: &SearchResult,
+    ) -> Result<Vec<(usize, SearchHit)>> {
+        const SOURCES: usize = 8;
+        const EDGES: usize = 16;
+        const TARGETS_PER_SOURCE: usize = 1;
+        const EMIT_MAX: usize = 4;
+        // Route contract: backlinks ride the structural channel; plans
+        // that exclude it (e.g. History) get none.
+        if !search.plan.routes.contains(&SearchRoute::Structural) {
+            return Ok(Vec::new());
+        }
+
+        let query_terms = prf_terms_in(&search.request.query);
+        let hit_entities: std::collections::HashSet<&str> = search
+            .hits
+            .iter()
+            .map(|hit| hit.entity_id.as_str())
+            .collect();
+        let sources: Vec<(usize, &SearchHit)> = search
+            .hits
+            .iter()
+            .enumerate()
+            .filter(|(_, hit)| hit.address.is_some())
+            .take(SOURCES)
+            .collect();
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Mechanism edges only lead out of callable entities — file/doc
+        // nodes carry containment and imports, not decision pointers.
+        let source_entities: HashMap<String, CodeEntity> = self
+            .store()
+            .entities_by_ids(
+                &search.request.snapshot_id,
+                &sources
+                    .iter()
+                    .map(|(_, hit)| hit.entity_id.clone())
+                    .collect::<Vec<_>>(),
+            )?
+            .into_iter()
+            .map(|entity| (entity.id.clone(), entity))
+            .collect();
+        let tail_score = sources.last().map_or(0.0, |pair| pair.1.score);
+
+        let mut emitted: Vec<(usize, SearchHit)> = Vec::new();
+        let mut emitted_ids = std::collections::HashSet::<String>::new();
+        'sources: for (source_index, source) in sources {
+            let Some(entity) = source_entities.get(&source.entity_id) else {
+                continue;
+            };
+            if !matches!(entity.kind, EntityKind::Function | EntityKind::Method) {
+                continue;
+            }
+            // Best edge per target: `Tests` outranks `Calls` outranks
+            // `References` at equal confidence — a name-paired subject or
+            // an exercised callee is a stronger pointer than a mention.
+            let relations = self.store().relations_for_entity(
+                &search.request.snapshot_id,
+                &source.entity_id,
+                RelationDirection::Outgoing,
+                EDGES,
+            )?;
+            let mut best_edge = HashMap::<String, &cce_core::Relation>::new();
+            for relation in &relations {
+                if !matches!(
+                    relation.kind,
+                    RelationKind::Calls | RelationKind::References | RelationKind::Tests
+                ) || hit_entities.contains(relation.target_entity_id.as_str())
+                {
+                    continue;
+                }
+                let rank = match relation.kind {
+                    RelationKind::Tests => 2_u8,
+                    RelationKind::Calls => 1,
+                    _ => 0,
+                };
+                best_edge
+                    .entry(relation.target_entity_id.clone())
+                    .and_modify(|best| {
+                        let best_rank = match best.kind {
+                            RelationKind::Tests => 2_u8,
+                            RelationKind::Calls => 1,
+                            _ => 0,
+                        };
+                        if (relation.confidence, rank) > (best.confidence, best_rank) {
+                            *best = relation;
+                        }
+                    })
+                    .or_insert(relation);
+            }
+            if best_edge.is_empty() {
+                continue;
+            }
+            let target_ids = best_edge.keys().cloned().collect::<Vec<_>>();
+            let mut scored = Vec::new();
+            for target in self
+                .store()
+                .entities_by_ids(&search.request.snapshot_id, &target_ids)?
+            {
+                if !matches!(target.kind, EntityKind::Function | EntityKind::Method)
+                    || emitted_ids.contains(&target.id)
+                {
+                    continue;
+                }
+                let target_path = target
+                    .address
+                    .as_ref()
+                    .map_or("", |address| address.path.as_str());
+                // A test's subject is the answer; another test's subject
+                // is sibling evidence, not the decision point.
+                if crate::engine::is_test(target_path, &target.name) {
+                    continue;
+                }
+                let overlap = prf_terms_in(&target.name)
+                    .iter()
+                    .filter(|term| query_terms.contains(term.as_str()))
+                    .count();
+                // `Calls` marks the subject the assertion runs through,
+                // but a spelling-resolved call can land on a same-named
+                // wrong entity — it breaks ties after extractor
+                // confidence, never above it.
+                let exercised = relations.iter().any(|relation| {
+                    relation.target_entity_id == target.id
+                        && matches!(relation.kind, RelationKind::Calls)
+                });
+                let degree = self
+                    .store()
+                    .entity_relation_degree(&search.request.snapshot_id, &target.id)
+                    .unwrap_or(1);
+                let confidence = best_edge
+                    .get(&target.id)
+                    .map_or(0.0, |relation| f64::from(relation.confidence));
+                scored.push((overlap, confidence, exercised, degree, target));
+            }
+            scored.sort_by(|left, right| {
+                right
+                    .0
+                    .cmp(&left.0)
+                    .then_with(|| right.1.total_cmp(&left.1))
+                    .then_with(|| right.2.cmp(&left.2))
+                    .then_with(|| right.3.cmp(&left.3))
+                    .then_with(|| left.4.name.cmp(&right.4.name))
+            });
+            let source_name = source
+                .symbol_name
+                .clone()
+                .unwrap_or_else(|| source.entity_id.clone());
+            for (_, _, _, _, target) in scored.into_iter().take(TARGETS_PER_SOURCE) {
+                let Some(relation) = best_edge.get(&target.id) else {
+                    continue;
+                };
+                let snippet = target
+                    .address
+                    .as_ref()
+                    .and_then(|address| self.store().source_text(address).ok())
+                    .filter(|text| !text.is_empty())
+                    .map_or_else(
+                        || {
+                            target
+                                .signature
+                                .clone()
+                                .or_else(|| target.qualified_name.clone())
+                                .unwrap_or_else(|| target.name.clone())
+                        },
+                        |text| truncate_chars(&text, 2_000),
+                    );
+                emitted_ids.insert(target.id.clone());
+                emitted.push((
+                    source_index,
+                    SearchHit {
+                        document_id: format!("subject:{}", target.id),
+                        entity_id: target.id.clone(),
+                        region_id: target.region_id.clone(),
+                        symbol_name: Some(target.name.clone()),
+                        representation: RetrievalRepresentation::RawCode,
+                        route: SearchRoute::Structural,
+                        rank: 0,
+                        score: tail_score,
+                        contributing_routes: vec![SearchRoute::Structural],
+                        address: target.address.clone(),
+                        evidence: relation.evidence.clone(),
+                        snippet,
+                        verified_current: source.verified_current,
+                        explanation: vec![format!(
+                            "evidence subject: {source_name} reaches it via {:?} ({:?}, confidence {:.2})",
+                            relation.kind, relation.origin, relation.confidence
+                        )],
+                    },
+                ));
+                if emitted.len() >= EMIT_MAX {
+                    break 'sources;
+                }
+            }
+        }
+        Ok(emitted)
+    }
+
     /// Pseudo-relevance feedback (RM3-style): treat the fused topical head
     /// as relevant, mine its discriminative terms, and run ONE extra FTS5
     /// query with the expanded text so vocabulary-mismatched documents in
@@ -3036,9 +3245,7 @@ mod tests {
     use cce_store::SnapshotRecords;
 
     // Test fixtures panic freely: an unmet precondition is a test bug.
-    fn store_with(records: &SnapshotRecords) -> (tempfile::TempDir, MetadataStore, String) {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let store = MetadataStore::open(directory.path()).expect("store");
+    fn commit_into(store: &MetadataStore, records: &SnapshotRecords) {
         store
             .register_repository(&cce_core::RepositoryIdentity {
                 id: "repo_test".to_owned(),
@@ -3060,7 +3267,22 @@ mod tests {
         store
             .commit_snapshot(&snapshot, records)
             .expect("commit records");
-        (directory, store, snapshot.id)
+    }
+
+    fn store_with(records: &SnapshotRecords) -> (tempfile::TempDir, MetadataStore, String) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        commit_into(&store, records);
+        (directory, store, "snap_test".to_owned())
+    }
+
+    /// An engine whose own store carries `records` — `subject_backlinks`
+    /// reads entities and relations through `engine.store()`.
+    fn engine_with(records: &SnapshotRecords) -> (tempfile::TempDir, CceEngine) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        commit_into(engine.store(), records);
+        (directory, engine)
     }
 
     fn file(path: &str) -> CodeEntity {
@@ -3181,6 +3403,263 @@ mod tests {
         let mut candidate = candidate(document_id, "src/nowhere.rs", fused_score);
         candidate.hit.address = None;
         candidate
+    }
+
+    /// A surfaced hit pointing at `entity_id` — the input shape
+    /// `subject_backlinks` reads.
+    fn hit(entity_id: &str, path: &str) -> SearchHit {
+        SearchHit {
+            document_id: format!("doc:{entity_id}"),
+            entity_id: entity_id.to_owned(),
+            region_id: Some(format!("region:{entity_id}")),
+            symbol_name: Some(entity_id.to_owned()),
+            representation: RetrievalRepresentation::RawCode,
+            route: SearchRoute::DenseRaw,
+            rank: 1,
+            score: 0.5,
+            contributing_routes: vec![SearchRoute::DenseRaw],
+            address: Some(
+                SourceAddress::new("repo_test", "snap_test", path, 0..1, 1..=1).expect("address"),
+            ),
+            evidence: Vec::new(),
+            snippet: String::new(),
+            verified_current: true,
+            explanation: Vec::new(),
+        }
+    }
+
+    fn search_result(routes: &[SearchRoute], hits: Vec<SearchHit>) -> SearchResult {
+        SearchResult {
+            request: SearchRequest {
+                repository_id: String::new(),
+                snapshot_id: "snap_test".to_owned(),
+                query: "where is snapshot freshness decided?".to_owned(),
+                intent: None,
+                limit: 10,
+                require_fresh: false,
+                routes: Vec::new(),
+                filters: cce_core::QueryFilters::default(),
+            },
+            plan: QueryPlan {
+                intent: QueryIntent::NaturalLanguageBehavior,
+                routes: routes.to_vec(),
+                graph_policy: GraphPolicy::Opportunistic,
+                required_views: Vec::new(),
+                reasons: Vec::new(),
+            },
+            manifest: ViewManifest {
+                repository_id: "repo_test".to_owned(),
+                snapshot_id: "snap_test".to_owned(),
+                views: std::collections::BTreeMap::new(),
+            },
+            hits,
+            missing_capabilities: Vec::new(),
+            verdict: SearchVerdict {
+                state: VerdictState::default(),
+                reasons: Vec::new(),
+                claim: ClaimFrame {
+                    intent: QueryIntent::NaturalLanguageBehavior,
+                    predicate: ClaimPredicate::Lookup,
+                    required_witness: WitnessRequirement::Any,
+                    subjects: Vec::new(),
+                    distinguishing_terms: Vec::new(),
+                },
+                witness: WitnessReport::default(),
+                evidence_tiers: EvidenceTiers::default(),
+            },
+            latency_ms: 0,
+        }
+    }
+
+    const SUBJECT_ROUTES: &[SearchRoute] = &[SearchRoute::Structural, SearchRoute::Lexical];
+
+    #[test]
+    fn backlink_pairs_test_evidence_with_the_function_it_calls() {
+        let evidence = symbol("asserts_freshness_semantics", "tests/freshness.rs");
+        let subject = symbol("decide_freshness", "src/freshness.rs");
+        let records = SnapshotRecords {
+            entities: vec![evidence.clone(), subject.clone()],
+            relations: vec![relation(&evidence.id, &subject.id, RelationKind::Calls)],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, engine) = engine_with(&records);
+        let mut unverified_hit = hit(&evidence.id, "tests/freshness.rs");
+        unverified_hit.verified_current = false;
+        let search = search_result(SUBJECT_ROUTES, vec![unverified_hit]);
+        let backlinks = engine.subject_backlinks(&search).expect("backlinks");
+        assert_eq!(backlinks.len(), 1);
+        let (index, backlink) = &backlinks[0];
+        // The returned index is the source hit's own position — the
+        // caller inserts the subject right after its pointer.
+        assert_eq!(*index, 0);
+        assert_eq!(backlink.entity_id, subject.id);
+        assert_eq!(backlink.route, SearchRoute::Structural);
+        assert!(!backlink.verified_current);
+        assert!(
+            backlink
+                .explanation
+                .iter()
+                .any(|line| line.contains("asserts_freshness_semantics"))
+        );
+    }
+
+    #[test]
+    fn backlink_index_marks_each_subject_after_its_own_source() {
+        let first = symbol("watches_committed", "tests/watch.rs");
+        let second = symbol("asserts_reuse", "tests/reuse.rs");
+        let first_subject = symbol("is_stale", "src/watch.rs");
+        let second_subject = symbol("resolve_index", "src/retrieval.rs");
+        let records = SnapshotRecords {
+            entities: vec![
+                first.clone(),
+                second.clone(),
+                first_subject.clone(),
+                second_subject.clone(),
+            ],
+            relations: vec![
+                relation(&first.id, &first_subject.id, RelationKind::Calls),
+                relation(&second.id, &second_subject.id, RelationKind::Calls),
+            ],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, engine) = engine_with(&records);
+        let search = search_result(
+            SUBJECT_ROUTES,
+            vec![
+                hit(&first.id, "tests/watch.rs"),
+                hit(&second.id, "tests/reuse.rs"),
+            ],
+        );
+        let backlinks = engine.subject_backlinks(&search).expect("backlinks");
+        let pairs: Vec<(usize, &str)> = backlinks
+            .iter()
+            .map(|(index, backlink)| (*index, backlink.entity_id.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (0, first_subject.id.as_str()),
+                (1, second_subject.id.as_str())
+            ]
+        );
+    }
+
+    #[test]
+    fn backlink_skips_plans_without_the_structural_route() {
+        let evidence = symbol("asserts_freshness_semantics", "tests/freshness.rs");
+        let subject = symbol("decide_freshness", "src/freshness.rs");
+        let records = SnapshotRecords {
+            entities: vec![evidence.clone(), subject.clone()],
+            relations: vec![relation(&evidence.id, &subject.id, RelationKind::Calls)],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, engine) = engine_with(&records);
+        let search = search_result(
+            &[SearchRoute::Lexical],
+            vec![hit(&evidence.id, "tests/freshness.rs")],
+        );
+        assert!(
+            engine
+                .subject_backlinks(&search)
+                .expect("backlinks")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn backlink_never_repeats_an_already_surfaced_entity() {
+        let evidence = symbol("asserts_freshness_semantics", "tests/freshness.rs");
+        let subject = symbol("decide_freshness", "src/freshness.rs");
+        let records = SnapshotRecords {
+            entities: vec![evidence.clone(), subject.clone()],
+            relations: vec![relation(&evidence.id, &subject.id, RelationKind::Calls)],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, engine) = engine_with(&records);
+        let search = search_result(
+            SUBJECT_ROUTES,
+            vec![
+                hit(&evidence.id, "tests/freshness.rs"),
+                hit(&subject.id, "src/freshness.rs"),
+            ],
+        );
+        assert!(
+            engine
+                .subject_backlinks(&search)
+                .expect("backlinks")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn backlink_skips_subjects_that_are_themselves_tests() {
+        let evidence = symbol("asserts_freshness_semantics", "tests/freshness.rs");
+        let helper = symbol("freshness_helper", "tests/helpers.rs");
+        let records = SnapshotRecords {
+            entities: vec![evidence.clone(), helper.clone()],
+            relations: vec![relation(&evidence.id, &helper.id, RelationKind::Calls)],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, engine) = engine_with(&records);
+        let search = search_result(
+            SUBJECT_ROUTES,
+            vec![hit(&evidence.id, "tests/freshness.rs")],
+        );
+        assert!(
+            engine
+                .subject_backlinks(&search)
+                .expect("backlinks")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn backlink_prefers_confident_relation_over_a_weaker_call() {
+        let evidence = symbol("asserts_freshness_semantics", "tests/freshness.rs");
+        let called = symbol("incidental_helper", "src/util.rs");
+        let referenced = symbol("freshness", "src/freshness.rs");
+        let mut weak_call = relation(&evidence.id, &called.id, RelationKind::Calls);
+        weak_call.confidence = 0.3;
+        let records = SnapshotRecords {
+            entities: vec![evidence.clone(), called, referenced.clone()],
+            relations: vec![
+                weak_call,
+                relation(&evidence.id, &referenced.id, RelationKind::References),
+            ],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, engine) = engine_with(&records);
+        let search = search_result(
+            SUBJECT_ROUTES,
+            vec![hit(&evidence.id, "tests/freshness.rs")],
+        );
+        let backlinks = engine.subject_backlinks(&search).expect("backlinks");
+        assert_eq!(backlinks.len(), 1);
+        // `referenced` wins twice over — the query names it and its edge
+        // is extractor-confident — but confidence alone must already
+        // outrank the ambiguous spelling-resolved call.
+        assert_eq!(backlinks[0].1.entity_id, referenced.id);
+    }
+
+    #[test]
+    fn backlink_ignores_hits_without_a_source_address() {
+        let evidence = symbol("asserts_freshness_semantics", "tests/freshness.rs");
+        let subject = symbol("decide_freshness", "src/freshness.rs");
+        let records = SnapshotRecords {
+            entities: vec![evidence.clone(), subject.clone()],
+            relations: vec![relation(&evidence.id, &subject.id, RelationKind::Calls)],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, engine) = engine_with(&records);
+        let mut pathless = hit(&evidence.id, "tests/freshness.rs");
+        pathless.address = None;
+        let search = search_result(SUBJECT_ROUTES, vec![pathless]);
+        assert!(
+            engine
+                .subject_backlinks(&search)
+                .expect("backlinks")
+                .is_empty()
+        );
     }
 
     #[test]

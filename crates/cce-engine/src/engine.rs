@@ -1031,7 +1031,7 @@ impl CceEngine {
                             entity_id: unit_id.clone(),
                             region_id: Some(doc_region_id),
                             snapshot_id: scanned.snapshot.id.clone(),
-                            representation: if is_test(file, &unit.name) {
+                            representation: if is_test(&file.relative_path, &unit.name) {
                                 RetrievalRepresentation::TestBehavior
                             } else {
                                 RetrievalRepresentation::RawCode
@@ -2218,8 +2218,8 @@ fn leading_doc_comment(file_text: &str, start_line: u32) -> Option<String> {
     (!doc.is_empty()).then_some(doc)
 }
 
-fn is_test(file: &ScannedFile, name: &str) -> bool {
-    let path = file.relative_path.to_ascii_lowercase();
+pub(crate) fn is_test(path: &str, name: &str) -> bool {
+    let path = path.to_ascii_lowercase();
     let name = name.to_ascii_lowercase();
     path.contains("test")
         || path.contains("spec")

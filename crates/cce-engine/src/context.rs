@@ -178,7 +178,7 @@ impl CceEngine {
     /// # Errors
     /// Propagates search/storage errors.
     pub async fn context(&self, request: ContextRequest) -> Result<ContextPack> {
-        let search = self
+        let mut search = self
             .search(SearchRequest {
                 repository_id: String::new(),
                 snapshot_id: String::new(),
@@ -190,6 +190,19 @@ impl CceEngine {
                 filters: cce_core::QueryFilters::default(),
             })
             .await?;
+        // Delivery-granularity decision (not retrieval): the surfaced
+        // evidence points at its subject — a top test calls the function
+        // that decides the queried behavior. Each backlink lands right
+        // after its pointer so the packer's caller quota delivers the
+        // pointed-at code beside the evidence.
+        let mut backlinks = self.subject_backlinks(&search)?;
+        backlinks.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+        for (index, hit) in backlinks {
+            search.hits.insert((index + 1).min(search.hits.len()), hit);
+        }
+        for (rank, hit) in search.hits.iter_mut().enumerate() {
+            hit.rank = rank + 1;
+        }
         let mut pack = ContextPacker::new().pack(&search, request.budget_tokens);
         pack.latency_ms = search.latency_ms;
         Ok(pack)
