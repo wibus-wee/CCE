@@ -37,5 +37,7 @@ commit).
 
 ## Status
 
-IN PROGRESS — modules spawned; wiring lands in `main.rs`/`fanout.rs`
-after module review.
+DONE — `45a748f` (breaker + bounded upstream + singleflight), `7bcb83c`
+(metrics). Live-verified: circuit opens after 3 failures and fast-fails
+in <1ms; 8 concurrent identical queries coalesce to 1 upstream call;
+`/metrics` and `/v1/metrics` serve typed series incl. breaker states.

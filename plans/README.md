@@ -30,7 +30,7 @@ atlas correctness bug found during the audit.
 | 008 | Evidence paths: principled abstention + fact-granularity emission | P1 | L | 007 | TODO |
 | 009 | World-model surface: structural operators, source→sink dataflow, federation | P2 | L | 008 | TODO |
 | 010 | Gateway infra: reliability, ingest perf, /v1/search/all fan-out, push parallelism | P1 | M | — (parallel to algorithm track; owns apps/gateway + apps/push) | DONE (all 4 tracks landed; live-verified stub+dead-repo fan-out) |
-| 011 | Infra resilience: metrics, circuit breaker, backpressure, singleflight, loadtest | P1 | M | 010 | IN PROGRESS |
+| 011 | Infra resilience: metrics, circuit breaker, backpressure, singleflight, loadtest | P1 | M | 010 | DONE (`45a748f`, `7bcb83c`; live-verified breaker fast-fail + 8→1 singleflight + metrics series) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
