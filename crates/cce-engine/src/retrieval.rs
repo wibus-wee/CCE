@@ -68,6 +68,13 @@ pub struct SearchResult {
 struct Candidate {
     hit: SearchHit,
     fused_score: f64,
+    /// Admitted by at least one strict-tier pass — a literal match on the
+    /// query's own terms (exact symbol, first-pass lexical, knowledge /
+    /// history / diff FTS matches). Dense similarity, structural and flow
+    /// expansion, and PRF-expanded vocabulary are inferred vicinity: they
+    /// rerank real evidence but never constitute it on their own — the
+    /// distinction the abstention gate reads.
+    strict: bool,
 }
 
 /// Where graph expansion went, recorded beside the candidate map on
@@ -212,6 +219,45 @@ impl CceEngine {
                     .to_owned(),
             );
         }
+        // Evidence gate, literal side: every anchor the query states
+        // verbatim — a backticked spelling, or an identifier-shaped or
+        // sole-anchor entity token — is checked for corpus presence. When
+        // ALL of them are absent the query names things that provably do
+        // not exist in this snapshot: no route can legitimately answer,
+        // and inferred-vicinity machinery (dense, expansion, flow) must
+        // not be given the chance to fabricate plausible support.
+        let anchors = literal_anchors(&request.query);
+        if !anchors.is_empty() {
+            let mut absent = Vec::new();
+            for anchor in &anchors {
+                if self
+                    .store()
+                    .term_document_frequency(&request.snapshot_id, anchor)?
+                    == 0
+                {
+                    absent.push(anchor.as_str());
+                }
+            }
+            if absent.len() == anchors.len() {
+                missing_capabilities.push(format!(
+                    "abstained: literal query term{} {} absent from the corpus — the named entity does not exist in this snapshot",
+                    if absent.len() == 1 { "" } else { "s" },
+                    absent
+                        .iter()
+                        .map(|anchor| format!("`{anchor}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                return Ok(SearchResult {
+                    request,
+                    plan,
+                    manifest,
+                    hits: Vec::new(),
+                    missing_capabilities,
+                    latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                });
+            }
+        }
         let mut candidates = HashMap::<String, Candidate>::new();
 
         if plan.routes.contains(&SearchRoute::ExactSymbol) {
@@ -253,6 +299,7 @@ impl CceEngine {
                             explanation: vec!["exact symbol or qualified-name match".to_owned()],
                         },
                         2.0 / (RRF_K + rank as f64),
+                        true,
                     );
                     rank += 1;
                 }
@@ -308,6 +355,7 @@ impl CceEngine {
                         },
                     },
                     1.0 / (RRF_K + rank as f64),
+                    true,
                 );
             }
         }
@@ -365,6 +413,7 @@ impl CceEngine {
                         )],
                     },
                     1.25 / (RRF_K + rank as f64),
+                    true,
                 );
             }
         }
@@ -389,6 +438,7 @@ impl CceEngine {
                     &mut candidates,
                     SearchHit { rank, ..hit },
                     1.0 / (RRF_K + rank as f64),
+                    true,
                 );
             }
         }
@@ -463,6 +513,7 @@ impl CceEngine {
                                 },
                                 representation_weight(&document.representation)
                                     / (RRF_K + rank as f64),
+                                false,
                             );
                         }
                     }
@@ -582,6 +633,7 @@ impl CceEngine {
                                 )],
                             },
                             propagated / (RRF_K + rank as f64),
+                            false,
                         );
                         next.push((entity.id, propagated));
                         rank += 1;
@@ -639,6 +691,19 @@ impl CceEngine {
             verified_fresh,
             request.limit,
         )?;
+
+        // Evidence gate, inferred side: a candidate whose only support is
+        // inferred vicinity — dense similarity, structural expansion,
+        // PRF-borrowed vocabulary, flow mass — may rerank real evidence
+        // but can never constitute it. A list with no strict-tier
+        // candidate is not an answer, however confident the propagation.
+        if !candidates.is_empty() && !candidates.values().any(|candidate| candidate.strict) {
+            candidates.clear();
+            missing_capabilities.push(
+                "abstained: every candidate rests on inferred vicinity (dense/expansion/PRF/flow) with no literal query-term evidence"
+                    .to_owned(),
+            );
+        }
 
         let mut hits = self.select_hits(&request, &candidates)?;
 
@@ -900,6 +965,7 @@ impl CceEngine {
                     },
                 },
                 PRF_ATTENUATION / (RRF_K + rank as f64),
+                false,
             );
         }
         Ok(())
@@ -1603,8 +1669,17 @@ fn apply_graph_flow(
     // symbol token — without it the named lane silently narrows versus
     // the join it replaces (v7: set_view_status lost on "views").
     let mut tolerant_terms = query_terms.clone();
+    // Literal spellings are exempt: a backticked or identifier-shaped
+    // anchor states an exact name, and singularizing a pluralized
+    // near-miss back into the real identifier is exactly how near-miss
+    // lookups resurrect the real entity. Exemption is judged in
+    // prf-term space, so anchors are split before comparison.
+    let literal_terms: std::collections::HashSet<String> = literal_anchors(query)
+        .iter()
+        .flat_map(|token| cce_core::split_identifier_terms(token))
+        .collect();
     for term in &query_terms {
-        if term.len() > 3 && term.ends_with('s') {
+        if term.len() > 3 && term.ends_with('s') && !literal_terms.contains(term) {
             tolerant_terms.insert(term[..term.len() - 1].to_owned());
         }
     }
@@ -1725,6 +1800,7 @@ fn apply_graph_flow(
                 )],
             },
             mass_hit,
+            false,
         );
     }
     Ok(())
@@ -1758,11 +1834,17 @@ fn file_entity(store: &MetadataStore, snapshot_id: &str, path: &str) -> Result<O
         .find(|entity| entity.kind == EntityKind::File))
 }
 
-fn add_candidate(candidates: &mut HashMap<String, Candidate>, hit: SearchHit, contribution: f64) {
+fn add_candidate(
+    candidates: &mut HashMap<String, Candidate>,
+    hit: SearchHit,
+    contribution: f64,
+    strict: bool,
+) {
     candidates
         .entry(hit.document_id.clone())
         .and_modify(|candidate| {
             candidate.fused_score += contribution;
+            candidate.strict |= strict;
             for route in &hit.contributing_routes {
                 if !candidate.hit.contributing_routes.contains(route) {
                     candidate.hit.contributing_routes.push(*route);
@@ -1776,6 +1858,7 @@ fn add_candidate(candidates: &mut HashMap<String, Candidate>, hit: SearchHit, co
         .or_insert(Candidate {
             hit,
             fused_score: contribution,
+            strict,
         });
 }
 
@@ -1929,6 +2012,95 @@ fn is_identifier_like(token: &str) -> bool {
         || token
             .chars()
             .any(|character| character.is_ascii_uppercase())
+}
+
+/// Entity-name shape: capitals, qualifiers, or underscores — the markers
+/// that distinguish a named thing from a plain word. A bare dot or digit
+/// run does not qualify (`18.04`, `config.toml` are values, not entity
+/// names) unless the token anchors the query on its own.
+fn is_name_shaped(token: &str) -> bool {
+    token.contains('_')
+        || token.contains("::")
+        || token
+            .chars()
+            .any(|character| character.is_ascii_uppercase())
+}
+
+/// Tokens the writer spelled verbatim inside backticks — explicit
+/// literals. A backticked spelling must never be normalized (no plural
+/// tolerance, no case folding of intent): a backticked pluralized
+/// near-miss asks about exactly that spelling, not its real stem.
+fn backtick_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut rest = query;
+    while let Some(open) = rest.find('`') {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('`') else {
+            break;
+        };
+        for token in rest[..close]
+            .split(|character: char| {
+                !(character.is_alphanumeric()
+                    || character == '_'
+                    || character == ':'
+                    || character == '.')
+            })
+            .map(|token| token.trim_matches('.'))
+        {
+            if token.chars().count() >= 3 && token.chars().any(char::is_alphanumeric) {
+                terms.push(token.to_owned());
+            }
+        }
+        rest = &rest[close + 1..];
+    }
+    terms
+}
+
+/// True when a token could be an entity spelling rather than a value:
+/// all alphabetic/underscore, or carrying identifier shape (capitals,
+/// `::`, `_`). `18.04` and `config.toml` fail both — dotted values are
+/// never provable-absence anchors.
+fn is_entity_spelling(token: &str) -> bool {
+    token
+        .chars()
+        .all(|character| character.is_alphabetic() || character == '_')
+        || is_name_shaped(token)
+}
+
+/// Literal anchors the abstention gate may check for corpus presence:
+/// backticked spellings that could name an entity, plus `entity_tokens`
+/// output that is either the query's only anchor or name-shaped.
+///
+/// Exclusions keep the veto honest:
+/// * CJK tokens — monolithic indexing makes absence unprovable (a phrase
+///   fragment may index inside a longer token), so CJK never vetoes;
+/// * `18.04`/`config.toml`-style values — dotted or numeric tokens are
+///   not entity spellings and never veto, even as the query's sole
+///   anchor; the retrieval cascade already returns empty for them,
+///   which is the honest no-context signal;
+/// * tokens without any alphanumeric, which would emit an empty FTS
+///   phrase.
+fn literal_anchors(query: &str) -> Vec<String> {
+    let entity = entity_tokens(query)
+        .into_iter()
+        .filter(|token| !token.chars().any(has_cjk))
+        .filter(|token| token.chars().any(char::is_alphanumeric))
+        .collect::<Vec<_>>();
+    let mut anchors: Vec<String> = backtick_terms(query)
+        .into_iter()
+        .filter(|token| !token.chars().any(has_cjk))
+        .filter(|token| is_entity_spelling(token))
+        .collect();
+    let sole_anchor = entity.len() == 1;
+    for token in entity {
+        if is_entity_spelling(&token)
+            && (sole_anchor || is_name_shaped(&token))
+            && !anchors.contains(&token)
+        {
+            anchors.push(token);
+        }
+    }
+    anchors
 }
 
 /// Curated CJK→English glossary for the lexical route. Source vocabulary
@@ -2232,6 +2404,7 @@ mod tests {
                 explanation: Vec::new(),
             },
             fused_score,
+            strict: true,
         }
     }
 
@@ -2360,9 +2533,6 @@ mod tests {
         );
         assert_eq!(count_of("src/b.rs"), 1);
     }
-
-
-
 
     #[test]
     fn graph_flow_emits_called_mechanism_and_corroborates() {
@@ -2652,7 +2822,6 @@ mod tests {
         assert!(candidates.is_empty());
     }
 
-
     fn file_touched(path: &str, last_touched: i64) -> CodeEntity {
         let mut entity = file(path);
         entity.attributes =
@@ -2803,6 +2972,121 @@ mod tests {
         }
     }
 
+    /// Mutate a real spelling the way the perturbation trap families do.
+    /// The near-miss literals must never appear in source: a verbatim
+    /// trap spelling in committed code indexes into the corpus and
+    /// falsifies the "provably absent" claim the veto relies on — the
+    /// self-dogfood benchmark would then be testing a contaminated
+    /// index.
+    fn pluralized(name: &str) -> String {
+        format!("{name}s")
+    }
+    fn swapped_last(name: &str) -> String {
+        let mut chars: Vec<char> = name.chars().collect();
+        let last = chars.len() - 1;
+        chars.swap(last - 1, last);
+        chars.into_iter().collect()
+    }
+    fn truncated(name: &str) -> String {
+        name.chars().take(name.chars().count() - 1).collect()
+    }
+
+    #[test]
+    fn backtick_terms_extract_verbatim_spans() {
+        assert_eq!(
+            backtick_terms("Where is `SourceAddress` defined?"),
+            ["SourceAddress"]
+        );
+        // Multiple spans each yield their token; `:` is preserved
+        // inside qualified names.
+        assert_eq!(
+            backtick_terms("how `SourceAddress` and `std::fmt` interact"),
+            ["SourceAddress", "std::fmt"]
+        );
+        // Unterminated spans and short tokens are ignored.
+        assert!(backtick_terms("a `dangling span").is_empty());
+        assert!(backtick_terms("`ok`").is_empty());
+    }
+
+    #[test]
+    fn literal_anchors_cover_verbatim_and_name_shaped() {
+        // The trap families: backticked near-miss spellings are anchors
+        // whether or not they look like identifiers.
+        let misspelled = pluralized("SourceAddress");
+        assert_eq!(
+            literal_anchors(&format!("Where is `{misspelled}` defined?")),
+            [misspelled]
+        );
+        let misspelled = pluralized("search");
+        assert_eq!(
+            literal_anchors(&format!("Where is `{misspelled}` defined?")),
+            [misspelled]
+        );
+        // Name-shaped tokens anchor even without backticks.
+        let misspelled = pluralized("IndexLease");
+        assert_eq!(
+            literal_anchors(&format!("Where is {misspelled} defined?")),
+            [misspelled]
+        );
+        // A sole all-alpha anchor is still checkable.
+        let misspelled = pluralized("search");
+        assert_eq!(literal_anchors(&misspelled), [misspelled]);
+    }
+
+    #[test]
+    fn literal_anchors_skip_values_and_cjk() {
+        // Backticked values are not entity spellings: versions, paths,
+        // and dotted names never veto.
+        assert!(literal_anchors("the `18.04` image fails on pytest").is_empty());
+        // A sole dotted value is a retrieval matter, not a veto.
+        assert!(literal_anchors("Where is config.toml defined?").is_empty());
+        // CJK tokens never anchor a veto — monolithic indexing cannot
+        // prove their absence.
+        assert!(literal_anchors("快照在哪里定义").is_empty());
+        assert!(literal_anchors("`快照`在哪定义").is_empty());
+        // ...but a Latin anchor in a code-switched query still vetoes.
+        let misspelled = swapped_last("ViewStatus");
+        assert_eq!(
+            literal_anchors(&format!("{misspelled} 在哪定义")),
+            [misspelled]
+        );
+        // Punctuation-only tokens cannot emit an FTS phrase.
+        assert!(literal_anchors("where is ::: defined").is_empty());
+    }
+
+    #[test]
+    fn add_candidate_strict_survives_merging() {
+        // A weak-first admission must not lock a document into weakness:
+        // once any strict pass claims it the flag flips, and later weak
+        // contributions must not dilute it back — the gate reads "at
+        // least one strict route ever admitted this document".
+        let mut candidates = HashMap::new();
+        add_candidate(
+            &mut candidates,
+            candidate("doc", "src/a.rs", 0.5).hit,
+            0.5,
+            false,
+        );
+        assert!(!candidates["doc"].strict);
+        add_candidate(
+            &mut candidates,
+            candidate("doc", "src/a.rs", 0.3).hit,
+            0.3,
+            true,
+        );
+        assert!(candidates["doc"].strict);
+        add_candidate(
+            &mut candidates,
+            candidate("doc", "src/a.rs", 0.1).hit,
+            0.1,
+            false,
+        );
+        assert!(
+            candidates["doc"].strict,
+            "weak contributions merge into a strict document without diluting it"
+        );
+    }
+
     #[test]
     fn root_package_claims_only_unowned_files() {
         let packages = vec![
@@ -2922,6 +3206,7 @@ mod tests {
                 explanation: Vec::new(),
             },
             fused_score: score,
+            strict: true,
         }
     }
 
@@ -3188,6 +3473,91 @@ mod tests {
         assert!(
             !paths.contains(&"src/unrelated.rs"),
             "unrelated vocabulary must stay unfound: {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_abstains_on_provably_absent_literal() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        let anchor = RepositoryScanner::new(engine.config().clone())
+            .identify()
+            .expect("anchor");
+        engine
+            .store()
+            .register_repository(&anchor.identity)
+            .expect("register repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_veto".to_owned(),
+            repository_id: anchor.identity.id.clone(),
+            base_revision: None,
+            workspace_overlay_hash: String::new(),
+            index_profile_hash: String::new(),
+            created_at: chrono::Utc::now(),
+            file_count: 1,
+            source_bytes: 0,
+        };
+        engine
+            .store()
+            .begin_snapshot(&snapshot)
+            .expect("begin snapshot");
+        let (view_doc, view_artifact) = indexed_document(
+            engine.store(),
+            "doc:viewstatus",
+            "file:src/view_status.rs",
+            "src/view_status.rs",
+            "ViewStatus",
+            "pub struct ViewStatus { stale: bool } // where staleness is defined",
+        );
+        let records = SnapshotRecords {
+            artifacts: vec![view_artifact],
+            entities: vec![file("src/view_status.rs")],
+            documents: vec![view_doc],
+            ..SnapshotRecords::default()
+        };
+        engine
+            .store()
+            .commit_snapshot(&snapshot, &records)
+            .expect("commit records");
+
+        // The perturbation trap families — pluralized, swapped,
+        // doubled, and truncated spellings of a real entity — are all
+        // provably absent and must abstain rather than answer with the
+        // near-miss's neighbor.
+        for trap in [
+            swapped_last("ViewStatus"),
+            pluralized("ViewStatus"),
+            truncated("ViewStatus"),
+            pluralized("search"),
+        ] {
+            let result = engine
+                .search(request(&format!("Where is `{trap}` defined?"), 10))
+                .await
+                .expect("search");
+            assert!(
+                result.hits.is_empty(),
+                "`{trap}` is provably absent — hits must be empty: {:?}",
+                result.hits
+            );
+            assert!(
+                result
+                    .missing_capabilities
+                    .iter()
+                    .any(|note| note.contains("abstained")),
+                "`{trap}` abstention must be explained in missing capabilities"
+            );
+        }
+
+        // Control: the real entity answers normally — the veto must not
+        // over-fire on a spelling that IS in the corpus.
+        let result = engine
+            .search(request("Where is `ViewStatus` defined?", 10))
+            .await
+            .expect("search");
+        assert!(
+            !result.hits.is_empty(),
+            "the real entity must still answer: {:?}",
+            result.missing_capabilities
         );
     }
 

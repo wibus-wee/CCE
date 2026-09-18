@@ -1125,6 +1125,34 @@ impl MetadataStore {
             .collect())
     }
 
+    /// Exact-match document frequency of one query term — how many
+    /// retrieval documents carry the term verbatim. The engine's
+    /// literal-evidence veto reads this to prove a named thing absent:
+    /// a term the query states verbatim that no document contains cannot
+    /// be answered for, and expansion machinery must not fabricate
+    /// vicinity for it.
+    ///
+    /// Deliberately exact, not prefix: `ViewStats` must not match
+    /// `ViewStatus` — a near-miss spelling is precisely the case the
+    /// veto exists to catch. The term is double-quoted, the same
+    /// convention as the lexical cascade, so `::`/`.`-bearing tokens
+    /// stay phrase-semantic. A term with no alphanumeric would emit an
+    /// empty FTS phrase; callers filter those upstream.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn term_document_frequency(&self, snapshot_id: &str, term: &str) -> Result<i64> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT count(*) FROM documents_fts
+                 WHERE documents_fts MATCH ?1 AND snapshot_id=?2",
+                rusqlite::params![format!("\"{term}\""), snapshot_id],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)
+    }
+
     /// Exact-name entity lookup, optionally filtered to a path prefix.
     ///
     /// # Errors
@@ -2276,5 +2304,116 @@ mod tests {
         assert_eq!(hits.len(), 13);
         assert!(ids.contains(&"doc:12"));
         assert!(!ids.contains(&"doc:13"));
+    }
+
+    #[test]
+    fn term_document_frequency_is_exact_not_prefix() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        store
+            .register_repository(&RepositoryIdentity {
+                id: "repo_t".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            })
+            .expect("repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_t".to_owned(),
+            repository_id: "repo_t".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        store.begin_snapshot(&snapshot).expect("begin snapshot");
+        let records = SnapshotRecords {
+            artifacts: vec![ArtifactRecord {
+                digest: "digest:0".to_owned(),
+                kind: crate::ArtifactKind::Source,
+                size_bytes: 40,
+                relative_path: "artifacts/0".to_owned(),
+            }],
+            entities: vec![CodeEntity {
+                id: "entity:0".to_owned(),
+                kind: cce_core::EntityKind::Function,
+                name: "ViewStatus".to_owned(),
+                qualified_name: None,
+                signature: None,
+                language: None,
+                region_id: None,
+                address: None,
+                capabilities: Vec::new(),
+                attributes: serde_json::Map::new(),
+            }],
+            documents: vec![IndexedDocument {
+                document: RetrievalDocument {
+                    id: "doc:0".to_owned(),
+                    entity_id: "entity:0".to_owned(),
+                    snapshot_id: "snap_t".to_owned(),
+                    representation: RetrievalRepresentation::RawCode,
+                    body_artifact_digest: "digest:0".to_owned(),
+                    region_id: None,
+                    address: None,
+                    embedding_profile: None,
+                    generated_by: None,
+                    evidence: Vec::new(),
+                    terms: Vec::new(),
+                },
+                path: "src/view_status.rs".to_owned(),
+                name: "ViewStatus".to_owned(),
+                body: "pub struct ViewStatus; fn search() {}".to_owned(),
+            }],
+            ..SnapshotRecords::default()
+        };
+        store.commit_snapshot(&snapshot, &records).expect("commit");
+
+        // Present spellings count their documents; near-miss spellings
+        // are the trap shapes the abstention veto exists to prove absent
+        // — a truncated variant must not ride the real prefix, and a
+        // pluralized near-miss must not ride its real stem. The fakes
+        // are built by mutating the real names so the trap literals
+        // never appear in this file: a verbatim trap spelling in
+        // committed source indexes into the corpus and falsifies the
+        // "provably absent" claim every self-dogfood index relies on.
+        assert_eq!(
+            store
+                .term_document_frequency("snap_t", "ViewStatus")
+                .expect("df"),
+            1
+        );
+        assert_eq!(
+            store
+                .term_document_frequency("snap_t", "viewstatus")
+                .expect("df"),
+            1,
+            "unicode61 folding makes the check case-insensitive"
+        );
+        let swap_last = |name: &str| -> String {
+            let mut chars: Vec<char> = name.chars().collect();
+            let last = chars.len() - 1;
+            chars.swap(last - 1, last);
+            chars.into_iter().collect()
+        };
+        let pluralized = |name: &str| format!("{name}s");
+        let truncated = |name: &str| -> String {
+            name.chars().take(name.chars().count() - 1).collect()
+        };
+        for absent in [
+            swap_last("ViewStatus"),
+            pluralized("ViewStatus"),
+            truncated("ViewStatus"),
+            pluralized("search"),
+            "nosuch".to_owned(),
+        ] {
+            assert_eq!(
+                store
+                    .term_document_frequency("snap_t", &absent)
+                    .expect("df"),
+                0,
+                "{absent} is provably absent"
+            );
+        }
     }
 }
