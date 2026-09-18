@@ -29,7 +29,7 @@ atlas correctness bug found during the audit.
 | 007 | Graph-flow parity: replace legacy ranking priors | P1 | L | — | DONE (v7: both lanes GATE PASS; priors deleted, flow unconditional) |
 | 008 | Evidence paths: principled abstention + fact-granularity emission | P1 | L | 007 | TODO |
 | 009 | World-model surface: structural operators, source→sink dataflow, federation | P2 | L | 008 | TODO |
-| 010 | Gateway infra: reliability, ingest perf, /v1/search/all fan-out, push parallelism | P1 | M | — (parallel to algorithm track; owns apps/gateway + apps/push) | IN PROGRESS |
+| 010 | Gateway infra: reliability, ingest perf, /v1/search/all fan-out, push parallelism | P1 | M | — (parallel to algorithm track; owns apps/gateway + apps/push) | DONE (all 4 tracks landed; live-verified stub+dead-repo fan-out) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
