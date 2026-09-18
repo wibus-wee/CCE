@@ -1,7 +1,7 @@
 use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicUsize},
     time::Duration,
 };
 
@@ -183,11 +183,82 @@ pub struct StoreHealth {
     pub artifact_scan_error: Option<String>,
 }
 
+/// Read connections alongside the writer — WAL permits any number of
+/// readers next to one serialized writer, so search traffic fans out
+/// instead of queueing on a single connection mutex.
+const READ_POOL_SIZE: usize = 4;
+
+/// Connection pool keyed to WAL's concurrency model. `lock()` returns
+/// the serialized WRITER — every legacy `self.connection.read()` call
+/// site keeps its exact semantics (multi-statement transactions stay
+/// per-method on one connection). `read()` hands out a round-robin
+/// READ-ONLY connection (`PRAGMA query_only`) — a write reaching it
+/// fails loudly instead of silently running on the wrong connection.
+struct ConnectionPool {
+    writer: Mutex<Connection>,
+    readers: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
+}
+
+impl ConnectionPool {
+    fn open(
+        database_path: &Path,
+        reader_count: usize,
+        configure: impl Fn(&Connection) -> Result<()>,
+    ) -> Result<Self> {
+        let writer = Connection::open(database_path)
+            .map_err(|error| CceError::Storage(error.to_string()))?;
+        writer
+            .busy_timeout(Duration::from_secs(10))
+            .map_err(|error| CceError::Storage(error.to_string()))?;
+        configure(&writer)?;
+        let mut readers = Vec::with_capacity(reader_count);
+        for _ in 0..reader_count {
+            let reader = Connection::open(database_path)
+                .map_err(|error| CceError::Storage(error.to_string()))?;
+            reader
+                .busy_timeout(Duration::from_secs(10))
+                .map_err(|error| CceError::Storage(error.to_string()))?;
+            reader
+                .execute_batch(
+                    "PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY; PRAGMA query_only=ON;",
+                )
+                .map_err(|error| CceError::Storage(error.to_string()))?;
+            readers.push(Mutex::new(reader));
+        }
+        Ok(Self {
+            writer: Mutex::new(writer),
+            readers,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    /// The serialized writer — same guard the single-connection store
+    /// handed every caller before pooling.
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.writer.lock()
+    }
+
+    /// A read-only pooled connection for provably-read-only paths.
+    /// Falls back to the writer if the pool is somehow empty — correct,
+    /// just serialized.
+    fn read(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        if self.readers.is_empty() {
+            return self.writer.lock();
+        }
+        let index =
+            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.readers.len();
+        self.readers
+            .get(index)
+            .map_or_else(|| self.writer.lock(), Mutex::lock)
+    }
+}
+
 /// The canonical metadata store: one `SQLite` database (entities, relations,
 /// FTS, view status) plus the content-addressed artifact store.
 #[derive(Clone)]
 pub struct MetadataStore {
-    connection: Arc<Mutex<Connection>>,
+    connection: Arc<ConnectionPool>,
     artifacts: ArtifactStore,
     database_path: PathBuf,
 }
@@ -216,17 +287,15 @@ impl MetadataStore {
         let data_root = data_root.as_ref();
         std::fs::create_dir_all(data_root).map_err(|error| CceError::io(data_root, error))?;
         let database_path = data_root.join("metadata.sqlite");
-        let connection = Connection::open(&database_path)
-            .map_err(|error| CceError::Storage(error.to_string()))?;
-        connection
-            .busy_timeout(Duration::from_secs(10))
-            .map_err(|error| CceError::Storage(error.to_string()))?;
-        connection
-            .execute_batch(
-                "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;",
-            )
-            .map_err(|error| CceError::Storage(error.to_string()))?;
-        let version: u32 = connection
+        let pool = ConnectionPool::open(&database_path, READ_POOL_SIZE, |connection| {
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;",
+                )
+                .map_err(|error| CceError::Storage(error.to_string()))
+        })?;
+        let version: u32 = pool
+            .lock()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(storage_error)?;
         if version > 4 {
@@ -236,28 +305,28 @@ impl MetadataStore {
             });
         }
         if version == 0 {
-            connection
+            pool.lock()
                 .execute_batch(include_str!("migrations/0001_initial.sql"))
                 .map_err(|error| CceError::Storage(format!("migration 1 failed: {error}")))?;
         }
         if version < 2 {
-            connection
+            pool.lock()
                 .execute_batch(include_str!("migrations/0002_parse_cache.sql"))
                 .map_err(|error| CceError::Storage(format!("migration 2 failed: {error}")))?;
         }
         if version < 3 {
-            connection
+            pool.lock()
                 .execute_batch(include_str!("migrations/0003_scan_cache.sql"))
                 .map_err(|error| CceError::Storage(format!("migration 3 failed: {error}")))?;
         }
         if version < 4 {
-            connection
+            pool.lock()
                 .execute_batch(include_str!("migrations/0004_regions.sql"))
                 .map_err(|error| CceError::Storage(format!("migration 4 failed: {error}")))?;
         }
         let artifacts = ArtifactStore::open(data_root)?;
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            connection: Arc::new(pool),
             artifacts,
             database_path,
         })
@@ -298,7 +367,7 @@ impl MetadataStore {
     /// # Errors
     /// Storage error if the checks themselves cannot run.
     pub fn health(&self) -> Result<StoreHealth> {
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let messages = match connection.prepare("PRAGMA quick_check") {
             Ok(mut statement) => match statement.query_map([], |row| row.get::<_, String>(0)) {
                 Ok(rows) => rows
@@ -622,7 +691,7 @@ impl MetadataStore {
     /// Storage error on query failure.
     pub fn current_snapshot(&self, repository_id: &str) -> Result<Option<String>> {
         self.connection
-            .lock()
+            .read()
             .query_row(
                 "SELECT snapshot_id FROM current_snapshots WHERE repository_id=?1",
                 [repository_id],
@@ -638,7 +707,7 @@ impl MetadataStore {
     /// Storage error on query failure.
     pub fn snapshot_is_complete(&self, snapshot_id: &str) -> Result<bool> {
         self.connection
-            .lock()
+            .read()
             .query_row(
                 "SELECT complete FROM snapshots WHERE id=?1",
                 [snapshot_id],
@@ -662,7 +731,7 @@ impl MetadataStore {
         profile_hash: &str,
     ) -> Result<Option<(String, String)>> {
         self.connection
-            .lock()
+            .read()
             .query_row(
                 "SELECT s.id, v.artifact_digest
                  FROM snapshots s
@@ -690,7 +759,7 @@ impl MetadataStore {
         content_hash: &str,
     ) -> Result<Option<String>> {
         self.connection
-            .lock()
+            .read()
             .query_row(
                 "SELECT sf.analysis_artifact_digest
                  FROM current_snapshots current
@@ -719,7 +788,7 @@ impl MetadataStore {
         mtime_ms: i64,
     ) -> Result<Option<(String, u64)>> {
         self.connection
-            .lock()
+            .read()
             .query_row(
                 "SELECT content_hash, line_count FROM scan_cache
                  WHERE repository_id=?1 AND path=?2 AND size_bytes=?3 AND mtime_ms=?4",
@@ -883,7 +952,7 @@ impl MetadataStore {
     /// # Errors
     /// Storage error on query failure.
     pub fn view_manifest(&self, repository_id: &str, snapshot_id: &str) -> Result<ViewManifest> {
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection
             .prepare(
                 "SELECT view_kind, state, profile_hash, updated_at, capabilities_json,
@@ -970,7 +1039,7 @@ impl MetadataStore {
             let _ = write!(sql, " AND lower(e.language) = ?{}", 2 + filter_params.len());
         }
         let _ = write!(sql, " ORDER BY rank LIMIT ?{}", 3 + filter_params.len());
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection.prepare(&sql).map_err(storage_error)?;
         let mut hits = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -1063,7 +1132,7 @@ impl MetadataStore {
         if terms.len() <= PAIR_TERMS_MAX {
             return Ok(pairs_of(terms));
         }
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let total_docs: i64 = connection
             .query_row(
                 "SELECT count(*) FROM documents_fts WHERE snapshot_id=?1",
@@ -1142,7 +1211,7 @@ impl MetadataStore {
     /// # Errors
     /// Storage error on query failure.
     pub fn term_document_frequency(&self, snapshot_id: &str, term: &str) -> Result<i64> {
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         connection
             .query_row(
                 "SELECT count(*) FROM documents_fts
@@ -1158,7 +1227,7 @@ impl MetadataStore {
     /// # Errors
     /// Storage error on query failure.
     pub fn document_count(&self, snapshot_id: &str) -> Result<i64> {
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         connection
             .query_row(
                 "SELECT count(*) FROM documents_fts WHERE snapshot_id=?1",
@@ -1179,7 +1248,7 @@ impl MetadataStore {
         term: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection
             .prepare(
                 "SELECT path FROM documents_fts
@@ -1216,7 +1285,7 @@ impl MetadataStore {
             .map(|term| format!("\"{term}\""))
             .collect::<Vec<_>>()
             .join(" AND ");
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection
             .prepare(
                 "SELECT path FROM documents_fts
@@ -1256,7 +1325,7 @@ impl MetadataStore {
             "SELECT document_id FROM documents_fts
              WHERE documents_fts MATCH ?1 AND snapshot_id=?2 AND document_id IN ({placeholders})"
         );
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection.prepare(&sql).map_err(storage_error)?;
         let parameters = rusqlite::params_from_iter(
             std::iter::once(format!("\"{term}\""))
@@ -1284,7 +1353,7 @@ impl MetadataStore {
         term: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection
             .prepare(
                 "SELECT f.document_id FROM documents_fts f
@@ -1333,7 +1402,7 @@ impl MetadataStore {
             .collect();
         let escaped = folded.replace('\\', "\\\\").replace('%', "\\%");
         let pattern = format!("%{escaped}%");
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection
             .prepare(
                 "SELECT id, kind, name, qualified_name, signature, language, region_id,
@@ -1374,7 +1443,7 @@ impl MetadataStore {
         name: &str,
         limit: usize,
     ) -> Result<Vec<CodeEntity>> {
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection
             .prepare(
                 "SELECT id, kind, name, qualified_name, signature, language, region_id,
@@ -1415,7 +1484,7 @@ impl MetadataStore {
         kind: &cce_core::EntityKind,
     ) -> Result<Vec<CodeEntity>> {
         let kind_json = serde_json::to_string(kind)?;
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection
             .prepare(
                 "SELECT id, kind, name, qualified_name, signature, language, region_id,
@@ -1448,7 +1517,7 @@ impl MetadataStore {
     /// # Errors
     /// Storage error on query failure.
     pub fn entity_by_id(&self, snapshot_id: &str, id: &str) -> Result<Option<CodeEntity>> {
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let row = connection
             .query_row(
                 "SELECT id, kind, name, qualified_name, signature, language, region_id,
@@ -1484,7 +1553,7 @@ impl MetadataStore {
     /// Storage error on query failure.
     pub fn entities_by_ids(&self, snapshot_id: &str, ids: &[String]) -> Result<Vec<CodeEntity>> {
         const SQLITE_VARIABLE_LIMIT: usize = 900;
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut entities = Vec::new();
         for chunk in ids.chunks(SQLITE_VARIABLE_LIMIT) {
             let placeholders = vec!["?"; chunk.len()].join(",");
@@ -1527,7 +1596,7 @@ impl MetadataStore {
     /// # Errors
     /// Storage error on query failure.
     pub fn regions_for_path(&self, snapshot_id: &str, path: &str) -> Result<Vec<CodeRegion>> {
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection
             .prepare(
                 "SELECT id, path, kind, language, symbol_name, symbol_kind, qualified_name,
@@ -1610,7 +1679,7 @@ impl MetadataStore {
              extractor, evidence_json, attributes_json FROM relations
              WHERE snapshot_id=?1 AND {predicate} ORDER BY confidence DESC LIMIT ?3"
         );
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection.prepare(&sql).map_err(storage_error)?;
         let rows = statement
             .query_map(
@@ -1653,7 +1722,7 @@ impl MetadataStore {
         limit: usize,
     ) -> Result<Vec<Relation>> {
         let kind_json = serde_json::to_string(kind)?;
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection
             .prepare(
                 "SELECT id, source_entity_id, target_entity_id, kind, origin, confidence,
@@ -1697,7 +1766,7 @@ impl MetadataStore {
     /// Storage error on query failure.
     pub fn entity_relation_degree(&self, snapshot_id: &str, entity_id: &str) -> Result<usize> {
         self.connection
-            .lock()
+            .read()
             .query_row(
                 "SELECT COUNT(*) FROM relations
                  WHERE snapshot_id=?1 AND (source_entity_id=?2 OR target_entity_id=?2)",
@@ -1715,7 +1784,7 @@ impl MetadataStore {
     /// # Errors
     /// Storage error on query failure.
     pub fn source_files_for_snapshot(&self, snapshot_id: &str) -> Result<Vec<SourceFileRow>> {
-        let connection = self.connection.lock();
+        let connection = self.connection.read();
         let mut statement = connection
             .prepare(
                 "SELECT path, language, analysis_artifact_digest FROM source_files
@@ -1747,7 +1816,7 @@ impl MetadataStore {
         origin: &cce_core::RelationOrigin,
     ) -> Result<usize> {
         self.connection
-            .lock()
+            .read()
             .query_row(
                 "SELECT COUNT(*) FROM relations
                  WHERE snapshot_id=?1 AND kind=?2 AND origin=?3",
@@ -1773,7 +1842,7 @@ impl MetadataStore {
         representation: &RetrievalRepresentation,
     ) -> Result<usize> {
         self.connection
-            .lock()
+            .read()
             .query_row(
                 "SELECT COUNT(*) FROM retrieval_documents
                  WHERE snapshot_id=?1 AND representation=?2",
@@ -1840,7 +1909,7 @@ impl MetadataStore {
     /// Storage error on query failure.
     pub fn documents_for_snapshot(&self, snapshot_id: &str) -> Result<Vec<DocumentContent>> {
         let rows = {
-            let connection = self.connection.lock();
+            let connection = self.connection.read();
             let mut statement = connection
                 .prepare(
                     "SELECT id, entity_id, region_id, representation, address_json,
