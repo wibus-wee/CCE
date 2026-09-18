@@ -102,6 +102,9 @@ pub struct LexicalHit {
     pub snippet: String,
 }
 
+/// One pairwise evidence-floor clause: two query terms `AND`ed together.
+pub(crate) type FloorPair = (String, String);
+
 /// A file's stat fingerprint observed during a repository scan.
 #[derive(Debug, Clone)]
 /// Cached file metadata for incremental scans.
@@ -943,6 +946,7 @@ impl MetadataStore {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
+        let floor_pairs = self.floor_evidence(snapshot_id, &terms)?;
         let mut sql = "SELECT f.document_id, f.entity_id, d.region_id, e.name, d.representation,
                  d.address_json, d.evidence_json,
                  bm25(documents_fts, 0.0, 0.0, 0.0, 3.0, 5.0, 2.0, 1.0) AS rank,
@@ -971,7 +975,7 @@ impl MetadataStore {
         let mut hits = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut position = 0_usize;
-        for match_query in fts_match_queries(&terms) {
+        for match_query in fts_match_queries(&terms, &floor_pairs) {
             if hits.len() >= limit {
                 break;
             }
@@ -1031,6 +1035,94 @@ impl MetadataStore {
             }
         }
         Ok(hits)
+    }
+
+    /// Cost-budgeted pair clauses for the evidence floor, measured by
+    /// per-term document frequency (one indexed count each — ~1 ms per
+    /// term even on large indexes).
+    ///
+    /// * **Ubiquitous terms are dropped first**: a term appearing in more
+    ///   than `docs/UBIQUITY_DOC_FRACTION` documents (absolute floor
+    ///   `UBIQUITY_DF_MIN`) carries ~zero IDF. Its pairs are the weakest
+    ///   evidence *and* the most expensive — and measured, the decoy
+    ///   pipeline: admitting ultra-common pairs moved `decoy_hit_rate@20`
+    ///   from .007 to .103.
+    /// * **Floor pairs** — every pair of the remaining live terms,
+    ///   ordered by clause cost (`df_a + df_b` posting-merge cost),
+    ///   capped at `PAIR_CLAUSES_MAX`. Rare and mid-frequency pairs are
+    ///   informative *and* cheap, so the cap spends on informative
+    ///   combinations first and drops exactly the expensive tail.
+    ///
+    /// Terms absent from the corpus are dead pair clauses (an AND with a
+    /// zero-document term never matches) and never appear. Fully
+    /// deterministic: pairs by `(cost, left, right)`.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    fn floor_evidence(&self, snapshot_id: &str, terms: &[String]) -> Result<Vec<FloorPair>> {
+        if terms.len() <= PAIR_TERMS_MAX {
+            return Ok(pairs_of(terms));
+        }
+        let connection = self.connection.lock();
+        let total_docs: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM documents_fts WHERE snapshot_id=?1",
+                [snapshot_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let mut statement = connection
+            .prepare(
+                "SELECT count(*) FROM documents_fts
+                 WHERE documents_fts MATCH ?1 AND snapshot_id=?2",
+            )
+            .map_err(storage_error)?;
+        let mut scored: Vec<(i64, &str)> = Vec::with_capacity(terms.len());
+        for term in terms {
+            // Prefix frequency: the pair stage emits `term*`, so rank by
+            // what the stage will actually scan. `fts_terms` output is
+            // alphanumeric/underscore only, safe unquoted.
+            let df: i64 = statement
+                .query_row(rusqlite::params![format!("{term}*"), snapshot_id], |row| {
+                    row.get(0)
+                })
+                .unwrap_or(i64::MAX);
+            scored.push((df, term.as_str()));
+        }
+        drop(statement);
+        drop(connection);
+        // Ubiquitous terms first — see `UBIQUITY_*` constants. Small
+        // live sets then pair whole under the clause budget regardless.
+        let ubiquity_cutoff = (total_docs / UBIQUITY_DOC_FRACTION).max(UBIQUITY_DF_MIN);
+        let mut live: Vec<(i64, &str)> = scored
+            .iter()
+            .filter(|(df, _)| (1..=ubiquity_cutoff).contains(df))
+            .copied()
+            .collect();
+        if live.len() < 2 {
+            // Rescue: the floor needs two distinct terms. When ubiquity
+            // and dead terms leave fewer, fall back to the least-common
+            // corpus-present terms rather than dropping the floor stage.
+            let mut corpus_live: Vec<(i64, &str)> = scored
+                .iter()
+                .filter(|(df, _)| (1..i64::MAX).contains(df))
+                .copied()
+                .collect();
+            corpus_live.sort_unstable();
+            live = corpus_live.into_iter().take(PAIR_TERMS_MAX).collect();
+        }
+        let mut pairs: Vec<(i64, &str, &str)> = Vec::with_capacity(live.len() * live.len() / 2);
+        for (index, (left_df, left)) in live.iter().enumerate() {
+            for (right_df, right) in live.get(index + 1..).unwrap_or_default() {
+                pairs.push((left_df + right_df, left, right));
+            }
+        }
+        pairs.sort_unstable();
+        Ok(pairs
+            .into_iter()
+            .take(PAIR_CLAUSES_MAX)
+            .map(|(_, left, right)| ((*left).to_owned(), (*right).to_owned()))
+            .collect())
     }
 
     /// Exact-name entity lookup, optionally filtered to a path prefix.
@@ -1717,6 +1809,35 @@ fn usize_to_i64(value: usize) -> Result<i64> {
         .map_err(|_| CceError::Storage(format!("value {value} exceeds SQLite INTEGER")))
 }
 
+/// Term budget for the pairwise evidence floor in `fts_match_queries`.
+/// The floor ORs every pairwise AND — C(n,2) clauses — so issue-length
+/// queries (32 terms → 496 clauses, ~15 s per pass on a mid-size index)
+/// cannot pair every term: above this count `floor_evidence` measures
+/// per-term document frequency, drops ubiquitous terms (see `UBIQUITY_*`),
+/// and emits only the cheapest remaining pairs.
+const PAIR_TERMS_MAX: usize = 12;
+
+/// Clause budget for the pairwise evidence floor in `fts_match_queries`.
+/// The floor ORs every pairwise AND — C(n,2) clauses — so issue-length
+/// queries (32 terms → 496 clauses, ~15 s per pass on a mid-size index)
+/// emit only the cheapest pairs by document-frequency cost. The tight
+/// bound is load-bearing twice over: it caps posting-merge work *and*
+/// concentrates the floor on the rarest evidence, keeping the stage's
+/// internal `bm25` ranking clean — measured: widening it admitted
+/// mid-frequency pairs that diluted rare-evidence documents out of the
+/// top-`limit` window (recall@50 .617 → .593, query time 2.8 s → 6.1 s).
+const PAIR_CLAUSES_MAX: usize = 150;
+
+/// Ubiquitous-term cutoff for the evidence floor: a term appearing in
+/// more than 1/8 of the corpus carries ~zero IDF, so its pairs are both
+/// the weakest evidence and the most expensive to evaluate — and
+/// measured: they are the decoy pipeline (`decoy_hit_rate@20` .007 → .103
+/// when ultra-common pairs were admitted). The absolute floor keeps small
+/// corpora (where nothing is meaningfully ubiquitous) fully pairable.
+const UBIQUITY_DOC_FRACTION: i64 = 8;
+/// Minimum document count for the ubiquity cutoff — see above.
+const UBIQUITY_DF_MIN: i64 = 200;
+
 fn fts_terms(query: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     query
@@ -1729,6 +1850,18 @@ fn fts_terms(query: &str) -> Vec<String> {
         .take(32)
         .map(|term| term.replace('"', "\"\""))
         .collect()
+}
+
+/// Every unordered pair over a term list — the short-query floor where the
+/// clause count is trivially bounded (C(12,2) = 66 at most).
+fn pairs_of(terms: &[String]) -> Vec<FloorPair> {
+    let mut pairs = Vec::with_capacity(terms.len() * terms.len() / 2);
+    for (index, left) in terms.iter().enumerate() {
+        for right in terms.get(index + 1..).unwrap_or_default() {
+            pairs.push((left.clone(), right.clone()));
+        }
+    }
+    pairs
 }
 
 /// Strictness cascade for one lexical query: exact AND, prefix AND, then a
@@ -1744,7 +1877,12 @@ fn fts_terms(query: &str) -> Vec<String> {
 /// hit must cover at least two distinct query terms. With fewer than three
 /// terms the prefix-AND stage already enforces the floor (a two-term query
 /// requires both terms, a one-term query its only term), so no third stage
-/// is emitted.
+/// is emitted. Long queries pass precomputed `floor_pairs` — the cheapest
+/// `PAIR_CLAUSES_MAX` clauses over non-ubiquitous corpus-present terms
+/// (see `floor_evidence`); short queries pass `pairs_of(terms)`, so the
+/// cascade is unchanged. The floor pairs run as ONE stage so `bm25`
+/// orders admitted documents by match quality rather than by which
+/// sub-band reached them.
 ///
 /// Code-switched queries (CJK runs alongside Latin words) get extra stages
 /// between the AND stages and the pairwise floor. unicode61 indexes a CJK
@@ -1754,7 +1892,7 @@ fn fts_terms(query: &str) -> Vec<String> {
 /// Latin side of a code-switched query is a deliberate anchor (the writer
 /// chose not to translate "stale"), so it earns a single-term tail that a
 /// homogeneous query does not get.
-fn fts_match_queries(terms: &[String]) -> Vec<String> {
+fn fts_match_queries(terms: &[String], floor_pairs: &[FloorPair]) -> Vec<String> {
     let quoted = |term: &str| format!("\"{term}\"");
     let exact_and = |terms: &[String]| {
         terms
@@ -1781,14 +1919,19 @@ fn fts_match_queries(terms: &[String]) -> Vec<String> {
         queries.push(exact_and(&latin));
         queries.push(prefix_and(&latin));
     }
-    if terms.len() >= 3 {
-        let mut pairs = Vec::new();
-        for (index, left) in terms.iter().enumerate() {
-            for right in terms.get(index + 1..).unwrap_or_default() {
-                pairs.push(format!("({}* AND {}*)", quoted(left), quoted(right)));
-            }
-        }
-        queries.push(pairs.join(" OR "));
+    let pair_stage = |pairs: &[(String, String)]| {
+        pairs
+            .iter()
+            .map(|(left, right)| format!("({}* AND {}*)", quoted(left), quoted(right)))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    };
+    // Short queries need ≥3 terms for the floor (fewer and the prefix-AND
+    // stage already enforces it). Long queries emit whatever the budgeted
+    // pair list holds — even a single live pair beats the always-empty
+    // full-AND stages.
+    if floor_pairs.len() >= 3 || (!floor_pairs.is_empty() && terms.len() > PAIR_TERMS_MAX) {
+        queries.push(pair_stage(floor_pairs));
     }
     if code_switched {
         queries.push(
@@ -1871,7 +2014,7 @@ mod tests {
     fn fts_terms_strip_stopwords_and_queries_cascade() {
         let terms = fts_terms("Where is the snapshot freshness decided?");
         assert_eq!(terms, ["snapshot", "freshness", "decided"]);
-        let queries = fts_match_queries(&terms);
+        let queries = fts_match_queries(&terms, &pairs_of(&terms));
         assert_eq!(
             queries,
             [
@@ -1886,22 +2029,21 @@ mod tests {
     fn fts_fallback_requires_two_distinct_terms() {
         // One- and two-term queries stop after the prefix-AND stage: it
         // already requires every term, which is the tightest possible floor.
+        // A repeated term is deduplicated so it cannot satisfy the two-term
+        // floor by matching the same word twice.
+        for terms in [fts_terms("freshness"), fts_terms("freshness freshness")] {
+            assert_eq!(
+                fts_match_queries(&terms, &pairs_of(&terms)),
+                ["\"freshness\"", "\"freshness\"*"]
+            );
+        }
+        let terms = fts_terms("snapshot freshness");
         assert_eq!(
-            fts_match_queries(&fts_terms("freshness")),
-            ["\"freshness\"", "\"freshness\"*"]
-        );
-        assert_eq!(
-            fts_match_queries(&fts_terms("snapshot freshness")),
+            fts_match_queries(&terms, &pairs_of(&terms)),
             [
                 "\"snapshot\" AND \"freshness\"",
                 "\"snapshot\"* AND \"freshness\"*",
             ]
-        );
-        // A repeated term is deduplicated so it cannot satisfy the two-term
-        // floor by matching the same word twice.
-        assert_eq!(
-            fts_match_queries(&fts_terms("freshness freshness")),
-            ["\"freshness\"", "\"freshness\"*"]
         );
     }
 
@@ -1921,7 +2063,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            fts_match_queries(&terms),
+            fts_match_queries(&terms, &pairs_of(&terms)),
             [
                 "\"search\" AND \"偶发返回陈旧结果\" AND \"哪里把过期视图标记为\" AND \"stale\"",
                 "\"search\"* AND \"偶发返回陈旧结果\"* AND \"哪里把过期视图标记为\"* AND \"stale\"*",
@@ -1939,7 +2081,7 @@ mod tests {
         // monolithic CJK term still gets exact and prefix stages.
         let terms = fts_terms("多条检索通道的命中是怎么合并成一个排序的");
         assert_eq!(
-            fts_match_queries(&terms),
+            fts_match_queries(&terms, &pairs_of(&terms)),
             [
                 "\"多条检索通道的命中是怎么合并成一个排序的\"",
                 "\"多条检索通道的命中是怎么合并成一个排序的\"*",
@@ -1953,12 +2095,186 @@ mod tests {
         // like "café" can still match — it is not a CJK monolith.
         let terms = fts_terms("café search resume");
         assert_eq!(
-            fts_match_queries(&terms),
+            fts_match_queries(&terms, &pairs_of(&terms)),
             [
                 "\"café\" AND \"search\" AND \"resume\"",
                 "\"café\"* AND \"search\"* AND \"resume\"*",
                 "(\"café\"* AND \"search\"*) OR (\"café\"* AND \"resume\"*) OR (\"search\"* AND \"resume\"*)",
             ]
         );
+    }
+
+    #[test]
+    fn fts_pair_floor_uses_budgeted_clauses_for_long_queries() {
+        // Issue-length queries pass a cost-budgeted pair list: the strict
+        // AND stages keep every term while the floor stage carries only
+        // the clauses `floor_evidence` emitted — 3 pairs here, not
+        // C(20,2) = 190.
+        let terms: Vec<String> = (0..20).map(|index| format!("term{index:02}")).collect();
+        let floor_pairs: Vec<FloorPair> = vec![
+            ("term00".to_owned(), "term01".to_owned()),
+            ("term00".to_owned(), "term02".to_owned()),
+            ("term01".to_owned(), "term02".to_owned()),
+        ];
+        let queries = fts_match_queries(&terms, &floor_pairs);
+        assert_eq!(queries.len(), 3);
+        assert!(queries[0].contains("\"term19\""));
+        assert!(queries[1].contains("\"term19\"*"));
+        assert_eq!(
+            queries[2],
+            "(\"term00\"* AND \"term01\"*) OR (\"term00\"* AND \"term02\"*) OR (\"term01\"* AND \"term02\"*)"
+        );
+    }
+
+    #[test]
+    fn floor_pairs_drop_ubiquitous_terms() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        store
+            .register_repository(&RepositoryIdentity {
+                id: "repo_t".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            })
+            .expect("repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_t".to_owned(),
+            repository_id: "repo_t".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        store.begin_snapshot(&snapshot).expect("begin snapshot");
+
+        // 215 documents: `zephyr` rarest (2 docs), `quux` (3),
+        // `mid00..mid10` spanning df 4..=14, and `common`/`shared`/
+        // `vocabulary` in every document — past the ubiquity cutoff of
+        // max(215/8, 200) = 200. `filler*`/`absent*` terms never appear.
+        let mut records = SnapshotRecords::default();
+        for index in 0..215_usize {
+            let mut body = String::from("common shared vocabulary");
+            if index < 2 {
+                body.push_str(" zephyr");
+            }
+            if index < 3 {
+                body.push_str(" quux");
+            }
+            for mid in 0..11_usize {
+                if index < mid + 4 {
+                    let _ = write!(body, " mid{mid:02}");
+                }
+            }
+            let entity_id = format!("entity:{index}");
+            records.artifacts.push(ArtifactRecord {
+                digest: format!("digest:{index}"),
+                kind: crate::ArtifactKind::Source,
+                size_bytes: body.len() as u64,
+                relative_path: format!("artifacts/{index}"),
+            });
+            records.entities.push(CodeEntity {
+                id: entity_id.clone(),
+                kind: cce_core::EntityKind::Function,
+                name: format!("f{index}"),
+                qualified_name: None,
+                signature: None,
+                language: None,
+                region_id: None,
+                address: None,
+                capabilities: Vec::new(),
+                attributes: serde_json::Map::new(),
+            });
+            records.documents.push(IndexedDocument {
+                document: RetrievalDocument {
+                    id: format!("doc:{index}"),
+                    entity_id,
+                    snapshot_id: "snap_t".to_owned(),
+                    representation: RetrievalRepresentation::RawCode,
+                    body_artifact_digest: format!("digest:{index}"),
+                    region_id: None,
+                    address: None,
+                    embedding_profile: None,
+                    generated_by: None,
+                    evidence: Vec::new(),
+                    terms: Vec::new(),
+                },
+                path: format!("src/f{index}.rs"),
+                name: format!("f{index}"),
+                body,
+            });
+        }
+        store.commit_snapshot(&snapshot, &records).expect("commit");
+
+        // Issue-length query: 13 dead + all 14 corpus terms. `common` is
+        // ubiquitous (215 > 200) and drops out; the remaining 13 live
+        // terms pair whole → C(13,2) = 78 clauses ordered cheapest first.
+        // Dead `filler*` terms never appear.
+        let mut terms: Vec<String> = (0..13).map(|index| format!("filler{index}")).collect();
+        terms.extend(["common", "zephyr", "quux"].map(str::to_owned));
+        terms.extend((0..11).map(|index| format!("mid{index:02}")));
+        let clauses = store.floor_evidence("snap_t", &terms).expect("floor");
+        assert_eq!(clauses.len(), 78);
+        assert_eq!(clauses[0], ("zephyr".to_owned(), "quux".to_owned()));
+        assert!(clauses.iter().all(|(left, _)| !left.starts_with("filler")));
+        assert!(
+            clauses
+                .iter()
+                .all(|(left, right)| left != "common" && right != "common")
+        );
+
+        // Exactly two corpus terms still emit their single pair.
+        let mut two_live: Vec<String> = (0..13).map(|index| format!("absent{index}")).collect();
+        two_live.extend(["zephyr", "quux"].map(str::to_owned));
+        let pairs = store.floor_evidence("snap_t", &two_live).expect("pairs");
+        assert_eq!(pairs, [("zephyr".to_owned(), "quux".to_owned())]);
+
+        // All-ubiquitous query: the rescue keeps the floor alive with the
+        // least-common corpus terms — 3 of them → C(3,2) = 3 clauses —
+        // instead of silently dropping fallback evidence.
+        let mut ubiquitous: Vec<String> = (0..13).map(|index| format!("absent{index}")).collect();
+        ubiquitous.extend(["common", "shared", "vocabulary"].map(str::to_owned));
+        let pairs = store
+            .floor_evidence("snap_t", &ubiquitous)
+            .expect("ubiquitous");
+        assert_eq!(pairs.len(), 3);
+
+        // End to end: the strict AND stages die on dead terms; the single
+        // live pair still surfaces the two documents carrying both rares.
+        let query = format!(
+            "{} zephyr quux",
+            (0..13)
+                .map(|index| format!("absent{index}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let hits = store
+            .lexical_search("snap_t", &query, 20, &cce_core::QueryFilters::default())
+            .expect("lexical");
+        assert_eq!(hits.len(), 2);
+
+        // With all 14 terms queried, `doc:12` surfaces through the pure
+        // mid-band pair (mid09, mid10). `doc:13` carries only `mid10`
+        // plus ubiquitous vocabulary — the decoy shape — and correctly
+        // fails the two-term floor.
+        let query = format!(
+            "zephyr quux common {} {}",
+            (0..11)
+                .map(|index| format!("mid{index:02}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            (0..5)
+                .map(|index| format!("absent{index}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let hits = store
+            .lexical_search("snap_t", &query, 20, &cce_core::QueryFilters::default())
+            .expect("lexical");
+        let ids: Vec<&str> = hits.iter().map(|hit| hit.document_id.as_str()).collect();
+        assert_eq!(hits.len(), 13);
+        assert!(ids.contains(&"doc:12"));
+        assert!(!ids.contains(&"doc:13"));
     }
 }
