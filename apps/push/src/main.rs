@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
@@ -37,6 +38,13 @@ struct Arguments {
     /// Poll interval for --watch, in seconds.
     #[arg(long, default_value_t = 15)]
     interval: u64,
+    /// Parallel blob uploads per sync.
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=64)
+    )]
+    concurrency: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,6 +265,7 @@ struct Uploader {
     gateway: String,
     repo_id: String,
     root: PathBuf,
+    concurrency: usize,
 }
 
 impl Uploader {
@@ -288,25 +297,8 @@ impl Uploader {
         if check.missing.is_empty() {
             eprintln!("cce-push: all blobs already on gateway");
         } else {
-            let by_digest: HashMap<&str, &FileEntry> =
-                files.iter().map(|f| (f.digest.as_str(), f)).collect();
             eprintln!("cce-push: uploading {} blobs", check.missing.len());
-            for digest in &check.missing {
-                let Some(entry) = by_digest.get(digest.as_str()) else {
-                    continue;
-                };
-                // Manifest paths are repo-relative; reads must resolve
-                // against the scanned root, not this process's cwd.
-                let bytes = std::fs::read(self.root.join(&entry.path))?;
-                self.client
-                    .put(format!(
-                        "{}/v1/repos/{}/blobs/{digest}",
-                        self.gateway, self.repo_id
-                    ))
-                    .body(bytes)
-                    .send()?
-                    .error_for_status()?;
-            }
+            self.upload_missing(files, &check.missing)?;
         }
         let response: PushResponse = self
             .client
@@ -329,6 +321,84 @@ impl Uploader {
             response.push_id, response.materialized, response.bytes
         );
         Ok(())
+    }
+
+    /// One blob upload: read the worktree file, PUT it under its digest.
+    fn upload_blob(&self, digest: &str, entry: &FileEntry) -> anyhow::Result<()> {
+        // Manifest paths are repo-relative; reads must resolve
+        // against the scanned root, not this process's cwd.
+        let bytes = std::fs::read(self.root.join(&entry.path))?;
+        self.client
+            .put(format!(
+                "{}/v1/repos/{}/blobs/{digest}",
+                self.gateway, self.repo_id
+            ))
+            .body(bytes)
+            .send()?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Fan `missing` across `--concurrency` scoped workers sharing the
+    /// blocking client (it is `Send + Sync`). Each worker PUTs its
+    /// contiguous chunk sequentially; the first failure flips `abort` so
+    /// peers stop at their next blob, and the joined error fails the push.
+    /// Partial uploads are safe — the CAS dedups them on retry.
+    fn upload_missing(&self, files: &[FileEntry], missing: &[String]) -> anyhow::Result<()> {
+        let by_digest: HashMap<&str, &FileEntry> =
+            files.iter().map(|f| (f.digest.as_str(), f)).collect();
+        let total = missing
+            .iter()
+            .filter(|digest| by_digest.contains_key(digest.as_str()))
+            .count();
+        if total == 0 {
+            return Ok(());
+        }
+        let workers = self.concurrency.min(missing.len());
+        let chunk_size = missing.len().div_ceil(workers);
+        // Progress every ~10% of the batch or every 500 blobs, whichever first.
+        let stride = total.div_ceil(10).clamp(1, 500);
+        let uploaded = AtomicUsize::new(0);
+        let abort = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let by_digest = &by_digest;
+            let uploaded = &uploaded;
+            let abort = &abort;
+            let mut handles = Vec::with_capacity(workers);
+            for chunk in missing.chunks(chunk_size) {
+                handles.push(scope.spawn(move || -> anyhow::Result<()> {
+                    for digest in chunk {
+                        if abort.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let Some(&entry) = by_digest.get(digest.as_str()) else {
+                            continue;
+                        };
+                        self.upload_blob(digest, entry).map_err(|error| {
+                            abort.store(true, Ordering::Relaxed);
+                            error.context(format!("blob {digest}"))
+                        })?;
+                        let done = uploaded.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done == total || done.is_multiple_of(stride) {
+                            eprintln!("cce-push: uploaded {done}/{total}");
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            let mut first_error = None;
+            for handle in handles {
+                let failure = match handle.join() {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error),
+                    Err(_) => Some(anyhow::anyhow!("blob upload worker panicked")),
+                };
+                if first_error.is_none() {
+                    first_error = failure;
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        })
     }
 }
 
@@ -357,6 +427,7 @@ fn main() -> anyhow::Result<()> {
         gateway,
         repo_id: repo.id,
         root: root.clone(),
+        concurrency: arguments.concurrency,
     };
     let mut cache = ScanCache::default();
     let files = scan(&root, &mut cache)?;
