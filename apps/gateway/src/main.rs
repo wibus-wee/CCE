@@ -29,6 +29,7 @@ mod breaker;
 mod cache;
 mod fanout;
 mod mcp;
+mod metrics;
 
 /// In-flight upstream calls the gateway allows across proxy and fan-out;
 /// requests beyond it queue for at most `UPSTREAM_QUEUE_WAIT` before a
@@ -166,6 +167,8 @@ struct GatewayState {
     /// hits bypass the circuit — a dead worker still serves stale-but-
     /// valid cached content.
     breakers: breaker::Breakers,
+    /// Process metrics — atomic counters; see `metrics` module docs.
+    metrics: metrics::Metrics,
 }
 
 /// Error envelope returned by every gateway endpoint.
@@ -282,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
         // Three consecutive reachability failures open a worker's circuit
         // for 30s; a single half-open probe then decides reopen-or-close.
         breakers: breaker::Breakers::new(3, Duration::from_secs(30)),
+        metrics: metrics::Metrics::new(),
         default_worker: arguments
             .default_worker
             .map(|url| url.trim_end_matches('/').to_owned()),
@@ -300,6 +304,8 @@ async fn main() -> anyhow::Result<()> {
         .split_for_parts();
     let mut router = api_router
         .merge(SwaggerUi::new("/docs").url("/openapi.json", api))
+        .route("/metrics", axum::routing::get(metrics_prometheus))
+        .route("/v1/metrics", axum::routing::get(metrics_json))
         .route("/{repo}/v1/{*path}", any(proxy))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         // Gzip responses for clients that ask — search JSON is verbose
@@ -345,26 +351,62 @@ impl Drop for FlightDone<'_> {
 async fn acquire_upstream(
     state: &GatewayState,
 ) -> Result<tokio::sync::SemaphorePermit<'_>, Response> {
-    match tokio::time::timeout(UPSTREAM_QUEUE_WAIT, state.upstream_permits.acquire()).await {
-        Ok(Ok(permit)) => Ok(permit),
-        _ => Err(Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header("retry-after", "2")
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(
-                serde_json::to_vec(&ErrorBody {
-                    error: "gateway saturated: too many upstream calls".to_owned(),
-                })
-                .unwrap_or_default(),
-            ))
-            .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())),
+    if let Ok(Ok(permit)) =
+        tokio::time::timeout(UPSTREAM_QUEUE_WAIT, state.upstream_permits.acquire()).await
+    {
+        return Ok(permit);
     }
+    state.metrics.record_proxy("shed");
+    Err(Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("retry-after", "2")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&ErrorBody {
+                error: "gateway saturated: too many upstream calls".to_owned(),
+            })
+            .unwrap_or_default(),
+        ))
+        .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response()))
 }
 
 #[utoipa::path(get, path = "/healthz", tag = "meta",
     responses((status = 200, description = "liveness probe", body = HealthStatus)))]
 async fn health() -> Json<HealthStatus> {
     Json(HealthStatus { status: "ok" })
+}
+
+/// `GET /metrics` — Prometheus text exposition. Lives on the outer
+/// router next to the proxy wildcard, not in the `OpenAPI` surface.
+async fn metrics_prometheus(State(state): State<Arc<GatewayState>>) -> Response {
+    Response::builder()
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )
+        .body(axum::body::Body::from(state.metrics.render_prometheus()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// `GET /v1/metrics` — the same series as JSON for dashboards/scripts,
+/// plus the per-worker circuit-breaker states (`open`/`half_open`/`closed`).
+async fn metrics_json(State(state): State<Arc<GatewayState>>) -> Json<serde_json::Value> {
+    let mut snapshot = state.metrics.snapshot();
+    let breakers: serde_json::Map<String, serde_json::Value> = state
+        .registry
+        .lock()
+        .keys()
+        .map(|id| {
+            (
+                id.clone(),
+                serde_json::Value::from(state.breakers.state_name(id)),
+            )
+        })
+        .collect();
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("breakers".to_owned(), serde_json::Value::Object(breakers));
+    }
+    Json(snapshot)
 }
 
 fn persist_registry(state: &GatewayState) -> anyhow::Result<()> {
@@ -732,7 +774,23 @@ async fn push(
     AxumPath(id): AxumPath<String>,
     Json(input): Json<PushRequest>,
 ) -> Result<Json<PushResponse>, ApiError> {
-    let repo = require_repo(&state, &id)?;
+    // Outcome + wall time are recorded for every push — validation
+    // rejections count as failures with zero files.
+    let started = Instant::now();
+    let result = push_inner(&state, &id, &input).await;
+    let files = result.as_ref().map_or(0, |ok| ok.materialized);
+    state
+        .metrics
+        .record_push(result.is_ok(), files, elapsed_ms(started));
+    result
+}
+
+async fn push_inner(
+    state: &GatewayState,
+    id: &str,
+    input: &PushRequest,
+) -> Result<Json<PushResponse>, ApiError> {
+    let repo = require_repo(state, id)?;
     if input.files.len() > 500_000 {
         return Err(bad_request("push manifest exceeds 500k files"));
     }
@@ -743,7 +801,7 @@ async fn push(
         input
             .files
             .iter()
-            .map(|file| plan_entry(&state, &file.path, &file.digest))
+            .map(|file| plan_entry(state, &file.path, &file.digest))
             .collect::<Result<Vec<_>, _>>()?,
     );
     // Verify every blob is present before touching the source dir — a
@@ -791,11 +849,11 @@ async fn push(
     };
     {
         let mut registry = state.registry.lock();
-        if let Some(entry) = registry.get_mut(&id) {
+        if let Some(entry) = registry.get_mut(id) {
             entry.last_push = Some(record.clone());
         }
     }
-    persist_registry(&state)?;
+    persist_registry(state)?;
     // Kick the worker's index in the background — push returns once the
     // source is materialized; indexing reports via the worker's own status.
     let client = state.client.clone();
@@ -887,6 +945,7 @@ async fn proxy(
     // the guard's Drop wakes followers on every exit path below.
     let _flight_done = if let Some(digest) = &body_digest {
         if let Some((cached_body, cached_type)) = state.search_cache.get(&entry.id, digest) {
+            state.metrics.record_proxy("cache_hit");
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header("x-cce-cache", "hit");
@@ -908,6 +967,7 @@ async fn proxy(
                 let _ = receiver.changed().await;
                 if let Some((cached_body, cached_type)) = state.search_cache.get(&entry.id, digest)
                 {
+                    state.metrics.record_proxy("singleflight");
                     let mut builder = Response::builder()
                         .status(StatusCode::OK)
                         .header("x-cce-cache", "hit")
@@ -936,6 +996,11 @@ async fn proxy(
         }
         upstream = upstream.header(name, value);
     }
+    // A cacheable request reaching this line is fetching upstream —
+    // leader or self-relying follower; both count as misses.
+    if body_digest.is_some() {
+        state.metrics.record_proxy("cache_miss");
+    }
     // Bound in-flight upstream work: queue briefly, then shed — the
     // permit covers the whole upstream call including the body read.
     // The permit comes BEFORE the circuit check: an admit obligates an
@@ -949,6 +1014,7 @@ async fn proxy(
     // fails fast — no timeout wait per request. Cache hits already
     // returned above, so a broken worker still serves cached content.
     if !state.breakers.admit(&entry.id) {
+        state.metrics.record_proxy("breaker");
         return Ok(Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header("x-cce-breaker", "open")
@@ -964,6 +1030,7 @@ async fn proxy(
     let started = Instant::now();
     let response = upstream.send().await.map_err(|error| {
         state.breakers.on_failure(&entry.id);
+        state.metrics.record_upstream_ms(elapsed_ms(started));
         tracing::warn!(
             repo = %entry.id,
             latency_ms = elapsed_ms(started),
@@ -971,16 +1038,19 @@ async fn proxy(
             "worker upstream request failed"
         );
         if error.is_timeout() {
+            state.metrics.record_proxy("timeout");
             ApiError(
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("worker {} timed out: {error}", entry.worker_url),
             )
         } else if error.is_connect() {
+            state.metrics.record_proxy("connect");
             ApiError(
                 StatusCode::BAD_GATEWAY,
                 format!("worker {} connection failed: {error}", entry.worker_url),
             )
         } else {
+            state.metrics.record_proxy("other");
             ApiError(
                 StatusCode::BAD_GATEWAY,
                 format!("worker {} unreachable: {error}", entry.worker_url),
@@ -999,6 +1069,7 @@ async fn proxy(
     // circuit even though the status line already arrived.
     let body = response.bytes().await.map_err(|error| {
         state.breakers.on_failure(&entry.id);
+        state.metrics.record_upstream_ms(elapsed_ms(started));
         tracing::warn!(
             repo = %entry.id,
             latency_ms = elapsed_ms(started),
@@ -1006,6 +1077,7 @@ async fn proxy(
             "worker response body failed"
         );
         if error.is_timeout() {
+            state.metrics.record_proxy("timeout");
             ApiError(
                 StatusCode::GATEWAY_TIMEOUT,
                 format!(
@@ -1014,6 +1086,7 @@ async fn proxy(
                 ),
             )
         } else {
+            state.metrics.record_proxy("other");
             ApiError(
                 StatusCode::BAD_GATEWAY,
                 format!("worker {} dropped the response: {error}", entry.worker_url),
@@ -1029,6 +1102,8 @@ async fn proxy(
     } else {
         state.breakers.on_success(&entry.id);
     }
+    state.metrics.record_upstream_ms(elapsed_ms(started));
+    state.metrics.record_proxy("ok");
     if let Some(digest) = &body_digest {
         if status == StatusCode::OK {
             state

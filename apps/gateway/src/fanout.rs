@@ -239,6 +239,9 @@ pub(crate) async fn search_all(
                 Some(false) => state.breakers.on_failure(&entry.id),
                 None => {}
             }
+            state.metrics.record_upstream_ms(
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            );
             (entry, started.elapsed(), reply)
         });
     }
@@ -268,6 +271,7 @@ pub(crate) async fn search_all(
     degraded.sort_by(|a, b| a.repo_slug.cmp(&b.repo_slug));
 
     let searched = replies.len();
+    state.metrics.record_fanout(searched, degraded.len());
     let per_repo: Vec<RepoOutcome> = replies
         .iter()
         .map(|reply| RepoOutcome {

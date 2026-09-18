@@ -124,8 +124,6 @@ impl Breakers {
 
     /// Current state name for metrics/debugging: `"closed"`, `"open"`,
     /// or `"half_open"` (cooldown elapsed, probe permitted).
-    // `dead_code`: consumed by the metrics endpoint once it lands.
-    #[allow(dead_code)]
     pub(crate) fn state_name(&self, key: &str) -> &'static str {
         let open_until = self
             .circuits
