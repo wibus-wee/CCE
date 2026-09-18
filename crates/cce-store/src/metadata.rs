@@ -1153,6 +1153,177 @@ impl MetadataStore {
             .map_err(storage_error)
     }
 
+    /// Document count in a snapshot — denominates rarity cutoffs.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn document_count(&self, snapshot_id: &str) -> Result<i64> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT count(*) FROM documents_fts WHERE snapshot_id=?1",
+                [snapshot_id],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)
+    }
+
+    /// Paths of documents mentioning a term (exact quoted phrase match),
+    /// cheapest first by row order — witness-check drill-down material.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn term_mention_paths(
+        &self,
+        snapshot_id: &str,
+        term: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT path FROM documents_fts
+                 WHERE documents_fts MATCH ?1 AND snapshot_id=?2 LIMIT ?3",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![format!("\"{term}\""), snapshot_id, usize_to_i64(limit)?],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(storage_error)
+    }
+
+    /// Paths of documents containing EVERY given term — the coherent-
+    /// scope binding set for a claim's distinguishing vocabulary. An
+    /// empty set means no artifact can witness the claim as asked.
+    ///
+    /// # Errors
+    /// Storage error on query failure, or when `terms` is empty.
+    pub fn terms_binding_paths(
+        &self,
+        snapshot_id: &str,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let matcher = terms
+            .iter()
+            .map(|term| format!("\"{term}\""))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT path FROM documents_fts
+                 WHERE documents_fts MATCH ?1 AND snapshot_id=?2 LIMIT ?3",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![matcher, snapshot_id, usize_to_i64(limit)?],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(storage_error)
+    }
+
+    /// Which of `document_ids` contain `term` — per-hit coverage checks
+    /// for claim vocabulary.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn documents_matching_term(
+        &self,
+        snapshot_id: &str,
+        term: &str,
+        document_ids: &[String],
+    ) -> Result<Vec<String>> {
+        if document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = document_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT document_id FROM documents_fts
+             WHERE documents_fts MATCH ?1 AND snapshot_id=?2 AND document_id IN ({placeholders})"
+        );
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+        let parameters = rusqlite::params_from_iter(
+            std::iter::once(format!("\"{term}\""))
+                .chain(std::iter::once(snapshot_id.to_owned()))
+                .chain(document_ids.iter().cloned()),
+        );
+        let rows = statement
+            .query_map(parameters, |row| row.get::<_, String>(0))
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(storage_error)
+    }
+
+    /// Entities whose name or qualified name contains `term` — a
+    /// case-insensitive LIKE superset callers refine by identifier-part
+    /// boundaries. This is the definition-tier candidate set for
+    /// witness checks: mention is not definition.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn entity_name_candidates(
+        &self,
+        snapshot_id: &str,
+        term: &str,
+        limit: usize,
+    ) -> Result<Vec<CodeEntity>> {
+        // Match on the folded column — identifiers fold to their
+        // alphanumeric stream, so `viewstatus` must reach
+        // `view_status.rs`, `WebSocket`, and `a::view::Status` alike.
+        // The term folds the same way before patterning.
+        let folded: String = term
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .collect();
+        let escaped = folded.replace('\\', "\\\\").replace('%', "\\%");
+        let pattern = format!("%{escaped}%");
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, kind, name, qualified_name, signature, language, region_id,
+                 address_json, capabilities_json, attributes_json FROM entities
+                 WHERE snapshot_id=?1 AND (
+                   REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(name,'_',''),'-',''),'.',''),'/',''),':','') LIKE ?2 ESCAPE '\\'
+                   OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(qualified_name,'_',''),'-',''),'.',''),'/',''),':','') LIKE ?2 ESCAPE '\\'
+                 ) LIMIT ?3",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![snapshot_id, pattern, usize_to_i64(limit)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })
+            .map_err(storage_error)?;
+        rows.map(|row| entity_from_cols(row.map_err(storage_error)?))
+            .collect()
+    }
+
     /// Exact-name entity lookup, optionally filtered to a path prefix.
     ///
     /// # Errors
@@ -2397,9 +2568,8 @@ mod tests {
             chars.into_iter().collect()
         };
         let pluralized = |name: &str| format!("{name}s");
-        let truncated = |name: &str| -> String {
-            name.chars().take(name.chars().count() - 1).collect()
-        };
+        let truncated =
+            |name: &str| -> String { name.chars().take(name.chars().count() - 1).collect() };
         for absent in [
             swap_last("ViewStatus"),
             pluralized("ViewStatus"),
@@ -2415,5 +2585,198 @@ mod tests {
                 "{absent} is provably absent"
             );
         }
+    }
+
+    #[test]
+    fn witness_apis_cover_mentions_binding_and_coverage() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        store
+            .register_repository(&RepositoryIdentity {
+                id: "repo_t".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            })
+            .expect("repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_t".to_owned(),
+            repository_id: "repo_t".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        store.begin_snapshot(&snapshot).expect("begin snapshot");
+
+        let entity =
+            |id: &str, kind: cce_core::EntityKind, name: &str, qualified: &str| CodeEntity {
+                id: id.to_owned(),
+                kind,
+                name: name.to_owned(),
+                qualified_name: Some(qualified.to_owned()),
+                signature: None,
+                language: None,
+                region_id: None,
+                address: None,
+                capabilities: Vec::new(),
+                attributes: serde_json::Map::new(),
+            };
+        let document = |index: usize, entity_id: &str, path: &str, name: &str, body: &str| {
+            (
+                IndexedDocument {
+                    document: RetrievalDocument {
+                        id: format!("doc:{index}"),
+                        entity_id: entity_id.to_owned(),
+                        snapshot_id: "snap_t".to_owned(),
+                        representation: RetrievalRepresentation::RawCode,
+                        body_artifact_digest: format!("digest:{index}"),
+                        region_id: None,
+                        address: None,
+                        embedding_profile: None,
+                        generated_by: None,
+                        evidence: Vec::new(),
+                        terms: Vec::new(),
+                    },
+                    path: path.to_owned(),
+                    name: name.to_owned(),
+                    body: body.to_owned(),
+                },
+                ArtifactRecord {
+                    digest: format!("digest:{index}"),
+                    kind: crate::ArtifactKind::Source,
+                    size_bytes: body.len() as u64,
+                    relative_path: format!("artifacts/{index}"),
+                },
+            )
+        };
+        let (doc0, art0) = document(
+            0,
+            "ent:viewstatus",
+            "src/view_status.rs",
+            "ViewStatus",
+            "pub struct ViewStatus; staleness handling",
+        );
+        let (doc1, art1) = document(
+            1,
+            "ent:gateway",
+            "src/gateway.rs",
+            "gateway",
+            "the gateway validates every request token",
+        );
+        let (doc2, art2) = document(
+            2,
+            "ent:plan",
+            "plans/009.md",
+            "plan",
+            "a distributed lock design sketch",
+        );
+        let (doc3, art3) = document(
+            3,
+            "ent:locks",
+            "src/lock_manager.rs",
+            "lock_manager",
+            "fn lock_manager acquires the lock",
+        );
+        let records = SnapshotRecords {
+            artifacts: vec![art0, art1, art2, art3],
+            entities: vec![
+                entity(
+                    "ent:viewstatus",
+                    cce_core::EntityKind::Struct,
+                    "ViewStatus",
+                    "app::view::ViewStatus",
+                ),
+                entity(
+                    "ent:locks",
+                    cce_core::EntityKind::File,
+                    "src/lock_manager.rs",
+                    "src/lock_manager.rs",
+                ),
+                entity(
+                    "ent:blockchain",
+                    cce_core::EntityKind::File,
+                    "src/blockchain.rs",
+                    "src/blockchain.rs",
+                ),
+                entity(
+                    "ent:gateway",
+                    cce_core::EntityKind::File,
+                    "src/gateway.rs",
+                    "src/gateway.rs",
+                ),
+            ],
+            documents: vec![doc0, doc1, doc2, doc3],
+            ..SnapshotRecords::default()
+        };
+        store.commit_snapshot(&snapshot, &records).expect("commit");
+
+        assert_eq!(store.document_count("snap_t").expect("count"), 4);
+
+        // Name candidates fold identifier separators: `viewstatus`
+        // reaches `ViewStatus` and `src/view_status.rs` alike. The LIKE
+        // set is a recall superset — `blockchain` legitimately surfaces
+        // for `lock` here; the part-boundary check lives in the caller.
+        let candidates = store
+            .entity_name_candidates("snap_t", "viewstatus", 8)
+            .expect("candidates");
+        assert!(
+            candidates
+                .iter()
+                .any(|entity| entity.id == "ent:viewstatus"),
+            "folded name match must reach the entity: {candidates:?}"
+        );
+        let candidates = store
+            .entity_name_candidates("snap_t", "lock", 8)
+            .expect("candidates");
+        let ids: Vec<&str> = candidates.iter().map(|entity| entity.id.as_str()).collect();
+        assert!(ids.contains(&"ent:locks"));
+        assert!(
+            ids.contains(&"ent:blockchain"),
+            "superset over-recalls: {ids:?}"
+        );
+        assert!(
+            store
+                .entity_name_candidates("snap_t", "websocket", 8)
+                .expect("candidates")
+                .is_empty(),
+            "a never-defined term finds no candidates"
+        );
+
+        // Mentions report every document carrying the term; binding
+        // reports only artifacts carrying ALL of them.
+        let mentions = store
+            .term_mention_paths("snap_t", "lock", 8)
+            .expect("mentions");
+        assert_eq!(
+            mentions.len(),
+            2,
+            "prose and code both mention: {mentions:?}"
+        );
+        let bound = store
+            .terms_binding_paths("snap_t", &["distributed".to_owned(), "lock".to_owned()], 8)
+            .expect("bound");
+        assert_eq!(bound, ["plans/009.md"], "only the plan binds both");
+        let bound = store
+            .terms_binding_paths("snap_t", &["gateway".to_owned(), "token".to_owned()], 8)
+            .expect("bound");
+        assert_eq!(bound, ["src/gateway.rs"]);
+
+        // Per-hit coverage: `distributed` lives in no returned hit,
+        // `lock` lives in one of them.
+        let doc_ids = vec!["doc:0".to_owned(), "doc:3".to_owned()];
+        assert!(
+            store
+                .documents_matching_term("snap_t", "distributed", &doc_ids)
+                .expect("coverage")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .documents_matching_term("snap_t", "lock", &doc_ids)
+                .expect("coverage"),
+            ["doc:3"]
+        );
     }
 }

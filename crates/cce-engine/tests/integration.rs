@@ -944,6 +944,63 @@ async fn type_diff_greps_stored_commit_patches() {
     );
 }
 
+/// Temporal claims ask whether the subject *ever* existed: "never defined
+/// now" cannot refute "defined then", so neither the literal veto nor the
+/// definition-witness gate may preempt the patch/history routes.
+/// `compute_first` is gone from current source — only the first commit's
+/// patch remembers it — and `compute_second` is a call target that was
+/// never defined anywhere; both must still answer through `type:diff`.
+#[tokio::test]
+async fn temporal_pins_bypass_current_source_evidence_gates() {
+    let repo = history_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // History-only term: gone from current source, alive in patch history.
+    let removed = engine
+        .search(search_request("type:diff compute_first", true))
+        .await
+        .expect("type:diff on history-only term");
+    assert!(
+        removed.hits.iter().any(|hit| {
+            hit.route == cce_core::SearchRoute::Diff && hit.snippet.contains("compute_first()")
+        }),
+        "a term living only in patch history must still answer: {:?}",
+        removed.missing_capabilities
+    );
+
+    // Never-defined call target: `compute_second` is *called* in current
+    // source but no entity bears the name — the definition gate would
+    // abstain, yet the diff route answers where it entered history.
+    let undefined = engine
+        .search(search_request("type:diff compute_second", true))
+        .await
+        .expect("type:diff on never-defined callee");
+    assert!(
+        undefined.hits.iter().any(|hit| {
+            hit.route == cce_core::SearchRoute::Diff && hit.snippet.contains("compute_second()")
+        }),
+        "a never-defined callee must still answer through history: {:?}",
+        undefined.missing_capabilities
+    );
+
+    // The exemption is scoped, not a hole: a `type:diff` term that exists
+    // nowhere — not even in patches — still abstains.
+    let absent = engine
+        .search(search_request("type:diff never_existed_marker_zzz", true))
+        .await
+        .expect("type:diff on absent term");
+    assert!(
+        absent.hits.is_empty(),
+        "a term absent from all corpora must still abstain: {:?}",
+        absent
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn ignored_paths_leave_no_history_evidence() {
     let repo = history_repo();

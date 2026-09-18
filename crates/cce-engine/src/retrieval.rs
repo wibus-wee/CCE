@@ -1,8 +1,11 @@
 use std::{collections::HashMap, time::Instant};
 
 use cce_core::{
-    CodeEntity, EntityKind, QueryIntent, RelationKind, Result, RetrievalRepresentation, SearchHit,
-    SearchRequest, SearchRoute, ViewKind, ViewManifest, ViewState, has_cjk,
+    BoundArtifact, ClaimFrame, ClaimPredicate, CodeEntity, DefinedWitness, DocumentClass,
+    EntityKind, EvidenceTiers, QueryIntent, RelationKind, Result, RetrievalRepresentation,
+    SearchHit, SearchRequest, SearchRoute, SearchVerdict, TermWitness, VerdictState, ViewKind,
+    ViewManifest, ViewState, WitnessReport, WitnessRequirement, document_class, folded_identifier,
+    has_cjk,
 };
 use cce_store::{MetadataStore, RelationDirection};
 use serde::{Deserialize, Serialize};
@@ -60,6 +63,10 @@ pub struct SearchResult {
     pub hits: Vec<SearchHit>,
     /// Capabilities the plan needed but could not satisfy.
     pub missing_capabilities: Vec<String>,
+    /// The kernel's evidence verdict — what the evidence is and where it
+    /// fails witness typing, exported so an external verifier can judge
+    /// instead of re-deriving.
+    pub verdict: SearchVerdict,
     /// Engine-side wall time in milliseconds.
     pub latency_ms: u64,
 }
@@ -227,7 +234,18 @@ impl CceEngine {
         // and inferred-vicinity machinery (dense, expansion, flow) must
         // not be given the chance to fabricate plausible support.
         let anchors = literal_anchors(&request.query);
-        if !anchors.is_empty() {
+        // The claim the evidence will be judged against: subjects are
+        // the verbatim anchors, predicate/required-witness follow intent.
+        // `distinguishing_terms` resolves lazily — it needs corpus dfs.
+        let mut frame = claim_frame(plan.intent, anchors.clone());
+        // Temporal routes read evidence the literal check can misjudge:
+        // `type:diff` greps commit *patch payloads* in the artifact store —
+        // the authoritative corpus for diff claims. Indexed diff documents
+        // are a bounded projection of those payloads (diff limits, line
+        // windows), so a term absent from FTS can still live in the raw
+        // patch. The veto must not preempt the authoritative scan.
+        let patch_grep_planned = plan.routes.contains(&SearchRoute::Diff);
+        if !anchors.is_empty() && !patch_grep_planned {
             let mut absent = Vec::new();
             for anchor in &anchors {
                 if self
@@ -239,7 +257,7 @@ impl CceEngine {
                 }
             }
             if absent.len() == anchors.len() {
-                missing_capabilities.push(format!(
+                let reason = format!(
                     "abstained: literal query term{} {} absent from the corpus — the named entity does not exist in this snapshot",
                     if absent.len() == 1 { "" } else { "s" },
                     absent
@@ -247,13 +265,89 @@ impl CceEngine {
                         .map(|anchor| format!("`{anchor}`"))
                         .collect::<Vec<_>>()
                         .join(", ")
-                ));
+                );
+                missing_capabilities.push(reason.clone());
+                frame.distinguishing_terms = resolve_distinguishing(
+                    self.store(),
+                    &request.snapshot_id,
+                    &content_terms(&request.query),
+                )?;
+                let verdict = SearchVerdict {
+                    state: VerdictState::Abstained,
+                    reasons: vec![reason],
+                    witness: build_witness_report(self.store(), &request.snapshot_id, &frame, &[])?,
+                    claim: frame,
+                    evidence_tiers: EvidenceTiers::default(),
+                };
                 return Ok(SearchResult {
                     request,
                     plan,
                     manifest,
                     hits: Vec::new(),
                     missing_capabilities,
+                    verdict,
+                    latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                });
+            }
+        }
+        // Witness gate, definition side: an exact-entity claim asks where
+        // its subject is *defined*. When every subject is mention-only —
+        // present in prose or identifiers that never resolve to a
+        // definition — the claim is provably unanswerable in this
+        // snapshot, so no route spends work. File entities count as
+        // definitions: a module bearing the name is a witness.
+        //
+        // Exclusively-temporal plans (`type:diff`, `type:commit`, or an
+        // explicit history/diff route override) ask whether the subject
+        // *ever* existed — "never defined now" cannot refute "defined
+        // then", so the gate must not preempt the temporal routes.
+        let temporal_only = plan
+            .routes
+            .iter()
+            .all(|route| matches!(route, SearchRoute::Diff | SearchRoute::History));
+        if frame.required_witness == WitnessRequirement::Definition
+            && !frame.subjects.is_empty()
+            && !temporal_only
+        {
+            let mut any_defined = false;
+            for subject in &frame.subjects {
+                if !defined_witnesses(self.store(), &request.snapshot_id, subject)?.is_empty() {
+                    any_defined = true;
+                    break;
+                }
+            }
+            if !any_defined {
+                let reason = format!(
+                    "abstained: claim subject{} {} ha{} no definition-tier witness — mentioned at most, never defined in this snapshot",
+                    if frame.subjects.len() == 1 { "" } else { "s" },
+                    frame
+                        .subjects
+                        .iter()
+                        .map(|subject| format!("`{subject}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if frame.subjects.len() == 1 { "s" } else { "ve" },
+                );
+                missing_capabilities.push(reason.clone());
+                frame.distinguishing_terms = resolve_distinguishing(
+                    self.store(),
+                    &request.snapshot_id,
+                    &content_terms(&request.query),
+                )?;
+                let verdict = SearchVerdict {
+                    state: VerdictState::Abstained,
+                    reasons: vec![reason],
+                    witness: build_witness_report(self.store(), &request.snapshot_id, &frame, &[])?,
+                    claim: frame,
+                    evidence_tiers: EvidenceTiers::default(),
+                };
+                return Ok(SearchResult {
+                    request,
+                    plan,
+                    manifest,
+                    hits: Vec::new(),
+                    missing_capabilities,
+                    verdict,
                     latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                 });
             }
@@ -798,12 +892,57 @@ impl CceEngine {
         for (offset, hit) in hits.iter_mut().enumerate() {
             hit.rank = offset + 1;
         }
+
+        // The verdict is the kernel's honest report to whoever consumes
+        // this result: what the evidence tiers look like, what the claim
+        // required, and where the evidence fails witness typing. The
+        // kernel reports; an external verifier judges.
+        frame.distinguishing_terms = resolve_distinguishing(
+            self.store(),
+            &request.snapshot_id,
+            &content_terms(&request.query),
+        )?;
+        let witness = build_witness_report(self.store(), &request.snapshot_id, &frame, &hits)?;
+        let evidence_tiers = EvidenceTiers {
+            strict: candidates.values().filter(|c| c.strict).count(),
+            weak: candidates.values().filter(|c| !c.strict).count(),
+        };
+        let mut reasons = Vec::new();
+        let mut state = if hits.is_empty() {
+            VerdictState::Abstained
+        } else {
+            VerdictState::Answered
+        };
+        if state == VerdictState::Answered {
+            reasons = weak_witness_reasons(&frame, &witness);
+            if !reasons.is_empty() {
+                state = VerdictState::WeakWitness;
+            }
+        } else {
+            reasons.extend(
+                missing_capabilities
+                    .iter()
+                    .filter(|note| note.starts_with("abstained"))
+                    .cloned(),
+            );
+            if reasons.is_empty() {
+                reasons.push("no evidence survived the retrieval and filter gates".to_owned());
+            }
+        }
+        let verdict = SearchVerdict {
+            state,
+            reasons,
+            claim: frame,
+            witness,
+            evidence_tiers,
+        };
         Ok(SearchResult {
             request,
             plan,
             manifest,
             hits,
             missing_capabilities,
+            verdict,
             latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         })
     }
@@ -863,7 +1002,12 @@ impl CceEngine {
             }
             if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
                 let count = per_file.entry(path.clone()).or_default();
-                if *count >= per_file_cap(hits.len()) {
+                // An exact-symbol hit answers the query's named subject
+                // directly; the per-file cap exists to bound *expansion*
+                // noise, so inferred-vicinity hits must never crowd it
+                // out of the same file's slot.
+                let exact_answer = hit.contributing_routes.contains(&SearchRoute::ExactSymbol);
+                if !exact_answer && *count >= per_file_cap(hits.len()) {
                     continue;
                 }
                 *count += 1;
@@ -2103,6 +2247,388 @@ fn literal_anchors(query: &str) -> Vec<String> {
     anchors
 }
 
+/// Query-shape and predicate words — the grammar of asking, not claim
+/// content. "Where is X defined" claims a definition of X; "defined"
+/// itself carries no distinguishing vocabulary.
+fn is_claim_shape_word(term: &str) -> bool {
+    matches!(
+        term,
+        "defined"
+            | "definition"
+            | "declared"
+            | "declaration"
+            | "references"
+            | "referenced"
+            | "implement"
+            | "implemented"
+            | "implementation"
+            | "work"
+            | "works"
+            | "working"
+            | "handle"
+            | "handles"
+            | "handled"
+            | "handling"
+            | "logic"
+            | "support"
+            | "supports"
+            | "supported"
+            | "exist"
+            | "exists"
+            | "existing"
+            | "way"
+            | "currently"
+            | "code"
+            | "file"
+            | "files"
+            | "flow"
+            | "repository"
+            | "repo"
+            | "project"
+            | "system"
+            | "在哪"
+            | "定义"
+            | "哪里"
+            | "谁"
+            | "引用"
+            | "怎么"
+            | "如何"
+            | "实现"
+            | "支持"
+    )
+}
+
+/// All claim content terms: alphanumeric tokens that are neither
+/// function words nor query-shape vocabulary, with no CJK (monolithic
+/// CJK tokens cannot bind reliably). Unlike `entity_tokens` this keeps
+/// plain lowercase words — a claim's distinguishing vocabulary
+/// ("distributed", "bearer") is rarely identifier-shaped.
+fn content_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for token in query.split(|character: char| {
+        !(character.is_alphanumeric() || character == '_' || character == ':' || character == '.')
+    }) {
+        let token = token.trim_matches('.');
+        if token.chars().count() < 3
+            || !token.chars().any(char::is_alphanumeric)
+            || token.chars().any(has_cjk)
+        {
+            continue;
+        }
+        let lowered = token.to_ascii_lowercase();
+        if is_prf_stopword(&lowered) || is_claim_shape_word(&lowered) {
+            continue;
+        }
+        if !terms.contains(&lowered) {
+            terms.push(lowered);
+        }
+    }
+    terms
+}
+
+/// What the query claims in witness terms: subjects are the verbatim
+/// anchors it names; predicate and required witness follow the
+/// classified intent. `distinguishing_terms` is filled by
+/// `resolve_distinguishing`, which needs corpus frequencies.
+const fn claim_frame(intent: QueryIntent, subjects: Vec<String>) -> ClaimFrame {
+    let (predicate, required_witness) = match intent {
+        QueryIntent::ExactEntity => (ClaimPredicate::Definition, WitnessRequirement::Definition),
+        QueryIntent::NaturalLanguageBehavior | QueryIntent::IssueLocalization => (
+            ClaimPredicate::Implementation,
+            WitnessRequirement::CodeBinding,
+        ),
+        QueryIntent::Trace
+        | QueryIntent::Impact
+        | QueryIntent::Architecture
+        | QueryIntent::PreciseDataflow => (ClaimPredicate::Relation, WitnessRequirement::Any),
+        QueryIntent::History => (ClaimPredicate::History, WitnessRequirement::Any),
+        QueryIntent::Unknown => (ClaimPredicate::Lookup, WitnessRequirement::Any),
+    };
+    ClaimFrame {
+        intent,
+        predicate,
+        required_witness,
+        subjects,
+        distinguishing_terms: Vec::new(),
+    }
+}
+
+/// The rare content terms carrying the claim's specificity — df-capped
+/// at the corpus's rarity band and rarest-first, capped at four so the
+/// binding query stays satisfiable rather than becoming an impossible
+/// conjunction.
+fn resolve_distinguishing(
+    store: &MetadataStore,
+    snapshot_id: &str,
+    terms: &[String],
+) -> Result<Vec<String>> {
+    let documents = store.document_count(snapshot_id)?.max(1);
+    let cap = (documents / 200).max(32);
+    let mut rare = Vec::new();
+    for term in terms.iter().take(24) {
+        let df = store.term_document_frequency(snapshot_id, term)?;
+        if df <= cap {
+            rare.push((df, term.clone()));
+        }
+    }
+    rare.sort();
+    rare.truncate(4);
+    Ok(rare.into_iter().map(|(_, term)| term).collect())
+}
+
+/// Ordered identifier parts — camel/snake boundaries without
+/// sort/dedup, so contiguous runs preserve the name's structure.
+fn identifier_parts(name: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut previous_lower = false;
+    for character in name.chars() {
+        if character.is_alphanumeric() {
+            if previous_lower && character.is_uppercase() && !current.is_empty() {
+                parts.push(current.to_ascii_lowercase());
+                current.clear();
+            }
+            previous_lower = character.is_lowercase();
+            current.push(character);
+        } else if !current.is_empty() {
+            parts.push(current.to_ascii_lowercase());
+            current.clear();
+            previous_lower = false;
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current.to_ascii_lowercase());
+    }
+    parts
+}
+
+/// Whether `name` carries `term` as the fold of a contiguous part-run:
+/// `lock` witnesses `LockManager` and `lock_manager.rs` but not
+/// `blockchain`; `websocket` witnesses `WebSocket` and
+/// `WebSocketHandler`. Substring matching without part boundaries
+/// would let unrelated names masquerade as definitions.
+fn name_witnesses(term: &str, name: &str) -> bool {
+    let term = folded_identifier(term);
+    if term.is_empty() {
+        return false;
+    }
+    let parts = identifier_parts(name);
+    for start in 0..parts.len() {
+        let mut run = String::new();
+        for part in parts.iter().skip(start) {
+            run.push_str(part);
+            if run == term {
+                return true;
+            }
+            if run.len() >= term.len() {
+                break;
+            }
+        }
+    }
+    false
+}
+
+/// Definition-tier witnesses for a term: entities and files whose name
+/// carries it as a contiguous part-run, capped for report size.
+/// Definition-tier witnesses for a claim term: entities or files whose
+/// name carries it. A `::`-qualified subject decomposes into scope +
+/// member — every segment must itself be defined, so
+/// `NonexistentType::method` is not witnessed by a bare `method`, while
+/// `ArtifactStore::open` is witnessed by `open` living where
+/// `ArtifactStore` is defined. Reported witnesses are the tail segment's
+/// definitions — the definable name — ordered to prefer entities
+/// coherent with a scope segment's home file.
+fn defined_witnesses(
+    store: &MetadataStore,
+    snapshot_id: &str,
+    term: &str,
+) -> Result<Vec<DefinedWitness>> {
+    let segments: Vec<&str> = term
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let matches = |segment: &str, entity: &CodeEntity| {
+        name_witnesses(segment, &entity.name)
+            || entity
+                .qualified_name
+                .as_deref()
+                .is_some_and(|qualified| name_witnesses(segment, qualified))
+    };
+    if segments.len() > 1 {
+        let mut segment_witnesses = Vec::with_capacity(segments.len());
+        for segment in &segments {
+            let found: Vec<CodeEntity> = store
+                .entity_name_candidates(snapshot_id, segment, 64)?
+                .into_iter()
+                .filter(|entity| matches(segment, entity))
+                .collect();
+            if found.is_empty() {
+                return Ok(Vec::new());
+            }
+            segment_witnesses.push(found);
+        }
+        let Some(tail) = segment_witnesses.pop() else {
+            return Ok(Vec::new());
+        };
+        let scope_files: std::collections::HashSet<&str> = segment_witnesses
+            .iter()
+            .flatten()
+            .filter_map(|entity| entity.address.as_ref().map(|address| address.path.as_str()))
+            .collect();
+        let mut tail = tail;
+        tail.sort_by_key(|entity| {
+            !entity
+                .address
+                .as_ref()
+                .is_some_and(|address| scope_files.contains(address.path.as_str()))
+        });
+        return Ok(tail
+            .into_iter()
+            .take(8)
+            .map(|entity| DefinedWitness {
+                entity_id: entity.id,
+                name: entity.name,
+                kind: entity.kind,
+                path: entity.address.map(|address| address.path),
+            })
+            .collect());
+    }
+    let candidates = store.entity_name_candidates(snapshot_id, term, 64)?;
+    Ok(candidates
+        .into_iter()
+        .filter(|entity| matches(term, entity))
+        .take(8)
+        .map(|entity| DefinedWitness {
+            entity_id: entity.id,
+            name: entity.name,
+            kind: entity.kind,
+            path: entity.address.map(|address| address.path),
+        })
+        .collect())
+}
+
+/// One term's witness data: definitions vs mentions.
+fn build_term_witness(store: &MetadataStore, snapshot_id: &str, term: &str) -> Result<TermWitness> {
+    Ok(TermWitness {
+        term: term.to_owned(),
+        defined: defined_witnesses(store, snapshot_id, term)?,
+        mentions: store.term_document_frequency(snapshot_id, term)?,
+        mention_paths: store.term_mention_paths(snapshot_id, term, 5)?,
+    })
+}
+
+/// What the evidence contains relative to the claim: per-term
+/// definition/mention data, the coherent-scope binding set for the
+/// distinguishing vocabulary, and the claim terms absent from every
+/// returned hit.
+fn build_witness_report(
+    store: &MetadataStore,
+    snapshot_id: &str,
+    frame: &ClaimFrame,
+    hits: &[SearchHit],
+) -> Result<WitnessReport> {
+    let mut checked = frame.subjects.clone();
+    for term in &frame.distinguishing_terms {
+        if !checked.contains(term) {
+            checked.push(term.clone());
+        }
+    }
+    checked.truncate(6);
+    let mut terms = Vec::with_capacity(checked.len());
+    for term in &checked {
+        terms.push(build_term_witness(store, snapshot_id, term)?);
+    }
+    let binding_artifacts = if frame.distinguishing_terms.len() >= 2 {
+        store
+            .terms_binding_paths(snapshot_id, &frame.distinguishing_terms, 10)?
+            .into_iter()
+            .map(|path| BoundArtifact {
+                class: document_class(&path),
+                path,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let document_ids: Vec<String> = hits
+        .iter()
+        .filter(|hit| !hit.document_id.starts_with("entity:"))
+        .map(|hit| hit.document_id.clone())
+        .collect();
+    let mut scope_gaps = Vec::new();
+    if !document_ids.is_empty() {
+        for term in &frame.distinguishing_terms {
+            if store
+                .documents_matching_term(snapshot_id, term, &document_ids)?
+                .is_empty()
+            {
+                scope_gaps.push(term.clone());
+            }
+        }
+    }
+    Ok(WitnessReport {
+        terms,
+        binding_artifacts,
+        scope_gaps,
+    })
+}
+
+/// Witness gaps worth flagging on an otherwise-answered verdict. These
+/// are reports, not verdicts — a consuming verifier reads them to
+/// decide whether the hits can constitute an answer.
+fn weak_witness_reasons(frame: &ClaimFrame, report: &WitnessReport) -> Vec<String> {
+    let quoted = |terms: &[String]| {
+        terms
+            .iter()
+            .map(|term| format!("`{term}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut reasons = Vec::new();
+    for witness in &report.terms {
+        if frame.subjects.contains(&witness.term) && witness.defined.is_empty() {
+            reasons.push(format!(
+                "weak_witness: `{}` has no definition-tier witness — the named subject is mention-only vocabulary",
+                witness.term
+            ));
+        }
+    }
+    if frame.distinguishing_terms.len() >= 2
+        && !report
+            .binding_artifacts
+            .iter()
+            .any(|artifact| artifact.class == DocumentClass::Code)
+    {
+        if report.binding_artifacts.is_empty() {
+            reasons.push(format!(
+                "weak_witness: no artifact binds the claim's distinguishing terms {}",
+                quoted(&frame.distinguishing_terms)
+            ));
+        } else {
+            let paths = report
+                .binding_artifacts
+                .iter()
+                .take(3)
+                .map(|artifact| artifact.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            reasons.push(format!(
+                "weak_witness: distinguishing terms {} co-bind only in prose: {paths}",
+                quoted(&frame.distinguishing_terms)
+            ));
+        }
+    }
+    if !frame.distinguishing_terms.is_empty()
+        && report.scope_gaps.len() == frame.distinguishing_terms.len()
+    {
+        reasons.push(format!(
+            "weak_witness: no returned hit carries the claim's distinguishing terms {}",
+            quoted(&frame.distinguishing_terms)
+        ));
+    }
+    reasons
+}
+
 /// Curated CJK→English glossary for the lexical route. Source vocabulary
 /// is English, so a query phrased in CJK terms indexes as one monolithic
 /// unicode61 token with no anchor into the documents it asks about — the
@@ -3055,6 +3581,165 @@ mod tests {
     }
 
     #[test]
+    fn content_terms_keep_claim_vocabulary() {
+        // The claim's specificity lives in plain lowercase words —
+        // "distributed" and "bearer" are not identifier-shaped but they
+        // ARE the claim. Shape words ("how", "implemented", "logic") are
+        // grammar, not content.
+        assert_eq!(
+            content_terms("how does the repository implement distributed locking"),
+            ["distributed", "locking"]
+        );
+        assert_eq!(
+            content_terms("how does the gateway handle bearer token validation"),
+            ["gateway", "bearer", "token", "validation"]
+        );
+        // Identifier-shaped terms survive lowercasing for matching;
+        // CJK cannot bind in the monolithic index and is excluded.
+        assert_eq!(
+            content_terms("Where is `ViewStatus` defined?"),
+            ["viewstatus"]
+        );
+        assert!(content_terms("快照在哪里定义").is_empty());
+    }
+
+    #[test]
+    fn name_witnesses_requires_contiguous_part_runs() {
+        // Contiguous part-run folds witness a term; inner substrings of
+        // a single part do not — `block` contains "lock" textually but
+        // never names it.
+        assert!(name_witnesses("lock", "LockManager"));
+        assert!(name_witnesses("lock", "lock_manager.rs"));
+        assert!(name_witnesses("lock", "src/lock/mod.rs"));
+        assert!(name_witnesses("websocket", "WebSocket"));
+        assert!(name_witnesses("websocket", "WebSocketHandler"));
+        assert!(name_witnesses("socket", "WebSocket"));
+        assert!(!name_witnesses("lock", "blockchain.rs"));
+        // Plural-suffix drift is a different spelling, not a witness —
+        // the same exactness the literal veto relies on.
+        assert!(!name_witnesses("lock", "src/locks/mod.rs"));
+        assert!(!name_witnesses("websocket", "ws_handler.rs"));
+        // The query's own near-miss spellings witness nothing real.
+        assert!(!name_witnesses(&pluralized("ViewStatus"), "ViewStatus"));
+    }
+
+    #[test]
+    fn defined_witnesses_qualified_subject_needs_each_segment_defined() {
+        // `ArtifactStore::open` decomposes into scope + member: `open` is
+        // a method where `ArtifactStore` is defined — qualified names in
+        // the index are file-path-qualified, so each `::` segment must
+        // witness independently. `NonexistentType::open` must not be
+        // witnessed by the bare `open` methods.
+        let mut artifact_open = symbol("open", "crates/cce-store/src/artifact.rs");
+        artifact_open.qualified_name = Some("crates/cce-store/src/artifact.rs::open".to_owned());
+        let mut engine_open = symbol("open", "crates/cce-engine/src/engine.rs");
+        engine_open.id = "symbol:open:engine".to_owned();
+        engine_open.qualified_name = Some("crates/cce-engine/src/engine.rs::open".to_owned());
+        let mut artifact_store = symbol("ArtifactStore", "crates/cce-store/src/artifact.rs");
+        artifact_store.id = "symbol:artifactstore".to_owned();
+        artifact_store.kind = EntityKind::Struct;
+        let records = SnapshotRecords {
+            entities: vec![
+                artifact_open,
+                engine_open,
+                artifact_store,
+                file("crates/cce-store/src/artifact.rs"),
+                file("crates/cce-engine/src/engine.rs"),
+            ],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, store, snapshot_id) = store_with(&records);
+
+        let witnesses =
+            defined_witnesses(&store, &snapshot_id, "ArtifactStore::open").expect("witnesses");
+        assert!(
+            !witnesses.is_empty(),
+            "scope + member both defined: the qualified subject witnesses"
+        );
+        // The reported witnesses are the member definitions, scope-
+        // coherent first: `open` living where `ArtifactStore` is defined
+        // outranks the unrelated `open` in engine.rs.
+        assert_eq!(
+            witnesses[0].path.as_deref(),
+            Some("crates/cce-store/src/artifact.rs"),
+            "scope-coherent member must order first: {witnesses:?}"
+        );
+
+        let ghost =
+            defined_witnesses(&store, &snapshot_id, "NonexistentType::open").expect("ghost");
+        assert!(
+            ghost.is_empty(),
+            "an undefined scope segment must not be witnessed by the bare member"
+        );
+
+        let ghost_member =
+            defined_witnesses(&store, &snapshot_id, "ArtifactStore::nonexistent_method")
+                .expect("ghost member");
+        assert!(
+            ghost_member.is_empty(),
+            "an undefined member segment must not be witnessed by the scope alone"
+        );
+    }
+
+    #[test]
+    fn claim_frame_maps_intent_to_witness_requirement() {
+        let frame = claim_frame(QueryIntent::ExactEntity, vec!["Foo".to_owned()]);
+        assert_eq!(frame.predicate, ClaimPredicate::Definition);
+        assert_eq!(frame.required_witness, WitnessRequirement::Definition);
+        let frame = claim_frame(QueryIntent::NaturalLanguageBehavior, Vec::new());
+        assert_eq!(frame.predicate, ClaimPredicate::Implementation);
+        assert_eq!(frame.required_witness, WitnessRequirement::CodeBinding);
+        let frame = claim_frame(QueryIntent::Impact, Vec::new());
+        assert_eq!(frame.required_witness, WitnessRequirement::Any);
+    }
+
+    #[test]
+    fn weak_witness_reasons_cover_each_gap_kind() {
+        let frame = ClaimFrame {
+            intent: QueryIntent::NaturalLanguageBehavior,
+            predicate: ClaimPredicate::Implementation,
+            required_witness: WitnessRequirement::CodeBinding,
+            subjects: vec!["gateway".to_owned()],
+            distinguishing_terms: vec!["bearer".to_owned(), "validation".to_owned()],
+        };
+        // Subject mention-only + binding prose-only + full scope gap.
+        let report = WitnessReport {
+            terms: vec![TermWitness {
+                term: "gateway".to_owned(),
+                defined: Vec::new(),
+                mentions: 7,
+                mention_paths: vec!["src/gateway.rs".to_owned()],
+            }],
+            binding_artifacts: vec![BoundArtifact {
+                path: "plans/009.md".to_owned(),
+                class: DocumentClass::Prose,
+            }],
+            scope_gaps: vec!["bearer".to_owned(), "validation".to_owned()],
+        };
+        let reasons = weak_witness_reasons(&frame, &report);
+        assert_eq!(reasons.len(), 3, "each gap kind reports once: {reasons:?}");
+        assert!(reasons[0].contains("no definition-tier witness"));
+        assert!(reasons[1].contains("only in prose"));
+        assert!(reasons[2].contains("no returned hit carries"));
+        // A code binding silences the binding reason; partial coverage
+        // silences the scope reason.
+        let report = WitnessReport {
+            binding_artifacts: vec![BoundArtifact {
+                path: "src/gateway.rs".to_owned(),
+                class: DocumentClass::Code,
+            }],
+            scope_gaps: vec!["bearer".to_owned()],
+            ..report
+        };
+        let reasons = weak_witness_reasons(&frame, &report);
+        assert_eq!(
+            reasons.len(),
+            1,
+            "only the subject gap remains: {reasons:?}"
+        );
+    }
+
+    #[test]
     fn add_candidate_strict_survives_merging() {
         // A weak-first admission must not lock a document into weakness:
         // once any strict pass claims it the flag flips, and later weak
@@ -3549,7 +4234,8 @@ mod tests {
         }
 
         // Control: the real entity answers normally — the veto must not
-        // over-fire on a spelling that IS in the corpus.
+        // over-fire on a spelling that IS in the corpus, and the verdict
+        // reports a clean answer.
         let result = engine
             .search(request("Where is `ViewStatus` defined?", 10))
             .await
@@ -3558,6 +4244,245 @@ mod tests {
             !result.hits.is_empty(),
             "the real entity must still answer: {:?}",
             result.missing_capabilities
+        );
+        assert_eq!(result.verdict.state, VerdictState::Answered);
+        assert!(
+            result.verdict.evidence_tiers.strict >= 1,
+            "the lexical hit is strict evidence: {:?}",
+            result.verdict
+        );
+        assert_eq!(result.verdict.claim.subjects, ["ViewStatus"]);
+        let subject = result
+            .verdict
+            .witness
+            .terms
+            .iter()
+            .find(|witness| witness.term == "ViewStatus")
+            .expect("subject witness");
+        assert!(
+            !subject.defined.is_empty(),
+            "`src/view_status.rs` is a definition-tier witness: {subject:?}"
+        );
+    }
+
+    /// A fixture with a real implementation file plus a prose document
+    /// that *mentions* claim vocabulary — the adversarial no-context
+    /// shape the verdict exists to describe.
+    fn verdict_fixture(
+        engine: &CceEngine,
+        snapshot_id: &str,
+        documents: &[(&str, &str, &str, &str)],
+    ) {
+        let anchor = RepositoryScanner::new(engine.config().clone())
+            .identify()
+            .expect("anchor");
+        engine
+            .store()
+            .register_repository(&anchor.identity)
+            .expect("register repository");
+        let snapshot = SnapshotIdentity {
+            id: snapshot_id.to_owned(),
+            repository_id: anchor.identity.id,
+            base_revision: None,
+            workspace_overlay_hash: String::new(),
+            index_profile_hash: String::new(),
+            created_at: chrono::Utc::now(),
+            file_count: documents.len() as u64,
+            source_bytes: 0,
+        };
+        engine
+            .store()
+            .begin_snapshot(&snapshot)
+            .expect("begin snapshot");
+        let mut records = SnapshotRecords::default();
+        for (document_id, path, name, body) in documents {
+            let (document, artifact) = indexed_document(
+                engine.store(),
+                document_id,
+                &format!("file:{path}"),
+                path,
+                name,
+                body,
+            );
+            records.artifacts.push(artifact);
+            records.entities.push(file(path));
+            records.documents.push(document);
+        }
+        engine
+            .store()
+            .commit_snapshot(&snapshot, &records)
+            .expect("commit records");
+    }
+
+    #[tokio::test]
+    async fn search_abstains_when_claim_subject_never_defined() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        verdict_fixture(
+            &engine,
+            "snap_witness",
+            &[(
+                "doc:rfc",
+                "docs/rfc.md",
+                "rfc",
+                "the websocket design was considered and rejected",
+            )],
+        );
+
+        // `WebSocket` is *mentioned* in prose (df > 0, so the literal
+        // veto passes) but never defined — no entity and no file bears
+        // the name. For a definition claim that is a provable negative.
+        let mut lookup = request("Where is `WebSocket` defined?", 10);
+        lookup.intent = Some(QueryIntent::ExactEntity);
+        let result = engine.search(lookup).await.expect("search");
+        assert!(
+            result.hits.is_empty(),
+            "no definition exists: {:?}",
+            result.hits
+        );
+        assert_eq!(result.verdict.state, VerdictState::Abstained);
+        assert!(
+            result
+                .verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("never defined")),
+            "abstention names the witness failure: {:?}",
+            result.verdict.reasons
+        );
+        let witness = result
+            .verdict
+            .witness
+            .terms
+            .iter()
+            .find(|witness| witness.term == "WebSocket")
+            .expect("subject witness");
+        assert!(witness.defined.is_empty());
+        assert_eq!(witness.mentions, 1, "the mention is still reported");
+        assert_eq!(witness.mention_paths, ["docs/rfc.md"]);
+
+        // A file bearing the name IS a definition — `docs/websocket.md`
+        // in the corpus turns the abstain into a weak-witness answer.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        verdict_fixture(
+            &engine,
+            "snap_witness2",
+            &[(
+                "doc:ws",
+                "docs/websocket.md",
+                "ws",
+                "the websocket approach defined in this sketch was rejected",
+            )],
+        );
+        let mut lookup = request("Where is `WebSocket` defined?", 10);
+        lookup.intent = Some(QueryIntent::ExactEntity);
+        let result = engine.search(lookup).await.expect("search");
+        assert_ne!(
+            result.verdict.state,
+            VerdictState::Abstained,
+            "a file named after the subject is a definition: {:?}",
+            result.verdict
+        );
+    }
+
+    #[tokio::test]
+    async fn search_flags_weak_witness_on_mention_only_subject() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        verdict_fixture(
+            &engine,
+            "snap_weak",
+            &[
+                (
+                    "doc:rfc",
+                    "docs/rfc.md",
+                    "rfc",
+                    "the websocket reconnection design sketch",
+                ),
+                (
+                    "doc:gw",
+                    "src/gateway.rs",
+                    "gateway",
+                    "the gateway validates every request token",
+                ),
+            ],
+        );
+
+        // A behavior claim whose backticked subject is mention-only:
+        // lexical evidence exists (the prose doc matches), but the
+        // subject has no definition-tier witness — answered hits with a
+        // weak-witness flag, not a silent pass.
+        let mut query = request("how does `WebSocket` handle reconnection", 10);
+        query.intent = Some(QueryIntent::NaturalLanguageBehavior);
+        let result = engine.search(query).await.expect("search");
+        assert!(!result.hits.is_empty(), "the prose doc still surfaces");
+        assert_eq!(result.verdict.state, VerdictState::WeakWitness);
+        assert!(
+            result
+                .verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("no definition-tier witness")),
+            "the witness gap is named: {:?}",
+            result.verdict.reasons
+        );
+    }
+
+    #[tokio::test]
+    async fn search_flags_weak_witness_when_terms_bind_nowhere() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        verdict_fixture(
+            &engine,
+            "snap_bind",
+            &[
+                (
+                    "doc:impl",
+                    "src/lock_manager.rs",
+                    "locks",
+                    "the coordinator locking mechanism acquires",
+                ),
+                (
+                    "doc:plan",
+                    "plans/009.md",
+                    "plan",
+                    "a distributed locking design sketch",
+                ),
+            ],
+        );
+
+        // `distributed` and `coordinator` never co-bind with `locking`
+        // in one artifact — each document carries part of the claim, no
+        // document carries it whole. Hits exist (pair-floor matches),
+        // but the witness report must say no artifact binds the claim.
+        let mut query = request("how does the coordinator handle distributed locking", 10);
+        query.intent = Some(QueryIntent::NaturalLanguageBehavior);
+        let result = engine.search(query).await.expect("search");
+        assert!(
+            !result.hits.is_empty(),
+            "partial coverage still surfaces: {:?}",
+            result.missing_capabilities
+        );
+        assert_eq!(result.verdict.state, VerdictState::WeakWitness);
+        assert!(
+            result
+                .verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("bind")),
+            "the binding gap is named: {:?}",
+            result.verdict.reasons
+        );
+        assert!(
+            result
+                .verdict
+                .witness
+                .binding_artifacts
+                .iter()
+                .all(|artifact| artifact.class == DocumentClass::Prose),
+            "no code artifact binds the claim: {:?}",
+            result.verdict.witness.binding_artifacts
         );
     }
 
