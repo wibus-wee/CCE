@@ -25,6 +25,7 @@ use utoipa::{OpenApi as _, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_swagger_ui::SwaggerUi;
 
+mod fanout;
 mod mcp;
 
 #[derive(Parser)]
@@ -265,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
         .routes(routes!(check_blobs))
         .routes(routes!(put_blob))
         .routes(routes!(push))
+        .routes(routes!(fanout::search_all))
         .routes(routes!(mcp::endpoint))
         .split_for_parts();
     let mut router = api_router
