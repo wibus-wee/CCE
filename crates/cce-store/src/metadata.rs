@@ -1144,6 +1144,51 @@ impl MetadataStore {
         row.map(entity_from_cols).transpose()
     }
 
+    /// Entities by id, batched: one `IN` query per chunk instead of a
+    /// point lookup per id. Retrieval passes that fan out over graph
+    /// neighbors resolve hundreds of entities — round-tripping each one
+    /// dominates the join's latency.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn entities_by_ids(&self, snapshot_id: &str, ids: &[String]) -> Result<Vec<CodeEntity>> {
+        const SQLITE_VARIABLE_LIMIT: usize = 900;
+        let connection = self.connection.lock();
+        let mut entities = Vec::new();
+        for chunk in ids.chunks(SQLITE_VARIABLE_LIMIT) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT id, kind, name, qualified_name, signature, language, region_id,
+                 address_json, capabilities_json, attributes_json FROM entities
+                 WHERE snapshot_id=?1 AND id IN ({placeholders})"
+            );
+            let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 1);
+            params.push(snapshot_id.to_owned().into());
+            params.extend(chunk.iter().map(|id| id.clone().into()));
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(params), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                })
+                .map_err(storage_error)?;
+            for row in rows {
+                entities.push(entity_from_cols(row.map_err(storage_error)?)?);
+            }
+        }
+        Ok(entities)
+    }
+
     /// Regions of one kind for a snapshot — the canonical code-range join
     /// target shared by documents, entities, and citations.
     /// All canonical regions in one file, ordered by position.
