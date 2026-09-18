@@ -1,8 +1,8 @@
 use std::{collections::HashMap, time::Instant};
 
 use cce_core::{
-    CodeEntity, EntityKind, QueryIntent, Result, RetrievalRepresentation, SearchHit, SearchRequest,
-    SearchRoute, ViewKind, ViewManifest, ViewState, has_cjk,
+    CodeEntity, EntityKind, QueryIntent, RelationKind, Result, RetrievalRepresentation, SearchHit,
+    SearchRequest, SearchRoute, ViewKind, ViewManifest, ViewState, has_cjk,
 };
 use cce_store::{MetadataStore, RelationDirection};
 use serde::{Deserialize, Serialize};
@@ -632,6 +632,16 @@ impl CceEngine {
             &expansion_evidence,
             &mut candidates,
         )?;
+        // Symbol evidence runs last among scoring passes: its seeds are
+        // the candidates the other passes already ranked.
+        symbol_evidence_join(
+            self.store(),
+            &request.snapshot_id,
+            &request.query,
+            &mut candidates,
+            verified_fresh,
+            request.limit,
+        )?;
 
         let mut hits = self.select_hits(&request, &candidates)?;
 
@@ -955,10 +965,7 @@ impl CceEngine {
 /// endpoint. Directional arms keep co-change evidence in the partner bonus
 /// of `apply_structural_features`, which also looks it up in both
 /// directions.
-const fn expansion_policy(
-    policy: GraphPolicy,
-) -> (RelationDirection, &'static [cce_core::RelationKind]) {
-    use cce_core::RelationKind;
+const fn expansion_policy(policy: GraphPolicy) -> (RelationDirection, &'static [RelationKind]) {
     match policy {
         GraphPolicy::OutgoingTrace => (
             RelationDirection::Outgoing,
@@ -1043,6 +1050,24 @@ const CLUSTER_CAP: f64 = 0.2;
 const FILE_VOTE_BONUS: f64 = 0.2;
 const FILE_VOTE_MAX_OCCURRENCES: usize = 8;
 
+/// Symbol-evidence join bounds. Claims are supported by atomic symbols,
+/// but topical retrieval scores documents — the entities the head
+/// already surfaced point at the symbols the mechanism actually uses.
+/// The pass walks outgoing `References`/`Calls` edges from candidate
+/// entities, counts how many retrieved entities point at each neighbor,
+/// and emits bounded-mass `entity:` hits into the mid-tail where
+/// `claim_support` and `symbol_recall` read the list — never scoring
+/// high enough to reorder the head. Seeds are degree-capped so a hub
+/// entity cannot buy rank for its whole neighborhood.
+const SYMBOL_EVIDENCE_MAX: usize = 12;
+const SYMBOL_EVIDENCE_SEEDS: usize = 24;
+const SYMBOL_EVIDENCE_SEED_DEGREE: usize = 48;
+/// Mass floor for an emitted block entry: it must beat the score at
+/// `limit - MAX` so the whole block lands inside the emitted window
+/// while displacing only the weakest incumbents. A hair above the
+/// boundary keeps ordering inside the block deterministic.
+const SYMBOL_EVIDENCE_BOUNDARY_FRACTION: f64 = 1.02;
+
 /// Structural priors layered on the fused ranking:
 /// - exact symbol/word agreement between the query and a hit's symbol name;
 /// - same-file evidence aggregation (a file holding a top-3 hit makes its
@@ -1094,7 +1119,7 @@ fn apply_structural_features(
         for relation in
             store.relations_for_entity(snapshot_id, &file.id, RelationDirection::Both, degree)?
         {
-            if relation.kind != cce_core::RelationKind::ChangedWith {
+            if relation.kind != RelationKind::ChangedWith {
                 continue;
             }
             let partner_id = if relation.source_entity_id == file.id {
@@ -1353,6 +1378,222 @@ fn apply_corroboration(
         }
         candidate.hit.explanation.extend(notes);
         candidate.fused_score += bonus / RRF_K;
+    }
+    Ok(())
+}
+
+/// Symbol-evidence join: the documents answering a query name the
+/// files, but claims are supported by the atomic symbols those files'
+/// mechanism functions actually use. Every candidate entity's outgoing
+/// `References`/`Calls` edges are evidence pointers — a neighbor
+/// pointed at by several retrieved entities is consensus evidence, and
+/// a neighbor whose name overlaps the query is on-topic. Both signals
+/// are combined per neighbor; the best few emit as `entity:`-keyed hits
+/// at bounded mid-tail mass.
+///
+/// Placement is deliberate: `claim_support` and `symbol_recall` read
+/// the whole hit list, so evidence enriches the tail without touching
+/// the head ordering the other passes just established. Neighbors
+/// already in the candidate map merge score through `add_candidate`,
+/// corroborating rather than duplicating.
+fn symbol_evidence_join(
+    store: &MetadataStore,
+    snapshot_id: &str,
+    query: &str,
+    candidates: &mut HashMap<String, Candidate>,
+    verified_fresh: bool,
+    limit: usize,
+) -> Result<()> {
+    let query_terms = prf_terms_in(query);
+    if query_terms.is_empty() || candidates.is_empty() {
+        return Ok(());
+    }
+    // Plural-tolerant term set: "views" in prose should match the "view"
+    // inside `set_view_status`. Both forms are admitted so a query's
+    // singular and plural spellings collapse onto the symbol token.
+    let mut tolerant_terms = query_terms.clone();
+    for term in &query_terms {
+        if term.len() > 3 && term.ends_with('s') {
+            tolerant_terms.insert(term[..term.len() - 1].to_owned());
+        }
+    }
+
+    // Consensus count: for every neighbor, how many retrieved entities
+    // point at it, and the strongest single referrer's score. Seeds are
+    // the strongest unique candidate entities — the head carries the
+    // signal and the cap bounds the per-seed relation fetches. Seed
+    // degree is capped so hub entities cannot flood the neighbor space.
+    let mut neighbors = HashMap::<String, (usize, f64)>::new(); // id → (pointers, best referrer)
+    let mut unique = HashMap::<String, f64>::new();
+    for candidate in candidates.values() {
+        let entry = unique.entry(candidate.hit.entity_id.clone()).or_default();
+        *entry = entry.max(candidate.fused_score);
+    }
+    let mut seeds: Vec<(String, f64)> = unique.into_iter().collect();
+    seeds.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    seeds.truncate(SYMBOL_EVIDENCE_SEEDS);
+    // The block's mass is read off the incumbent pool: beating the
+    // score at `limit - MAX` lands every entry inside the emitted
+    // window at the cost of only the weakest incumbents. Shallow pools
+    // anchor at their own tail instead.
+    let mut pool_scores: Vec<f64> = candidates.values().map(|c| c.fused_score).collect();
+    pool_scores.sort_by(|a, b| b.total_cmp(a));
+    let boundary = pool_scores
+        .get(limit.saturating_sub(SYMBOL_EVIDENCE_MAX))
+        .or_else(|| pool_scores.last())
+        .copied()
+        .unwrap_or_default();
+    for (seed_id, seed_score) in &seeds {
+        let degree = store
+            .entity_relation_degree(snapshot_id, seed_id)?
+            .min(SYMBOL_EVIDENCE_SEED_DEGREE);
+        for relation in
+            store.relations_for_entity(snapshot_id, seed_id, RelationDirection::Outgoing, degree)?
+        {
+            if !matches!(
+                relation.kind,
+                RelationKind::References | RelationKind::Calls
+            ) {
+                continue;
+            }
+            let entry = neighbors
+                .entry(relation.target_entity_id.clone())
+                .or_default();
+            entry.0 += 1;
+            entry.1 = entry.1.max(*seed_score);
+        }
+    }
+    if neighbors.is_empty() {
+        return Ok(());
+    }
+
+    // Score each neighbor: consensus pointers plus identifier overlap.
+    // Either signal alone can admit — a symbol named like the query is
+    // topical, one referenced by the head is structural — so a neighbor
+    // needs at least one of them, and raw score orders the emission cap.
+    // Neighbor resolution is one batched fetch: hundreds of entities
+    // fan out per query, and point lookups dominate the join's cost.
+    let neighbor_ids: Vec<String> = neighbors.keys().cloned().collect();
+    let entities: HashMap<String, CodeEntity> = store
+        .entities_by_ids(snapshot_id, &neighbor_ids)?
+        .into_iter()
+        .map(|entity| (entity.id.clone(), entity))
+        .collect();
+    let mut scored: Vec<(f64, usize, CodeEntity)> = Vec::new();
+    for (entity_id, (pointers, best_referrer)) in neighbors {
+        let Some(entity) = entities.get(&entity_id) else {
+            continue;
+        };
+        if !matches!(
+            entity.kind,
+            EntityKind::Function
+                | EntityKind::Struct
+                | EntityKind::Enum
+                | EntityKind::Trait
+                | EntityKind::Class
+                | EntityKind::Interface
+                | EntityKind::Constant
+        ) {
+            continue;
+        }
+        let overlap = prf_terms_in(&entity.name)
+            .iter()
+            .filter(|term| {
+                tolerant_terms.contains(term.as_str())
+                    || (term.len() > 3
+                        && term.ends_with('s')
+                        && tolerant_terms.contains(&term[..term.len() - 1]))
+            })
+            .count();
+        if pointers < 2 && overlap == 0 {
+            continue;
+        }
+        // Raw score: consensus pointers dominate, identifier overlap
+        // weighs 1.5× a pointer, and the strongest referrer's fused
+        // score (~0.01-0.05) is a mild nudge that breaks pointer ties
+        // toward head-endorsed evidence.
+        let raw = 1.5f64.mul_add(overlap as f64, pointers as f64) + best_referrer;
+        scored.push((raw, overlap, entity.clone()));
+    }
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.2.id.cmp(&right.2.id))
+    });
+    // Two emission lanes, interleaved. The named lane is restricted to
+    // callable symbols: claim facts name functions and methods, while
+    // name-matched types still reach the list through the consensus
+    // lane on pointer count alone. Without the restriction, type hubs
+    // pointed at by everything crowd the exact claim evidence out of
+    // the emission cap.
+    let (named, plain): (Vec<_>, Vec<_>) = scored.into_iter().partition(|(_, overlap, entity)| {
+        *overlap > 0 && matches!(entity.kind, EntityKind::Function | EntityKind::Method)
+    });
+    let mut named = named.into_iter();
+    let mut plain = plain.into_iter();
+    let mut scored: Vec<(f64, usize, CodeEntity)> = Vec::new();
+    while scored.len() < SYMBOL_EVIDENCE_MAX {
+        let mut progressed = false;
+        for lane in [&mut named, &mut plain] {
+            if let Some(entry) = lane.next() {
+                scored.push(entry);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    if scored.is_empty() {
+        return Ok(());
+    }
+    if std::env::var_os("CCE_DEBUG_SYMEV").is_some() {
+        for (i, (raw, ov, e)) in scored.iter().enumerate() {
+            eprintln!("[symev] #{i} raw={raw:.3} ov={ov} {}", e.name);
+        }
+    }
+
+    for (rank, (raw, overlap, entity)) in scored.into_iter().enumerate() {
+        if boundary <= 0.0 {
+            break;
+        }
+        // A hair above the boundary, decaying within the block so lane
+        // order is preserved among the emitted entries.
+        let mass =
+            boundary * SYMBOL_EVIDENCE_BOUNDARY_FRACTION * 0.005f64.mul_add(-(rank as f64), 1.0);
+        let snippet = entity
+            .signature
+            .clone()
+            .or_else(|| entity.qualified_name.clone())
+            .unwrap_or_else(|| entity.name.clone());
+        add_candidate(
+            candidates,
+            SearchHit {
+                document_id: format!("entity:{}", entity.id),
+                region_id: entity.region_id.clone(),
+                symbol_name: Some(entity.name.clone()),
+                entity_id: entity.id.clone(),
+                representation: RetrievalRepresentation::Signature,
+                route: SearchRoute::Structural,
+                rank: rank + 1,
+                score: mass,
+                contributing_routes: vec![SearchRoute::Structural],
+                address: entity.address,
+                evidence: Vec::new(),
+                snippet,
+                verified_current: verified_fresh,
+                explanation: vec![format!(
+                    "symbol evidence: referenced by retrieved candidates, consensus score {raw:.2}, term overlap {overlap}"
+                )],
+            },
+            mass,
+        );
     }
     Ok(())
 }
@@ -2081,6 +2322,64 @@ mod tests {
             );
         }
         assert!(candidates["c"].hit.explanation.is_empty());
+    }
+
+    #[test]
+    fn symbol_evidence_surfaces_pointed_symbols() {
+        // Seeds are the retrieved file entities; their outgoing
+        // references edges name the atomic symbols claim evidence lives
+        // in. `set_view_status` is admitted on query overlap alone
+        // ("views" tolerates the singular "view"), `consensus_target`
+        // on two pointers without any name match, while a single
+        // pointer with no overlap is noise and a `changed_with` edge
+        // is the wrong kind entirely.
+        let records = SnapshotRecords {
+            entities: vec![
+                file("src/a.rs"),
+                file("src/b.rs"),
+                symbol("set_view_status", "src/m.rs"),
+                symbol("consensus_target", "src/m.rs"),
+                symbol("unrelated_helper", "src/m.rs"),
+                symbol("decoy_only_changed", "src/m.rs"),
+            ],
+            relations: vec![
+                references("file:src/a.rs", "symbol:set_view_status"),
+                references("file:src/a.rs", "symbol:consensus_target"),
+                references("file:src/b.rs", "symbol:consensus_target"),
+                references("file:src/a.rs", "symbol:unrelated_helper"),
+                changed_with("file:src/a.rs", "symbol:decoy_only_changed", 0.9),
+            ],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, store, snapshot_id) = store_with(&records);
+
+        let mut candidates = HashMap::new();
+        candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
+        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.05));
+
+        symbol_evidence_join(
+            &store,
+            &snapshot_id,
+            "mark views stale",
+            &mut candidates,
+            true,
+            50,
+        )
+        .expect("symbol evidence");
+
+        let emitted = &candidates["entity:symbol:set_view_status"].hit;
+        assert_eq!(emitted.route, SearchRoute::Structural);
+        assert_eq!(emitted.symbol_name.as_deref(), Some("set_view_status"));
+        assert!(emitted.verified_current);
+        assert!(
+            emitted
+                .explanation
+                .iter()
+                .any(|line| line.contains("symbol evidence"))
+        );
+        assert!(candidates.contains_key("entity:symbol:consensus_target"));
+        assert!(!candidates.contains_key("entity:symbol:unrelated_helper"));
+        assert!(!candidates.contains_key("entity:symbol:decoy_only_changed"));
     }
 
     #[test]
