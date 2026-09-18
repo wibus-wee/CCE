@@ -627,9 +627,11 @@ impl CceEngine {
             &mut candidates,
         )?;
         // Structural passes. `CCE_FLOW` selects the graph evidence
-        // mechanism: `off` keeps only the legacy priors, `replace` runs
-        // the unified flow pass INSTEAD of the priors it subsumes, and
-        // anything else unions them (flow is additive on top).
+        // mechanism: `union` runs flow additively on top of the legacy
+        // priors, `replace` runs flow INSTEAD of the priors it subsumes.
+        // Default is off — the v6 A/B showed union adds ~1.4s/query for
+        // no measured gain and replace hasn't matched sparse tail
+        // coverage yet, so the experimental pass stays opt-in.
         let flow_mode = std::env::var("CCE_FLOW").unwrap_or_default();
         if !matches!(flow_mode.as_str(), "replace") {
             apply_corroboration(
@@ -649,7 +651,7 @@ impl CceEngine {
                 request.limit,
             )?;
         }
-        if flow_mode != "off" {
+        if matches!(flow_mode.as_str(), "union" | "replace") {
             apply_graph_flow(
                 self.store(),
                 &request.snapshot_id,
@@ -1637,17 +1639,8 @@ const FLOW_SEED_DEGREE: usize = 64;
 const FLOW_HOPS: usize = 2;
 const FLOW_HOP_DECAY: f64 = 0.5;
 const FLOW_BONUS: f64 = 0.25;
-const FLOW_EMIT_MAX: usize = 8;
-
-/// Receiver-side hub gate `1/(1+ln degree)`: one inbound edge passes
-/// mass at full strength, while a type referenced by hundreds of
-/// functions absorbs proportionally little per sender. This is the
-/// target-side counterpart of source-side fan-out normalization —
-/// without it, signature types monopolize the flow exactly as pointer
-/// hubs did in the symbol-evidence join.
-fn flow_hub_gate(degree: f64) -> f64 {
-    1.0 / (1.0 + degree.max(1.0).ln())
-}
+const FLOW_EMIT_MAX: usize = 12;
+const FLOW_FRONTIER: usize = 16;
 
 /// Per-kind conductance `(forward, backward)`: the fraction of a
 /// node's mass crossing an edge in each direction per hop. The table
@@ -1698,6 +1691,60 @@ const fn flow_kind_tag(kind: &RelationKind) -> u8 {
     }
 }
 
+/// Fetch `entity_id`'s relations (degree-capped) and append unseen
+/// `(source, target, kind)` edges with extractor confidence. Relation
+/// rows repeat per extractor merge, so `seen` dedups or flow mass
+/// multiplies.
+fn flow_collect_edges(
+    store: &MetadataStore,
+    snapshot_id: &str,
+    entity_id: &str,
+    seen: &mut std::collections::BTreeSet<(String, String, u8)>,
+    edges: &mut Vec<(String, String, RelationKind, f64)>,
+) -> Result<()> {
+    let degree = store
+        .entity_relation_degree(snapshot_id, entity_id)?
+        .min(FLOW_SEED_DEGREE);
+    for relation in
+        store.relations_for_entity(snapshot_id, entity_id, RelationDirection::Both, degree)?
+    {
+        let key = (
+            relation.source_entity_id.clone(),
+            relation.target_entity_id.clone(),
+            flow_kind_tag(&relation.kind),
+        );
+        if seen.insert(key) {
+            edges.push((
+                relation.source_entity_id,
+                relation.target_entity_id,
+                relation.kind,
+                f64::from(relation.confidence),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Per-(node, kind) confidence sums: `(outgoing, incoming)` totals the
+/// propagation loop normalizes edge shares against.
+type FlowConfMaps = (
+    HashMap<(String, RelationKind), f64>,
+    HashMap<(String, RelationKind), f64>,
+);
+
+/// Rebuild the per-(node, kind) confidence sums the propagation loop
+/// normalizes against. Called once for the seed universe and again
+/// after frontier edges merge.
+fn flow_degree_maps(edges: &[(String, String, RelationKind, f64)]) -> FlowConfMaps {
+    let mut out_conf = HashMap::<(String, RelationKind), f64>::new();
+    let mut in_conf = HashMap::<(String, RelationKind), f64>::new();
+    for (source, target, kind, confidence) in edges {
+        *out_conf.entry((source.clone(), kind.clone())).or_default() += confidence;
+        *in_conf.entry((target.clone(), kind.clone())).or_default() += confidence;
+    }
+    (out_conf, in_conf)
+}
+
 fn apply_graph_flow(
     store: &MetadataStore,
     snapshot_id: &str,
@@ -1738,30 +1785,9 @@ fn apply_graph_flow(
     // their source is also a seed — seed→shared-neighbor→seed is how
     // cluster support emerges in hop 2.
     let mut edges: Vec<(String, String, RelationKind, f64)> = Vec::new();
-    {
-        let mut seen = std::collections::BTreeSet::<(String, String, u8)>::new();
-        for (seed_id, _) in &seeds {
-            let degree = store
-                .entity_relation_degree(snapshot_id, seed_id)?
-                .min(FLOW_SEED_DEGREE);
-            for relation in
-                store.relations_for_entity(snapshot_id, seed_id, RelationDirection::Both, degree)?
-            {
-                let key = (
-                    relation.source_entity_id.clone(),
-                    relation.target_entity_id.clone(),
-                    flow_kind_tag(&relation.kind),
-                );
-                if seen.insert(key) {
-                    edges.push((
-                        relation.source_entity_id,
-                        relation.target_entity_id,
-                        relation.kind,
-                        f64::from(relation.confidence),
-                    ));
-                }
-            }
-        }
+    let mut seen = std::collections::BTreeSet::<(String, String, u8)>::new();
+    for (seed_id, _) in &seeds {
+        flow_collect_edges(store, snapshot_id, seed_id, &mut seen, &mut edges)?;
     }
     if edges.is_empty() {
         return Ok(());
@@ -1777,21 +1803,15 @@ fn apply_graph_flow(
     // a source's mass splits across its same-kind edges proportional to
     // extractor confidence, and the kind's conductance weight then
     // decides how much of the source's total mass that layer carries.
-    // Per-kind in-degree powers the receiver-side hub gate: a type
-    // referenced by hundreds of functions absorbs little per sender,
-    // while a file `contains`-ing many members is a normal parent.
-    let mut out_conf = HashMap::<(String, RelationKind), f64>::new();
-    let mut in_conf = HashMap::<(String, RelationKind), f64>::new();
-    let mut out_deg = HashMap::<(String, RelationKind), f64>::new();
-    let mut in_deg = HashMap::<(String, RelationKind), f64>::new();
-    for (source, target, kind, confidence) in &edges {
-        *out_conf.entry((source.clone(), kind.clone())).or_default() += confidence;
-        *in_conf.entry((target.clone(), kind.clone())).or_default() += confidence;
-        *out_deg.entry((source.clone(), kind.clone())).or_default() += 1.0;
-        *in_deg.entry((target.clone(), kind.clone())).or_default() += 1.0;
-    }
+    // Receiver-side degree is deliberately NOT gated: within this
+    // bounded universe (≤ FLOW_SEEDS senders) high in-degree is
+    // corroborating consensus, not global hubness — gating it here
+    // punished exactly the multi-sender evidence the mechanism exists
+    // to reward (type hubs lost to low-degree utilities in v6.0).
+    let (mut out_conf, mut in_conf) = flow_degree_maps(&edges);
 
     let mut mass: HashMap<String, f64> = seeds.iter().cloned().collect();
+    let seed_ids: std::collections::HashSet<&String> = seeds.iter().map(|(id, _)| id).collect();
     // Mass RECEIVED from other nodes — the evidence signal. Seed mass
     // itself is excluded: a candidate's own topicality is not evidence
     // corroborating it.
@@ -1804,6 +1824,25 @@ fn apply_graph_flow(
     // is the consensus signal itself.
     let mut traversed = std::collections::HashSet::<(usize, u8)>::new();
     for hop in 1..=FLOW_HOPS {
+        if hop > 1 {
+            // Frontier expansion: hop-1's strongest receivers get their
+            // own edges fetched so mass can relay past the seed star —
+            // file→member→mechanism is the two-hop path lexical
+            // evidence cannot name. Without this, hop 2 could only echo
+            // inside edges incident to seeds.
+            let mut frontier: Vec<(f64, &String)> = received
+                .iter()
+                .filter(|(id, _)| !seed_ids.contains(id))
+                .map(|(id, flow)| (*flow, id))
+                .collect();
+            frontier.sort_by(|left, right| {
+                right.0.total_cmp(&left.0).then_with(|| left.1.cmp(right.1))
+            });
+            for (_, entity_id) in frontier.into_iter().take(FLOW_FRONTIER) {
+                flow_collect_edges(store, snapshot_id, entity_id, &mut seen, &mut edges)?;
+            }
+            (out_conf, in_conf) = flow_degree_maps(&edges);
+        }
         let prev = mass.clone();
         let used = std::mem::take(&mut traversed);
         let mut delta = std::collections::BTreeMap::<String, f64>::new();
@@ -1817,14 +1856,8 @@ fn apply_graph_flow(
                         .copied()
                         .unwrap_or(1.0)
                         .max(f64::EPSILON);
-                let hub_gate = flow_hub_gate(
-                    in_deg
-                        .get(&(target.clone(), kind.clone()))
-                        .copied()
-                        .unwrap_or(1.0),
-                );
-                *delta.entry(target.clone()).or_default() +=
-                    (forward * source_mass * share).mul_add(hub_gate, 0.0);
+                let flow = forward * source_mass * share;
+                *delta.entry(target.clone()).or_default() += flow;
                 traversed.insert((index, 0));
             }
             let target_mass = prev.get(target).copied().unwrap_or_default();
@@ -1835,14 +1868,8 @@ fn apply_graph_flow(
                         .copied()
                         .unwrap_or(1.0)
                         .max(f64::EPSILON);
-                let hub_gate = flow_hub_gate(
-                    out_deg
-                        .get(&(source.clone(), kind.clone()))
-                        .copied()
-                        .unwrap_or(1.0),
-                );
-                *delta.entry(source.clone()).or_default() +=
-                    (backward * target_mass * share).mul_add(hub_gate, 0.0);
+                let flow = backward * target_mass * share;
+                *delta.entry(source.clone()).or_default() += flow;
                 traversed.insert((index, 1));
             }
         }
