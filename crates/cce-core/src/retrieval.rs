@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::SourceAddress;
+use crate::{RelationKind, RelationOrigin, SourceAddress};
 
 /// Coarse classification of what a query is trying to accomplish, used by
 /// the planner to pick routes and graph policy.
@@ -319,6 +319,12 @@ pub enum WitnessRequirement {
     /// The claim's distinguishing terms must co-bind inside at least one
     /// coherent code artifact.
     CodeBinding,
+    /// At least one claim subject must participate in typed relation
+    /// edges — a relation claim's witness is the edge set itself.
+    Relation,
+    /// At least one claim subject must appear in commit-class documents
+    /// — a history claim's witness is the recorded change history.
+    History,
     /// Any strict-tier evidence suffices; no witness typing asserted.
     Any,
 }
@@ -389,6 +395,25 @@ pub struct DefinedWitness {
     pub path: Option<String>,
 }
 
+/// Typed-edge summary across a term's definition entities — a relation
+/// claim's witness is the edge set itself.
+///
+/// Counts are bounded samples (per-entity edge fetches are capped):
+/// enough to attest that relations exist and of which kinds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationWitness {
+    /// Inbound + outbound edges sampled across the term's definitions.
+    pub edges: usize,
+    /// Distinct edge kinds present.
+    #[serde(default)]
+    pub kinds: Vec<RelationKind>,
+    /// Origins present — deterministic facts vs model inference stay
+    /// split, so inference-only structure is never passed as source truth.
+    #[serde(default)]
+    pub origins: Vec<RelationOrigin>,
+}
+
 /// Per-term witness data: defined (entities/files) vs mentioned
 /// (documents). Mention is not definition — the distinction this report
 /// exists to surface.
@@ -406,6 +431,15 @@ pub struct TermWitness {
     /// consuming verifier.
     #[serde(default)]
     pub mention_paths: Vec<String>,
+    /// Typed-edge summary across this term's definitions — zero edges
+    /// means the term participates in no recorded relation.
+    #[serde(default)]
+    pub relations: RelationWitness,
+    /// Commit-class document ids (commit summary/diff) containing the
+    /// term — the history claim's witness surface. Empty means the term
+    /// never appears in the recorded change history.
+    #[serde(default)]
+    pub history_documents: Vec<String>,
 }
 
 /// An artifact binding every distinguishing term in one coherent scope —
@@ -495,6 +529,12 @@ mod tests {
                     defined: Vec::new(),
                     mentions: 4,
                     mention_paths: vec!["plans/009.md".to_owned()],
+                    relations: RelationWitness {
+                        edges: 3,
+                        kinds: vec![RelationKind::Calls],
+                        origins: vec![RelationOrigin::ModelInference],
+                    },
+                    history_documents: vec!["commit:abc123".to_owned()],
                 }],
                 binding_artifacts: vec![BoundArtifact {
                     path: "docs/rfc.md".to_owned(),
@@ -518,6 +558,19 @@ mod tests {
         );
         assert_eq!(json["witness"]["bindingArtifacts"][0]["class"], "prose");
         assert_eq!(json["witness"]["scopeGaps"][0], "reconnect");
+        assert_eq!(json["witness"]["terms"][0]["relations"]["edges"], 3);
+        assert_eq!(
+            json["witness"]["terms"][0]["relations"]["kinds"][0],
+            "calls"
+        );
+        assert_eq!(
+            json["witness"]["terms"][0]["relations"]["origins"][0],
+            "model_inference"
+        );
+        assert_eq!(
+            json["witness"]["terms"][0]["historyDocuments"][0],
+            "commit:abc123"
+        );
         assert_eq!(json["evidenceTiers"]["strict"], 2);
         let roundtrip: SearchVerdict = serde_json::from_value(json).expect("deserialize");
         assert_eq!(roundtrip, verdict);

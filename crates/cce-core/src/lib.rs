@@ -23,9 +23,9 @@ pub use region::{CodeRegion, RegionKind};
 pub use relation::{Relation, RelationKind, RelationOrigin};
 pub use retrieval::{
     BoundArtifact, ClaimFrame, ClaimPredicate, DefinedWitness, DocumentClass, EvidenceTiers,
-    GraphPolicy, QueryFilters, QueryIntent, RetrievalDocument, RetrievalRepresentation, SearchHit,
-    SearchRequest, SearchRoute, SearchVerdict, TermWitness, VerdictState, WitnessReport,
-    WitnessRequirement, document_class, parse_query_filters,
+    GraphPolicy, QueryFilters, QueryIntent, RelationWitness, RetrievalDocument,
+    RetrievalRepresentation, SearchHit, SearchRequest, SearchRoute, SearchVerdict, TermWitness,
+    VerdictState, WitnessReport, WitnessRequirement, document_class, parse_query_filters,
 };
 pub use snapshot::{IndexProfile, RepositoryIdentity, SnapshotIdentity};
 pub use text::{folded_identifier, has_cjk, split_identifier_terms};

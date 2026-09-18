@@ -2,10 +2,10 @@ use std::{collections::HashMap, time::Instant};
 
 use cce_core::{
     BoundArtifact, ClaimFrame, ClaimPredicate, CodeEntity, DefinedWitness, DocumentClass,
-    EntityKind, EvidenceTiers, QueryIntent, RelationKind, Result, RetrievalRepresentation,
-    SearchHit, SearchRequest, SearchRoute, SearchVerdict, TermWitness, VerdictState, ViewKind,
-    ViewManifest, ViewState, WitnessReport, WitnessRequirement, document_class, folded_identifier,
-    has_cjk,
+    EntityKind, EvidenceTiers, QueryIntent, RelationKind, RelationOrigin, RelationWitness, Result,
+    RetrievalRepresentation, SearchHit, SearchRequest, SearchRoute, SearchVerdict, TermWitness,
+    VerdictState, ViewKind, ViewManifest, ViewState, WitnessReport, WitnessRequirement,
+    document_class, folded_identifier, has_cjk,
 };
 use cce_store::{MetadataStore, RelationDirection};
 use serde::{Deserialize, Serialize};
@@ -266,28 +266,18 @@ impl CceEngine {
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
-                missing_capabilities.push(reason.clone());
-                frame.distinguishing_terms = resolve_distinguishing(
+                return abstain_result(
                     self.store(),
-                    &request.snapshot_id,
-                    &content_terms(&request.query),
-                )?;
-                let verdict = SearchVerdict {
-                    state: VerdictState::Abstained,
-                    reasons: vec![reason],
-                    witness: build_witness_report(self.store(), &request.snapshot_id, &frame, &[])?,
-                    claim: frame,
-                    evidence_tiers: EvidenceTiers::default(),
-                };
-                return Ok(SearchResult {
-                    request,
-                    plan,
-                    manifest,
-                    hits: Vec::new(),
-                    missing_capabilities,
-                    verdict,
-                    latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-                });
+                    AbstainContext {
+                        request,
+                        plan,
+                        manifest,
+                        missing_capabilities,
+                        frame,
+                        started,
+                    },
+                    reason,
+                );
             }
         }
         // Witness gate, definition side: an exact-entity claim asks where
@@ -328,28 +318,119 @@ impl CceEngine {
                         .join(", "),
                     if frame.subjects.len() == 1 { "s" } else { "ve" },
                 );
-                missing_capabilities.push(reason.clone());
-                frame.distinguishing_terms = resolve_distinguishing(
+                return abstain_result(
                     self.store(),
-                    &request.snapshot_id,
-                    &content_terms(&request.query),
-                )?;
-                let verdict = SearchVerdict {
-                    state: VerdictState::Abstained,
-                    reasons: vec![reason],
-                    witness: build_witness_report(self.store(), &request.snapshot_id, &frame, &[])?,
-                    claim: frame,
-                    evidence_tiers: EvidenceTiers::default(),
-                };
-                return Ok(SearchResult {
-                    request,
-                    plan,
-                    manifest,
-                    hits: Vec::new(),
-                    missing_capabilities,
-                    verdict,
-                    latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-                });
+                    AbstainContext {
+                        request,
+                        plan,
+                        manifest,
+                        missing_capabilities,
+                        frame,
+                        started,
+                    },
+                    reason,
+                );
+            }
+        }
+        // Witness gate, relation side: a trace/impact/architecture claim
+        // asks what the typed graph says about its subject. When every
+        // subject — defined or merely named — participates in zero
+        // edges, the graph provably says nothing and no route can
+        // legitimately answer. Temporal pins ask about historical
+        // structure the current graph cannot refute.
+        if frame.required_witness == WitnessRequirement::Relation
+            && !frame.subjects.is_empty()
+            && !temporal_only
+        {
+            let mut edgeful = false;
+            for subject in &frame.subjects {
+                let defined = defined_witnesses(self.store(), &request.snapshot_id, subject)?;
+                if relation_witness(self.store(), &request.snapshot_id, &defined)?.edges > 0 {
+                    edgeful = true;
+                    break;
+                }
+            }
+            if !edgeful {
+                let reason = format!(
+                    "abstained: claim subject{} {} participate{} in no typed relations — the graph records nothing about {} in this snapshot",
+                    if frame.subjects.len() == 1 { "" } else { "s" },
+                    frame
+                        .subjects
+                        .iter()
+                        .map(|subject| format!("`{subject}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if frame.subjects.len() == 1 { "s" } else { "" },
+                    if frame.subjects.len() == 1 {
+                        "it"
+                    } else {
+                        "them"
+                    },
+                );
+                return abstain_result(
+                    self.store(),
+                    AbstainContext {
+                        request,
+                        plan,
+                        manifest,
+                        missing_capabilities,
+                        frame,
+                        started,
+                    },
+                    reason,
+                );
+            }
+        }
+        // Witness gate, history side: a history claim asks what the
+        // recorded change history says. When no subject appears in any
+        // commit-class document, recorded history provably does not
+        // mention it. `type:diff` is exempt — its authoritative surface
+        // is raw patch payloads, and indexed commit-diff documents are
+        // only a bounded projection of them.
+        if frame.required_witness == WitnessRequirement::History
+            && !frame.subjects.is_empty()
+            && !patch_grep_planned
+        {
+            let mut witnessed = false;
+            for subject in &frame.subjects {
+                if !self
+                    .store()
+                    .history_documents_matching_term(&request.snapshot_id, subject, 1)?
+                    .is_empty()
+                {
+                    witnessed = true;
+                    break;
+                }
+            }
+            if !witnessed {
+                let reason = format!(
+                    "abstained: claim subject{} {} appear{} in no commit-class document — recorded history does not mention {} in this snapshot",
+                    if frame.subjects.len() == 1 { "" } else { "s" },
+                    frame
+                        .subjects
+                        .iter()
+                        .map(|subject| format!("`{subject}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if frame.subjects.len() == 1 { "s" } else { "" },
+                    if frame.subjects.len() == 1 {
+                        "it"
+                    } else {
+                        "them"
+                    },
+                );
+                return abstain_result(
+                    self.store(),
+                    AbstainContext {
+                        request,
+                        plan,
+                        manifest,
+                        missing_capabilities,
+                        frame,
+                        started,
+                    },
+                    reason,
+                );
             }
         }
         let mut candidates = HashMap::<String, Candidate>::new();
@@ -2337,11 +2418,14 @@ const fn claim_frame(intent: QueryIntent, subjects: Vec<String>) -> ClaimFrame {
             ClaimPredicate::Implementation,
             WitnessRequirement::CodeBinding,
         ),
-        QueryIntent::Trace
-        | QueryIntent::Impact
-        | QueryIntent::Architecture
-        | QueryIntent::PreciseDataflow => (ClaimPredicate::Relation, WitnessRequirement::Any),
-        QueryIntent::History => (ClaimPredicate::History, WitnessRequirement::Any),
+        // PreciseDataflow keeps `Any`: its dedicated capability refusal
+        // (no dataflow view) is the honest reason, and a relation gate
+        // would preempt it with the wrong one.
+        QueryIntent::Trace | QueryIntent::Impact | QueryIntent::Architecture => {
+            (ClaimPredicate::Relation, WitnessRequirement::Relation)
+        }
+        QueryIntent::PreciseDataflow => (ClaimPredicate::Relation, WitnessRequirement::Any),
+        QueryIntent::History => (ClaimPredicate::History, WitnessRequirement::History),
         QueryIntent::Unknown => (ClaimPredicate::Lookup, WitnessRequirement::Any),
     };
     ClaimFrame {
@@ -2507,13 +2591,64 @@ fn defined_witnesses(
         .collect())
 }
 
-/// One term's witness data: definitions vs mentions.
-fn build_term_witness(store: &MetadataStore, snapshot_id: &str, term: &str) -> Result<TermWitness> {
+/// The typed-edge summary across a term's definition entities — the
+/// relation claim's witness. Per-entity fetches are capped, so the
+/// count is a bounded sample: enough to attest that relations exist
+/// and of which kinds/origins, not to enumerate the neighborhood.
+fn relation_witness(
+    store: &MetadataStore,
+    snapshot_id: &str,
+    defined: &[DefinedWitness],
+) -> Result<RelationWitness> {
+    let mut witness = RelationWitness::default();
+    for entity in defined {
+        for edge in store.relations_for_entity(
+            snapshot_id,
+            &entity.entity_id,
+            RelationDirection::Both,
+            64,
+        )? {
+            witness.edges += 1;
+            if !witness.kinds.contains(&edge.kind) {
+                witness.kinds.push(edge.kind);
+            }
+            if !witness.origins.contains(&edge.origin) {
+                witness.origins.push(edge.origin);
+            }
+        }
+    }
+    Ok(witness)
+}
+
+/// One term's witness data: definitions vs mentions, plus whichever
+/// claim-scoped surface the required witness actually reads. Relation
+/// and history probes are computed only for claims that demand them —
+/// an exact-entity lookup must not pay for graph/history queries it
+/// never checks.
+fn build_term_witness(
+    store: &MetadataStore,
+    snapshot_id: &str,
+    term: &str,
+    required_witness: WitnessRequirement,
+) -> Result<TermWitness> {
+    let defined = defined_witnesses(store, snapshot_id, term)?;
+    let relations = if required_witness == WitnessRequirement::Relation {
+        relation_witness(store, snapshot_id, &defined)?
+    } else {
+        RelationWitness::default()
+    };
+    let history_documents = if required_witness == WitnessRequirement::History {
+        store.history_documents_matching_term(snapshot_id, term, 8)?
+    } else {
+        Vec::new()
+    };
     Ok(TermWitness {
         term: term.to_owned(),
-        defined: defined_witnesses(store, snapshot_id, term)?,
+        relations,
+        defined,
         mentions: store.term_document_frequency(snapshot_id, term)?,
         mention_paths: store.term_mention_paths(snapshot_id, term, 5)?,
+        history_documents,
     })
 }
 
@@ -2536,7 +2671,12 @@ fn build_witness_report(
     checked.truncate(6);
     let mut terms = Vec::with_capacity(checked.len());
     for term in &checked {
-        terms.push(build_term_witness(store, snapshot_id, term)?);
+        terms.push(build_term_witness(
+            store,
+            snapshot_id,
+            term,
+            frame.required_witness,
+        )?);
     }
     let binding_artifacts = if frame.distinguishing_terms.len() >= 2 {
         store
@@ -2626,7 +2766,92 @@ fn weak_witness_reasons(frame: &ClaimFrame, report: &WitnessReport) -> Vec<Strin
             quoted(&frame.distinguishing_terms)
         ));
     }
+    match frame.required_witness {
+        WitnessRequirement::Relation => {
+            for witness in &report.terms {
+                if !frame.subjects.contains(&witness.term) {
+                    continue;
+                }
+                if witness.relations.edges == 0 && !witness.defined.is_empty() {
+                    reasons.push(format!(
+                        "weak_witness: `{}` is defined but participates in no typed relations — the relation claim rests on non-graph evidence",
+                        witness.term
+                    ));
+                } else if !witness.relations.origins.is_empty()
+                    && witness
+                        .relations
+                        .origins
+                        .iter()
+                        .all(|origin| *origin == RelationOrigin::ModelInference)
+                {
+                    reasons.push(format!(
+                        "weak_witness: `{}`'s relation evidence is model-inferred only — no deterministic edge backs it",
+                        witness.term
+                    ));
+                }
+            }
+        }
+        WitnessRequirement::History => {
+            for witness in &report.terms {
+                if frame.subjects.contains(&witness.term) && witness.history_documents.is_empty() {
+                    reasons.push(format!(
+                        "weak_witness: `{}` appears in no commit-class document — answered from current-source evidence only",
+                        witness.term
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
     reasons
+}
+
+/// Everything an early-abstain needs that a normal result carries —
+/// bundled so the gate call sites stay readable.
+struct AbstainContext {
+    request: SearchRequest,
+    plan: QueryPlan,
+    manifest: ViewManifest,
+    missing_capabilities: Vec<String>,
+    frame: ClaimFrame,
+    started: Instant,
+}
+
+/// Early-abstain assembly shared by the pre-retrieval witness gates:
+/// resolve the claim's distinguishing vocabulary for the report, then
+/// return the abstained verdict with empty hits.
+fn abstain_result(
+    store: &MetadataStore,
+    mut context: AbstainContext,
+    reason: String,
+) -> Result<SearchResult> {
+    context.missing_capabilities.push(reason.clone());
+    context.frame.distinguishing_terms = resolve_distinguishing(
+        store,
+        &context.request.snapshot_id,
+        &content_terms(&context.request.query),
+    )?;
+    let verdict = SearchVerdict {
+        state: VerdictState::Abstained,
+        reasons: vec![reason],
+        witness: build_witness_report(store, &context.request.snapshot_id, &context.frame, &[])?,
+        claim: context.frame,
+        evidence_tiers: EvidenceTiers::default(),
+    };
+    Ok(SearchResult {
+        request: context.request,
+        plan: context.plan,
+        manifest: context.manifest,
+        hits: Vec::new(),
+        missing_capabilities: context.missing_capabilities,
+        verdict,
+        latency_ms: context
+            .started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    })
 }
 
 /// Curated CJK→English glossary for the lexical route. Source vocabulary
@@ -3690,6 +3915,14 @@ mod tests {
         assert_eq!(frame.predicate, ClaimPredicate::Implementation);
         assert_eq!(frame.required_witness, WitnessRequirement::CodeBinding);
         let frame = claim_frame(QueryIntent::Impact, Vec::new());
+        assert_eq!(frame.predicate, ClaimPredicate::Relation);
+        assert_eq!(frame.required_witness, WitnessRequirement::Relation);
+        let frame = claim_frame(QueryIntent::History, Vec::new());
+        assert_eq!(frame.predicate, ClaimPredicate::History);
+        assert_eq!(frame.required_witness, WitnessRequirement::History);
+        // PreciseDataflow keeps `Any`: the dedicated capability refusal
+        // is its honest reason; a relation gate would preempt it.
+        let frame = claim_frame(QueryIntent::PreciseDataflow, Vec::new());
         assert_eq!(frame.required_witness, WitnessRequirement::Any);
     }
 
@@ -3709,6 +3942,8 @@ mod tests {
                 defined: Vec::new(),
                 mentions: 7,
                 mention_paths: vec!["src/gateway.rs".to_owned()],
+                relations: RelationWitness::default(),
+                history_documents: Vec::new(),
             }],
             binding_artifacts: vec![BoundArtifact {
                 path: "plans/009.md".to_owned(),
@@ -4273,6 +4508,25 @@ mod tests {
         snapshot_id: &str,
         documents: &[(&str, &str, &str, &str)],
     ) {
+        let documents: Vec<(&str, &str, &str, &str, RetrievalRepresentation)> = documents
+            .iter()
+            .map(|(id, path, name, body)| {
+                (*id, *path, *name, *body, RetrievalRepresentation::RawCode)
+            })
+            .collect();
+        verdict_fixture_full(engine, snapshot_id, &documents, &[], &[]);
+    }
+
+    /// The verdict fixture with extra graph/history material: documents
+    /// carry an explicit representation (commit-class docs seed the
+    /// history surface), entities and relations seed the typed graph.
+    fn verdict_fixture_full(
+        engine: &CceEngine,
+        snapshot_id: &str,
+        documents: &[(&str, &str, &str, &str, RetrievalRepresentation)],
+        entities: &[CodeEntity],
+        relations: &[cce_core::Relation],
+    ) {
         let anchor = RepositoryScanner::new(engine.config().clone())
             .identify()
             .expect("anchor");
@@ -4295,8 +4549,8 @@ mod tests {
             .begin_snapshot(&snapshot)
             .expect("begin snapshot");
         let mut records = SnapshotRecords::default();
-        for (document_id, path, name, body) in documents {
-            let (document, artifact) = indexed_document(
+        for (document_id, path, name, body, representation) in documents {
+            let (mut document, artifact) = indexed_document(
                 engine.store(),
                 document_id,
                 &format!("file:{path}"),
@@ -4304,14 +4558,37 @@ mod tests {
                 name,
                 body,
             );
+            document.document.representation = representation.clone();
             records.artifacts.push(artifact);
             records.entities.push(file(path));
             records.documents.push(document);
         }
+        records.entities.extend(entities.iter().cloned());
+        records.relations.extend(relations.iter().cloned());
         engine
             .store()
             .commit_snapshot(&snapshot, &records)
             .expect("commit records");
+    }
+
+    fn edge(
+        source: &str,
+        target: &str,
+        kind: RelationKind,
+        origin: RelationOrigin,
+    ) -> cce_core::Relation {
+        cce_core::Relation {
+            id: format!("rel:{source}:{target}"),
+            source_entity_id: source.to_owned(),
+            target_entity_id: target.to_owned(),
+            kind,
+            origin,
+            confidence: 1.0,
+            snapshot_id: "snap_test".to_owned(),
+            extractor: "test".to_owned(),
+            evidence: Vec::new(),
+            attributes: serde_json::Map::new(),
+        }
     }
 
     #[tokio::test]
@@ -4483,6 +4760,269 @@ mod tests {
                 .all(|artifact| artifact.class == DocumentClass::Prose),
             "no code artifact binds the claim: {:?}",
             result.verdict.witness.binding_artifacts
+        );
+    }
+
+    /// The relation fixture: `helper` calls `beta_fn` (tree-sitter
+    /// fact), `inferred_fn` is the target of a model-inferred call, and
+    /// `orphan_fn` is defined but participates in nothing.
+    fn relation_fixture(engine: &CceEngine) {
+        verdict_fixture_full(
+            engine,
+            "snap_rel",
+            &[(
+                "doc:lib",
+                "src/lib.rs",
+                "lib",
+                "fn helper() { beta_fn() } fn orphan_fn() {} fn inferred_fn() {}",
+                RetrievalRepresentation::RawCode,
+            )],
+            &[
+                symbol("helper", "src/lib.rs"),
+                symbol("beta_fn", "src/lib.rs"),
+                symbol("orphan_fn", "src/lib.rs"),
+                symbol("inferred_fn", "src/lib.rs"),
+            ],
+            &[
+                edge(
+                    "symbol:helper",
+                    "symbol:beta_fn",
+                    RelationKind::Calls,
+                    RelationOrigin::TreeSitter,
+                ),
+                edge(
+                    "symbol:helper",
+                    "symbol:inferred_fn",
+                    RelationKind::Calls,
+                    RelationOrigin::ModelInference,
+                ),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn search_abstains_when_relation_subject_has_no_edges() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        relation_fixture(&engine);
+
+        // `orphan_fn` is defined and corpus-present (df > 0), but zero
+        // edges touch it: for a relation claim that is a provable
+        // negative — the graph records nothing about the subject.
+        let mut query = request("what breaks if `orphan_fn` changes", 10);
+        query.intent = Some(QueryIntent::Impact);
+        let result = engine.search(query).await.expect("search");
+        assert!(result.hits.is_empty());
+        assert_eq!(result.verdict.state, VerdictState::Abstained);
+        assert!(
+            result
+                .verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("no typed relations")),
+            "abstention names the relation witness failure: {:?}",
+            result.verdict.reasons
+        );
+    }
+
+    #[tokio::test]
+    async fn relation_witness_reports_edge_kinds_and_origins() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        relation_fixture(&engine);
+
+        // `helper` has a deterministic Calls edge: the gate must let the
+        // search run, and the witness report must carry the edge's kind
+        // and tree-sitter provenance.
+        let mut query = request("what breaks if `helper` changes", 10);
+        query.intent = Some(QueryIntent::Impact);
+        let result = engine.search(query).await.expect("search");
+        assert!(
+            !result
+                .verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("no typed relations")),
+            "an edgeful subject must not hit the relation gate: {:?}",
+            result.verdict.reasons
+        );
+        let witness = result
+            .verdict
+            .witness
+            .terms
+            .iter()
+            .find(|term| term.term == "helper")
+            .expect("helper witness");
+        assert!(witness.relations.edges > 0);
+        assert!(witness.relations.kinds.contains(&RelationKind::Calls));
+        assert!(
+            witness
+                .relations
+                .origins
+                .contains(&RelationOrigin::TreeSitter)
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_only_relation_evidence_is_flagged_weak() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        relation_fixture(&engine);
+
+        // `inferred_fn` has edges — the gate passes — but every one is
+        // model-inferred. Inference is not source truth, so the verdict
+        // must say so rather than letting the structure stand as fact.
+        let mut query = request("`inferred_fn`", 10);
+        query.intent = Some(QueryIntent::Impact);
+        let result = engine.search(query).await.expect("search");
+        assert!(
+            result
+                .verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("model-inferred only")),
+            "inference-only structure is flagged, not presented as fact: {:?}",
+            result.verdict.reasons
+        );
+    }
+
+    #[tokio::test]
+    async fn search_abstains_when_history_subject_absent_from_commits() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        verdict_fixture_full(
+            &engine,
+            "snap_hist",
+            &[
+                (
+                    "doc:commit1",
+                    "commit:aaa111",
+                    "commit",
+                    "added grpc transport for the control plane",
+                    RetrievalRepresentation::CommitSummary,
+                ),
+                (
+                    "doc:patch",
+                    "commit:bbb222",
+                    "commit",
+                    "src/net.rs +grpc client channel",
+                    RetrievalRepresentation::CommitDiff,
+                ),
+                (
+                    "doc:net",
+                    "src/net.rs",
+                    "net",
+                    "fn dial() { /* grpc endpoint on the tokio runtime */ }",
+                    RetrievalRepresentation::RawCode,
+                ),
+            ],
+            &[],
+            &[],
+        );
+
+        // `tokio` lives only in current source — recorded history never
+        // mentions it. For a history claim that is a provable negative.
+        let mut query = request("when was `tokio` added", 10);
+        query.intent = Some(QueryIntent::History);
+        let result = engine.search(query).await.expect("search");
+        assert!(result.hits.is_empty());
+        assert_eq!(result.verdict.state, VerdictState::Abstained);
+        assert!(
+            result
+                .verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("commit-class document")),
+            "abstention names the history witness failure: {:?}",
+            result.verdict.reasons
+        );
+
+        // `grpc` is attested in commit-class documents: the gate must
+        // not fire, and the witness report carries the document ids.
+        let mut query = request("when was `grpc` added", 10);
+        query.intent = Some(QueryIntent::History);
+        let result = engine.search(query).await.expect("search");
+        assert!(
+            !result
+                .verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("commit-class document")),
+            "a history-attested subject must not hit the history gate: {:?}",
+            result.verdict.reasons
+        );
+        let witness = result
+            .verdict
+            .witness
+            .terms
+            .iter()
+            .find(|term| term.term == "grpc")
+            .expect("grpc witness");
+        assert_eq!(witness.history_documents.len(), 2);
+    }
+
+    #[test]
+    fn weak_witness_reasons_flag_relation_and_history_gaps() {
+        let term = |relations: RelationWitness, history: Vec<String>| TermWitness {
+            term: "subject".to_owned(),
+            defined: vec![DefinedWitness {
+                entity_id: "symbol:subject".to_owned(),
+                name: "subject".to_owned(),
+                kind: EntityKind::Function,
+                path: Some("src/lib.rs".to_owned()),
+            }],
+            mentions: 3,
+            mention_paths: vec!["src/lib.rs".to_owned()],
+            relations,
+            history_documents: history,
+        };
+        let report = |terms: Vec<TermWitness>| WitnessReport {
+            terms,
+            binding_artifacts: Vec::new(),
+            scope_gaps: Vec::new(),
+        };
+        let mut frame = claim_frame(QueryIntent::Impact, vec!["subject".to_owned()]);
+
+        // Defined but edgeless: the relation claim rests on non-graph
+        // evidence.
+        let reasons = weak_witness_reasons(
+            &frame,
+            &report(vec![term(RelationWitness::default(), Vec::new())]),
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("no typed relations")),
+            "{reasons:?}"
+        );
+
+        // Inference-only edges: structure exists but nothing
+        // deterministic backs it.
+        let inferred = RelationWitness {
+            edges: 2,
+            kinds: vec![RelationKind::Calls],
+            origins: vec![RelationOrigin::ModelInference],
+        };
+        let reasons = weak_witness_reasons(&frame, &report(vec![term(inferred, Vec::new())]));
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("model-inferred only")),
+            "{reasons:?}"
+        );
+
+        // History claim with no commit-class witness: answered from
+        // current source only.
+        frame = claim_frame(QueryIntent::History, vec!["subject".to_owned()]);
+        let reasons = weak_witness_reasons(
+            &frame,
+            &report(vec![term(RelationWitness::default(), Vec::new())]),
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("no commit-class document")),
+            "{reasons:?}"
         );
     }
 

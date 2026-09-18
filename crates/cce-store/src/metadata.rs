@@ -1270,6 +1270,46 @@ impl MetadataStore {
             .map_err(storage_error)
     }
 
+    /// Commit-class document ids (commit summary / commit diff) whose
+    /// FTS row matches `term` — the history-claim witness surface:
+    /// whether the term appears in the recorded change history at all.
+    /// Raw patch payloads in the artifact store are authoritative for
+    /// `type:diff`; this surface reports the indexed projection.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn history_documents_matching_term(
+        &self,
+        snapshot_id: &str,
+        term: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT f.document_id FROM documents_fts f
+                 JOIN retrieval_documents d ON d.id = f.document_id
+                 WHERE documents_fts MATCH ?1 AND f.snapshot_id=?2
+                   AND d.representation IN (?3, ?4)
+                 LIMIT ?5",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    format!("\"{term}\""),
+                    snapshot_id,
+                    json(&RetrievalRepresentation::CommitSummary)?,
+                    json(&RetrievalRepresentation::CommitDiff)?,
+                    usize_to_i64(limit)?,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(storage_error)
+    }
+
     /// Entities whose name or qualified name contains `term` — a
     /// case-insensitive LIKE superset callers refine by identifier-part
     /// boundaries. This is the definition-tier candidate set for
@@ -2777,6 +2817,108 @@ mod tests {
                 .documents_matching_term("snap_t", "lock", &doc_ids)
                 .expect("coverage"),
             ["doc:3"]
+        );
+    }
+
+    #[test]
+    fn history_documents_matching_term_filters_to_commit_class() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        store
+            .register_repository(&RepositoryIdentity {
+                id: "repo_t".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            })
+            .expect("repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_t".to_owned(),
+            repository_id: "repo_t".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        store.begin_snapshot(&snapshot).expect("begin snapshot");
+
+        let document =
+            |index: usize, representation: RetrievalRepresentation, path: &str, body: &str| {
+                (
+                    IndexedDocument {
+                        document: RetrievalDocument {
+                            id: format!("doc:{index}"),
+                            entity_id: format!("ent:{index}"),
+                            snapshot_id: "snap_t".to_owned(),
+                            representation,
+                            body_artifact_digest: format!("digest:{index}"),
+                            region_id: None,
+                            address: None,
+                            embedding_profile: None,
+                            generated_by: None,
+                            evidence: Vec::new(),
+                            terms: Vec::new(),
+                        },
+                        path: path.to_owned(),
+                        name: path.to_owned(),
+                        body: body.to_owned(),
+                    },
+                    ArtifactRecord {
+                        digest: format!("digest:{index}"),
+                        kind: crate::ArtifactKind::Source,
+                        size_bytes: body.len() as u64,
+                        relative_path: format!("artifacts/{index}"),
+                    },
+                )
+            };
+        // `grpc` is attested in a commit summary AND in current source —
+        // only the commit-class document is a history witness.
+        let (doc0, art0) = document(
+            0,
+            RetrievalRepresentation::CommitSummary,
+            "commit:aaa111",
+            "added grpc transport for the control plane",
+        );
+        let (doc1, art1) = document(
+            1,
+            RetrievalRepresentation::CommitDiff,
+            "commit:bbb222",
+            "src/net.rs +use tonic::transport::Channel; // grpc client",
+        );
+        let (doc2, art2) = document(
+            2,
+            RetrievalRepresentation::RawCode,
+            "src/net.rs",
+            "fn dial() { /* grpc endpoint */ }",
+        );
+        let records = SnapshotRecords {
+            artifacts: vec![art0, art1, art2],
+            documents: vec![doc0, doc1, doc2],
+            ..SnapshotRecords::default()
+        };
+        store.commit_snapshot(&snapshot, &records).expect("commit");
+
+        assert_eq!(
+            store
+                .history_documents_matching_term("snap_t", "grpc", 8)
+                .expect("history"),
+            ["doc:0", "doc:1"],
+            "both commit classes witness; the RawCode mention does not"
+        );
+        assert!(
+            store
+                .history_documents_matching_term("snap_t", "tokio", 8)
+                .expect("history")
+                .is_empty(),
+            "a term absent from commit-class documents has no history witness"
+        );
+        assert!(
+            store
+                .history_documents_matching_term("snap_t", "dial", 8)
+                .expect("history")
+                .is_empty(),
+            "current-source-only vocabulary has no history witness"
         );
     }
 }
