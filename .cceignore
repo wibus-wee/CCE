@@ -1,5 +1,6 @@
 # Evaluation queries and generated research outputs must not leak into retrieval indexes.
 benchmarks/datasets/
 benchmarks/results/
+research/external/
 research/output/
 /index.scip
