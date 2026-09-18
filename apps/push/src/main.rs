@@ -45,6 +45,10 @@ struct Arguments {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=64)
     )]
     concurrency: usize,
+    /// Bypass the on-disk scan cache entirely (no read, no write) —
+    /// escape hatch for debugging and CI.
+    #[arg(long)]
+    no_scan_cache: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,11 +88,91 @@ struct PushResponse {
     bytes: u64,
 }
 
-/// In-memory (repo-relative path → (mtime, size, digest)) cache so
+/// In-memory (repo-relative path → (`mtime_ms`, size, digest)) cache so
 /// --watch polls only re-hash files whose mtime/size actually moved.
+/// Persisted as JSON across runs so cold starts skip unchanged files too.
 #[derive(Debug, Default)]
 struct ScanCache {
-    entries: HashMap<String, (i64, u64, String)>,
+    entries: HashMap<String, (u64, u64, String)>,
+}
+
+/// On-disk shape: `{"version":1,"root":"…","entries":{"path":[ms,size,digest]}}`.
+/// Tuples serialize as JSON arrays; mtime is milliseconds since the epoch.
+#[derive(Debug, Serialize, Deserialize)]
+struct ScanCacheFile {
+    version: u32,
+    root: String,
+    entries: HashMap<String, (u64, u64, String)>,
+}
+
+const SCAN_CACHE_VERSION: u32 = 1;
+
+impl ScanCache {
+    /// Read a persisted cache. A missing file, corrupt JSON, version bump,
+    /// or a different worktree root all yield an empty cache — the cache is
+    /// a hint and must never fail a push.
+    fn load(path: &Path, root: &Path) -> Self {
+        let root = root.to_string_lossy().into_owned();
+        let loaded = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ScanCacheFile>(&bytes).ok());
+        match loaded {
+            Some(file) if file.version == SCAN_CACHE_VERSION && file.root == root => Self {
+                entries: file.entries,
+            },
+            _ => Self::default(),
+        }
+    }
+
+    /// Persist atomically (write `<path>.tmp`, then rename) so a crash
+    /// mid-write can't leave a torn cache. Failures warn, never fail.
+    fn save(&self, path: &Path, root: &Path) {
+        if let Err(error) = self.try_save(path, root) {
+            eprintln!(
+                "cce-push: warning: could not write scan cache {}: {error}",
+                path.display()
+            );
+        }
+    }
+
+    fn try_save(&self, path: &Path, root: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = ScanCacheFile {
+            version: SCAN_CACHE_VERSION,
+            root: root.to_string_lossy().into_owned(),
+            entries: self.entries.clone(),
+        };
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&file)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+/// `$XDG_CACHE_HOME/cce/push-scan-<hash>.json`, else `$HOME/.cache/cce/…`,
+/// else `<root>/.cce/push-cache.json` on a bare env. `<hash>` is the first
+/// 16 hex chars of the canonicalized root's blake3 — stable across runs,
+/// distinct across worktrees.
+fn scan_cache_path(root: &Path) -> PathBuf {
+    let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+        });
+    cache_dir.map_or_else(
+        || root.join(".cce").join("push-cache.json"),
+        |dir| {
+            let digest = blake3::hash(root.to_string_lossy().as_bytes()).to_hex();
+            dir.join("cce")
+                .join(format!("push-scan-{}.json", &digest.as_str()[..16]))
+        },
+    )
 }
 
 fn is_internal_dir(entry: &ignore::DirEntry) -> bool {
@@ -203,7 +287,7 @@ fn scan(root: &Path, cache: &mut ScanCache) -> anyhow::Result<Vec<FileEntry>> {
             .modified()
             .ok()
             .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or_default())
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or_default())
             .unwrap_or_default();
         let size = metadata.len();
         let digest = match cache.entries.get(&relative) {
@@ -429,8 +513,20 @@ fn main() -> anyhow::Result<()> {
         root: root.clone(),
         concurrency: arguments.concurrency,
     };
-    let mut cache = ScanCache::default();
+    let cache_path = (!arguments.no_scan_cache).then(|| scan_cache_path(&root));
+    let mut cache = cache_path
+        .as_ref()
+        .map_or_else(ScanCache::default, |path| ScanCache::load(path, &root));
+    // Snapshot of what's already on disk; only re-save when a scan actually
+    // moves the entries (avoids rewriting a multi-MB JSON every watch tick).
+    let mut last_saved = cache.entries.clone();
     let files = scan(&root, &mut cache)?;
+    if cache.entries != last_saved {
+        if let Some(path) = &cache_path {
+            cache.save(path, &root);
+        }
+        last_saved.clone_from(&cache.entries);
+    }
     uploader.sync_once(&files, head_revision(&root).as_deref())?;
     if !arguments.watch {
         return Ok(());
@@ -440,12 +536,114 @@ fn main() -> anyhow::Result<()> {
     loop {
         std::thread::sleep(Duration::from_secs(arguments.interval));
         let files = scan(&root, &mut cache)?;
+        if cache.entries != last_saved {
+            if let Some(path) = &cache_path {
+                cache.save(path, &root);
+            }
+            last_saved.clone_from(&cache.entries);
+        }
         let refs = refs_digest(&root);
         if cache.entries != last_seen || refs != last_refs {
             eprintln!("cce-push: change detected, syncing…");
             uploader.sync_once(&files, head_revision(&root).as_deref())?;
             last_seen.clone_from(&cache.entries);
             last_refs = refs;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_cache_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cce-push-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("push-scan.json")
+    }
+
+    #[test]
+    fn scan_cache_round_trip() {
+        let path = temp_cache_path("round-trip");
+        let root = Path::new("/some/repo");
+        let mut cache = ScanCache::default();
+        cache.entries.insert(
+            "src/main.rs".to_owned(),
+            (1_700_000_000_000, 42, "deadbeef".to_owned()),
+        );
+        cache.save(&path, root);
+        let loaded = ScanCache::load(&path, root);
+        assert_eq!(loaded.entries, cache.entries);
+        // On-disk shape: {"version":1,"root":"…","entries":{"p":[ms,size,digest]}}.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], 1);
+        assert_eq!(raw["root"], "/some/repo");
+        assert_eq!(
+            raw["entries"]["src/main.rs"],
+            serde_json::json!([1_700_000_000_000u64, 42, "deadbeef"])
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_cache_rejects_wrong_version() {
+        let path = temp_cache_path("version");
+        std::fs::write(&path, br#"{"version":2,"root":"/some/repo","entries":{}}"#).unwrap();
+        assert!(
+            ScanCache::load(&path, Path::new("/some/repo"))
+                .entries
+                .is_empty()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_cache_rejects_wrong_root_and_corrupt() {
+        let path = temp_cache_path("root");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"root":"/other","entries":{"a.rs":[1,2,"d"]}}"#,
+        )
+        .unwrap();
+        assert!(
+            ScanCache::load(&path, Path::new("/some/repo"))
+                .entries
+                .is_empty()
+        );
+        std::fs::write(&path, b"not json at all").unwrap();
+        assert!(
+            ScanCache::load(&path, Path::new("/some/repo"))
+                .entries
+                .is_empty()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_cache_missing_file_loads_empty() {
+        let path = temp_cache_path("missing").with_file_name("does-not-exist.json");
+        assert!(
+            ScanCache::load(&path, Path::new("/some/repo"))
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scan_cache_path_is_stable_and_named_for_root() {
+        let root = Path::new("/tmp/cce-scan-cache-path-test");
+        let first = scan_cache_path(root);
+        assert_eq!(first, scan_cache_path(root));
+        // Either the XDG/HOME form push-scan-<16 hex of blake3(root)>.json,
+        // or the bare-env .cce/push-cache.json fallback under the root.
+        let name = first.file_name().unwrap().to_str().unwrap();
+        let digest = blake3::hash(root.to_string_lossy().as_bytes()).to_hex();
+        let hashed = format!("push-scan-{}.json", &digest.as_str()[..16]);
+        if first.starts_with(root) {
+            assert_eq!(first, root.join(".cce").join("push-cache.json"));
+        } else {
+            assert_eq!(name, hashed);
         }
     }
 }
