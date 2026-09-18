@@ -25,6 +25,7 @@ use utoipa::{OpenApi as _, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_swagger_ui::SwaggerUi;
 
+mod cache;
 mod fanout;
 mod mcp;
 
@@ -145,6 +146,9 @@ struct GatewayState {
     /// immutable, the check never goes stale).
     push_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     default_worker: Option<String>,
+    /// Search-response cache: replay is only valid because pushes are
+    /// the sole content-mutation channel — see `cache` module docs.
+    search_cache: cache::SearchCache,
 }
 
 /// Error envelope returned by every gateway endpoint.
@@ -253,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
         registry: parking_lot::Mutex::new(registry),
         push_locks: parking_lot::Mutex::new(HashMap::new()),
+        search_cache: cache::SearchCache::new(Duration::from_secs(300), 512),
         default_worker: arguments
             .default_worker
             .map(|url| url.trim_end_matches('/').to_owned()),
@@ -755,6 +760,9 @@ async fn push(
         elapsed_ms = elapsed_ms(started),
         "push materialized"
     );
+    // New content committed — every cached search response for this repo
+    // is stale as of now. This is the cache's exact invalidation point.
+    state.search_cache.invalidate_repo(&repo.id);
     Ok(Json(PushResponse {
         push_id: record.push_id,
         materialized: record.file_count,
@@ -804,6 +812,25 @@ async fn proxy(
     let body = axum::body::to_bytes(request.into_body(), 64 * 1024 * 1024)
         .await
         .map_err(ApiError::from)?;
+    // Search-response cache: POST /v1/search only — the expensive engine
+    // path — keyed on the exact request body. A hit replays the stored
+    // response verbatim; push invalidates the repo's entries (see
+    // `cache` module docs for why that is exact, not heuristic).
+    let cacheable = method == axum::http::Method::POST && path == "search" && query.is_empty();
+    let body_digest = cacheable.then(|| blake3::hash(&body).to_hex().to_string());
+    if let Some(digest) = &body_digest {
+        if let Some((cached_body, cached_type)) = state.search_cache.get(&entry.id, digest) {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header("x-cce-cache", "hit");
+            if let Some(content_type) = cached_type {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+            }
+            return builder
+                .body(axum::body::Body::from(cached_body))
+                .map_err(ApiError::from);
+        }
+    }
     let mut upstream = state.client.request(method, &url).body(body);
     for (name, value) in &headers {
         if matches!(
@@ -870,9 +897,19 @@ async fn proxy(
             )
         }
     })?;
+    if let Some(digest) = &body_digest {
+        if status == StatusCode::OK {
+            state
+                .search_cache
+                .put(&entry.id, digest, body.clone(), content_type.clone());
+        }
+    }
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+    }
+    if body_digest.is_some() {
+        builder = builder.header("x-cce-cache", "miss");
     }
     builder
         .body(axum::body::Body::from(body))
