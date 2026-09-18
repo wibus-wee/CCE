@@ -26,8 +26,38 @@ atlas correctness bug found during the audit.
 | 004 | Embedding model ladder: paired e5-small / Qwen3-0.6B / e5-base | P1 | S | 001, 003 | DONE (Qwen3 unavailable in fastembed; jina-code substituted) |
 | 005 | Task→Component Recall@K metric (package-granularity L0) | P1 | S | — (annotates 003's cases) | DONE |
 | 006 | Framework landmark extractor: axum route bindings | P2 | S | — (best after 003) | DONE |
+| 007 | Graph-flow parity: replace legacy ranking priors | P1 | L | — | TODO |
+| 008 | Evidence paths: principled abstention + fact-granularity emission | P1 | L | 007 | TODO |
+| 009 | World-model surface: structural operators, source→sink dataflow, federation | P2 | L | 008 | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
+
+## Direction roadmap (007–009)
+
+Plans 007–009 are one sequenced evolution — **ranker → world model** —
+anchored on the v6.0 adversarial-benchmark evidence
+(`false_positive_rate` 0.60, `decoy_hit_rate@20` 0.282,
+`symbol_recall@20` ≈ .52) and the v6 A/B finding that the four legacy
+structural priors are approximations of one propagation mechanism:
+
+1. **007 — Earn the mechanism.** Query-seeded propagation replaces the
+   hand-tuned priors it subsumes, proven by parity on the 51-case
+   adversarial set. Prerequisite for everything below.
+2. **008 — Evidence semantics.** Propagation emits typed evidence
+   *paths*, not just mass: principled abstention (the only honest
+   answer to FPR 0.60 — RRF scores are cross-query incomparable and
+   cannot be thresholded), symbol-level claim support, and same-name
+   disambiguation.
+3. **009 — World-model surface.** The typed graph becomes a product
+   surface: structural operators (`type:symbol`, `kind:`, `pat:`),
+   source→sink dataflow as constrained propagation (dataflow view
+   `Partial` → `Ready`), and gateway fan-out federation across workers.
+
+Deliberately deferred (rejected sequencing): SPLADE-Code vocabulary
+bridge (fixes recall, not abstention — sequence after 008), K8s/auth
+(service layer is already ahead of kernel maturity — don't scale
+untrusted answers), larger embedding models (measured flat in the 004
+ladder).
 
 ## Dependency notes
 
