@@ -626,41 +626,19 @@ impl CceEngine {
             &request.query,
             &mut candidates,
         )?;
-        // Structural passes. `CCE_FLOW` selects the graph evidence
-        // mechanism: `union` runs flow additively on top of the legacy
-        // priors, `replace` runs flow INSTEAD of the priors it subsumes.
-        // Default is off — the v6 A/B showed union adds ~1.4s/query for
-        // no measured gain and replace hasn't matched sparse tail
-        // coverage yet, so the experimental pass stays opt-in.
-        let flow_mode = std::env::var("CCE_FLOW").unwrap_or_default();
-        if !matches!(flow_mode.as_str(), "replace") {
-            apply_corroboration(
-                self.store(),
-                &request.snapshot_id,
-                &expansion_evidence,
-                &mut candidates,
-            )?;
-            // Symbol evidence runs last among scoring passes: its
-            // seeds are the candidates the other passes already ranked.
-            symbol_evidence_join(
-                self.store(),
-                &request.snapshot_id,
-                &request.query,
-                &mut candidates,
-                verified_fresh,
-                request.limit,
-            )?;
-        }
-        if matches!(flow_mode.as_str(), "union" | "replace") {
-            apply_graph_flow(
-                self.store(),
-                &request.snapshot_id,
-                &request.query,
-                &mut candidates,
-                verified_fresh,
-                request.limit,
-            )?;
-        }
+        // Structural evidence: the unified query-seeded flow pass. The
+        // v7 gate (`docs/benchmarking.md`) showed it computes everything
+        // the legacy corroboration/cluster/file-vote/symbol-evidence
+        // priors computed — they are deleted, not shadowed.
+        apply_graph_flow(
+            self.store(),
+            &request.snapshot_id,
+            &request.query,
+            &expansion_evidence,
+            &mut candidates,
+            verified_fresh,
+            request.limit,
+        )?;
 
         let mut hits = self.select_hits(&request, &candidates)?;
 
@@ -1023,76 +1001,14 @@ const fn expansion_policy(policy: GraphPolicy) -> (RelationDirection, &'static [
     }
 }
 
-/// Scale for the co-change bonus. `ChangedWith` confidence is capped at
-/// 0.7, so a partner earns at most 0.3 × 0.7 = 0.21 — deliberately below
-/// the flat 0.25 a same-file sibling gets: sharing commits is weaker
-/// evidence than sharing the file a top hit already lives in.
-const CO_CHANGE_SCALE: f64 = 0.3;
-
 /// Same-package bonus: a top-3 hit's package is likely the task's package,
-/// so sibling files get a small lift — below the same-file 0.25 and the
-/// co-change ceiling.
+/// so sibling files get a small lift — below the same-file 0.25.
 const PACKAGE_BONUS: f64 = 0.15;
-
-/// Ceiling for the corroboration bonus: the lift a document candidate
-/// earns when graph expansion independently surfaced its entity, region,
-/// or file. 0.2 sits beside the co-change ceiling (0.21) and under the
-/// same-file 0.25 — corroboration confirms a vocabulary match, it does
-/// not replace one. Its fused effect (0.2 / `RRF_K` ≈ 0.003) is an order
-/// of magnitude under a rank-1 exact-symbol hit's RRF mass
-/// (2.0 / (`RRF_K` + 1) ≈ 0.033), so it can reorder the head but never
-/// leapfrog an identity match on its own.
-const CORROBORATION_BONUS: f64 = 0.2;
-
-/// Head candidates inspected for mechanism clustering: wide enough to
-/// catch a task's file set when it genuinely clusters — gold evidence for
-/// one query routinely spans 6-11 files parked across ranks 6-30 — while
-/// bounded so the relations fetch stays at ~one query per head file.
-const CLUSTER_HEAD: usize = 30;
-
-/// Intra-candidate edge weight. ln-damped so the first supporting edges
-/// matter most — 0.12·ln(2) ≈ 0.08 for one edge, ≈0.17 for three — and
-/// capped beside the co-change ceiling: a file whose neighbors also rank
-/// is corroborated, never self-evident.
-const CLUSTER_SCALE: f64 = 0.12;
-const CLUSTER_CAP: f64 = 0.2;
-
-/// File-vote prior ceiling. Mechanism files recur across the candidate
-/// pool — the regions answering a query cluster in a handful of files —
-/// while an isolated vocabulary match occupies exactly one rank. The
-/// vote scales a file's best-rank mass by ln(1+occurrences): a single
-/// hit earns nothing (ln 2 damped by the cap check below would still
-/// score, so the prior only pays out past one occurrence), a file
-/// holding three ranks earns ≈1.4× its best-rank mass. Occurrences are
-/// capped so a large file's raw chunk count cannot dominate on size
-/// alone; the ceiling sits at the co-change/cluster tier.
-const FILE_VOTE_BONUS: f64 = 0.2;
-const FILE_VOTE_MAX_OCCURRENCES: usize = 8;
-
-/// Symbol-evidence join bounds. Claims are supported by atomic symbols,
-/// but topical retrieval scores documents — the entities the head
-/// already surfaced point at the symbols the mechanism actually uses.
-/// The pass walks outgoing `References`/`Calls` edges from candidate
-/// entities, counts how many retrieved entities point at each neighbor,
-/// and emits bounded-mass `entity:` hits into the mid-tail where
-/// `claim_support` and `symbol_recall` read the list — never scoring
-/// high enough to reorder the head. Seeds are degree-capped so a hub
-/// entity cannot buy rank for its whole neighborhood.
-const SYMBOL_EVIDENCE_MAX: usize = 12;
-const SYMBOL_EVIDENCE_SEEDS: usize = 24;
-const SYMBOL_EVIDENCE_SEED_DEGREE: usize = 48;
-/// Mass floor for an emitted block entry: it must beat the score at
-/// `limit - MAX` so the whole block lands inside the emitted window
-/// while displacing only the weakest incumbents. A hair above the
-/// boundary keeps ordering inside the block deterministic.
-const SYMBOL_EVIDENCE_BOUNDARY_FRACTION: f64 = 1.02;
 
 /// Structural priors layered on the fused ranking:
 /// - exact symbol/word agreement between the query and a hit's symbol name;
 /// - same-file evidence aggregation (a file holding a top-3 hit makes its
 ///   other hits more likely to be task evidence);
-/// - git co-change neighborhood (files that keep landing in the same
-///   commits as a top-3 file);
 /// - same-package membership (a file in a top-3 hit's package is likelier
 ///   task evidence than a cross-package one);
 /// - git recency prior for issue/history intents (a recently touched file
@@ -1123,37 +1039,6 @@ fn apply_structural_features(
                 .map(|address| address.path.clone())
         })
         .collect();
-    // Co-change partners of the top-3 files. The edge is stored once per
-    // pair (smaller entity id as source), so only a Both-direction lookup
-    // sees it from either endpoint — and since `ChangedWith` caps at 0.7
-    // while structural edges carry up to 1.0, the confidence-ordered fetch
-    // limit must cover the file's whole degree or the co-change rows are
-    // crowded out entirely.
-    let mut co_changed = HashMap::<String, f32>::new();
-    for path in &top_paths {
-        let Some(file) = file_entity(store, snapshot_id, path)? else {
-            continue;
-        };
-        let degree = store.entity_relation_degree(snapshot_id, &file.id)?;
-        for relation in
-            store.relations_for_entity(snapshot_id, &file.id, RelationDirection::Both, degree)?
-        {
-            if relation.kind != RelationKind::ChangedWith {
-                continue;
-            }
-            let partner_id = if relation.source_entity_id == file.id {
-                &relation.target_entity_id
-            } else {
-                &relation.source_entity_id
-            };
-            let Some(partner) = store.entity_by_id(snapshot_id, partner_id)? else {
-                continue;
-            };
-            // File entity names are repository-relative paths.
-            let confidence = co_changed.entry(partner.name).or_default();
-            *confidence = confidence.max(relation.confidence);
-        }
-    }
     // Workspace packages as (rootDir, name); the task package set is the
     // owners of the top-3 files, mirroring the top_paths aggregation.
     let packages = store
@@ -1201,12 +1086,6 @@ fn apply_structural_features(
             if top_paths.contains(path) {
                 bonus += 0.25;
             }
-            if let Some(confidence) = co_changed.get(path) {
-                bonus = CO_CHANGE_SCALE.mul_add(f64::from(*confidence), bonus);
-                notes.push(format!(
-                    "co-change partner of a top hit file (confidence {confidence:.2})"
-                ));
-            }
             let package = *candidate_packages
                 .entry(path.clone())
                 .or_insert_with(|| package_of(path, &packages));
@@ -1252,371 +1131,6 @@ fn apply_structural_features(
     Ok(())
 }
 
-/// Join graph evidence back onto document candidates — the pass that
-/// fixes the `entity:`-vs-document key asymmetry of `add_candidate`.
-/// Three priors share one per-candidate loop:
-///
-/// Corroboration: expansion hits are keyed `entity:{id}` while document
-/// candidates carry document ids, so the merge can never connect them —
-/// before this pass a gold file confirmed by three graph edges scored
-/// identically to an isolated vocabulary match. A candidate is
-/// corroborated when it IS a surfaced entity, shares a surfaced entity's
-/// region, or lives in a file any surfaced entity points into — path
-/// membership covers both file-entity-adjacent (`ChangedWith`/`Imports`)
-/// and symbol-entity-adjacent (`Calls`/`References`) expansion, since
-/// surfaced entities of either granularity carry `address.path`.
-/// Strength is the best normalized propagated score reaching the
-/// candidate, so weak tail evidence lifts less than a head-confirmed hit.
-///
-/// Cluster support: the files answering one query call, import, and
-/// co-change each other; isolated vocabulary matches don't. The head's
-/// candidates resolve to FILE entities (document hits on symbol regions
-/// still map to a file through `address.path`), then edges whose other
-/// endpoint is also in the head file set count as per-file support. Only
-/// file-level adjacency is visible at this granularity: symbol-level
-/// `Calls` never touch file entities as endpoints, so `Imports`/
-/// `ChangedWith` carry the cluster signal.
-///
-/// File vote: the files answering one query recur across the candidate
-/// pool — a mechanism's regions fill many ranks — while an isolated
-/// vocabulary match occupies exactly one. Each file is keyed by its
-/// best rank (a lucky tail hit cannot outvote a real head presence) and
-/// earns `FILE_VOTE_BONUS` × best-rank mass × ln(1+occurrences) once it
-/// holds more than one pooled rank. No store access: the pool itself is
-/// the evidence.
-fn apply_corroboration(
-    store: &MetadataStore,
-    snapshot_id: &str,
-    expansion: &ExpansionEvidence,
-    candidates: &mut HashMap<String, Candidate>,
-) -> Result<()> {
-    let mut head_files = HashMap::<String, String>::new(); // path → file entity id
-    for candidate in ranked_candidates(candidates).into_iter().take(CLUSTER_HEAD) {
-        let Some(path) = candidate.hit.address.as_ref().map(|a| a.path.clone()) else {
-            continue;
-        };
-        if head_files.contains_key(&path) {
-            continue;
-        }
-        if let Some(entity) = file_entity(store, snapshot_id, &path)? {
-            head_files.insert(path, entity.id);
-        }
-    }
-    let head_ids: std::collections::HashSet<&str> =
-        head_files.values().map(String::as_str).collect();
-    // path → count of edges whose other endpoint is another head file.
-    let mut support = HashMap::<String, usize>::new();
-    for (path, file_id) in &head_files {
-        // Span the whole degree like the co-change fetch: confidence-
-        // ordered heads crowd out the 0.7-capped ChangedWith edges that
-        // carry much of the cluster signal.
-        let degree = store.entity_relation_degree(snapshot_id, file_id)?;
-        let count = store
-            .relations_for_entity(snapshot_id, file_id, RelationDirection::Both, degree)?
-            .iter()
-            .filter(|relation| {
-                let other = if relation.source_entity_id == *file_id {
-                    relation.target_entity_id.as_str()
-                } else {
-                    relation.source_entity_id.as_str()
-                };
-                other != file_id.as_str() && head_ids.contains(other)
-            })
-            .count();
-        support.insert(path.clone(), count);
-    }
-    // File vote: occurrences per path across the whole pool, each file
-    // keyed by its best rank so a lucky tail hit cannot outvote a real
-    // head presence. Only the file's champion — the document holding
-    // that best rank — collects the bonus: it is the slot competing for
-    // the head; boosting the file's tail docs would just crowd the
-    // dedup-relaxed middle ranks.
-    let mut votes = HashMap::<String, (String, usize, usize)>::new(); // path → (champion doc, best rank, occurrences)
-    for (rank, candidate) in ranked_candidates(candidates).iter().enumerate() {
-        let Some(path) = candidate.hit.address.as_ref().map(|a| a.path.clone()) else {
-            continue;
-        };
-        let entry = votes
-            .entry(path)
-            .or_insert_with(|| (candidate.hit.document_id.clone(), rank, 0));
-        entry.2 += 1;
-    }
-    for candidate in candidates.values_mut() {
-        let hit = &candidate.hit;
-        // Structural candidates ARE the expansion evidence; corroborating
-        // them with it would double-count.
-        if hit.contributing_routes.contains(&SearchRoute::Structural) {
-            continue;
-        }
-        let mut bonus = 0.0_f64;
-        let mut notes = Vec::new();
-        if !expansion.entities.is_empty() {
-            let evidence = [
-                expansion.entities.get(&hit.entity_id),
-                hit.region_id
-                    .as_ref()
-                    .and_then(|region_id| expansion.regions.get(region_id)),
-                hit.address
-                    .as_ref()
-                    .and_then(|address| expansion.paths.get(&address.path)),
-            ]
-            .into_iter()
-            .flatten()
-            .max_by(|left, right| left.0.total_cmp(&right.0));
-            if let Some(&(score, edges)) = evidence {
-                let strength = (score / expansion.max_score).min(1.0);
-                bonus = CORROBORATION_BONUS.mul_add(strength, bonus);
-                notes.push(format!(
-                    "corroborated by graph expansion ({edges} edge{})",
-                    if edges == 1 { "" } else { "s" }
-                ));
-            }
-        }
-        if let Some(&count) = hit
-            .address
-            .as_ref()
-            .and_then(|address| support.get(&address.path))
-            .filter(|count| **count > 0)
-        {
-            bonus += (CLUSTER_SCALE * (count as f64).ln_1p()).min(CLUSTER_CAP);
-            notes.push(format!("{count} intra-candidate edges (mechanism cluster)"));
-        }
-        if let Some((_, best_rank, occurrences)) = hit
-            .address
-            .as_ref()
-            .and_then(|address| votes.get(&address.path))
-            .filter(|(champion, _, occurrences)| *occurrences > 1 && *champion == hit.document_id)
-        {
-            let strength = RRF_K / (RRF_K + *best_rank as f64 + 1.0)
-                * ((*occurrences).min(FILE_VOTE_MAX_OCCURRENCES) as f64).ln_1p()
-                / (FILE_VOTE_MAX_OCCURRENCES as f64).ln_1p();
-            bonus = FILE_VOTE_BONUS.mul_add(strength, bonus);
-            notes.push(format!(
-                "file vote: {occurrences} pooled occurrences (champion)"
-            ));
-        }
-        candidate.hit.explanation.extend(notes);
-        candidate.fused_score += bonus / RRF_K;
-    }
-    Ok(())
-}
-
-/// Symbol-evidence join: the documents answering a query name the
-/// files, but claims are supported by the atomic symbols those files'
-/// mechanism functions actually use. Every candidate entity's outgoing
-/// `References`/`Calls` edges are evidence pointers — a neighbor
-/// pointed at by several retrieved entities is consensus evidence, and
-/// a neighbor whose name overlaps the query is on-topic. Both signals
-/// are combined per neighbor; the best few emit as `entity:`-keyed hits
-/// at bounded mid-tail mass.
-///
-/// Placement is deliberate: `claim_support` and `symbol_recall` read
-/// the whole hit list, so evidence enriches the tail without touching
-/// the head ordering the other passes just established. Neighbors
-/// already in the candidate map merge score through `add_candidate`,
-/// corroborating rather than duplicating.
-fn symbol_evidence_join(
-    store: &MetadataStore,
-    snapshot_id: &str,
-    query: &str,
-    candidates: &mut HashMap<String, Candidate>,
-    verified_fresh: bool,
-    limit: usize,
-) -> Result<()> {
-    let query_terms = prf_terms_in(query);
-    if query_terms.is_empty() || candidates.is_empty() {
-        return Ok(());
-    }
-    // Plural-tolerant term set: "views" in prose should match the "view"
-    // inside `set_view_status`. Both forms are admitted so a query's
-    // singular and plural spellings collapse onto the symbol token.
-    let mut tolerant_terms = query_terms.clone();
-    for term in &query_terms {
-        if term.len() > 3 && term.ends_with('s') {
-            tolerant_terms.insert(term[..term.len() - 1].to_owned());
-        }
-    }
-
-    // Consensus count: for every neighbor, how many retrieved entities
-    // point at it, and the strongest single referrer's score. Seeds are
-    // the strongest unique candidate entities — the head carries the
-    // signal and the cap bounds the per-seed relation fetches. Seed
-    // degree is capped so hub entities cannot flood the neighbor space.
-    let mut neighbors = HashMap::<String, (usize, f64)>::new(); // id → (pointers, best referrer)
-    let mut unique = HashMap::<String, f64>::new();
-    for candidate in candidates.values() {
-        let entry = unique.entry(candidate.hit.entity_id.clone()).or_default();
-        *entry = entry.max(candidate.fused_score);
-    }
-    let mut seeds: Vec<(String, f64)> = unique.into_iter().collect();
-    seeds.sort_by(|left, right| {
-        right
-            .1
-            .total_cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    seeds.truncate(SYMBOL_EVIDENCE_SEEDS);
-    // The block's mass is read off the incumbent pool: beating the
-    // score at `limit - MAX` lands every entry inside the emitted
-    // window at the cost of only the weakest incumbents. Shallow pools
-    // anchor at their own tail instead.
-    let mut pool_scores: Vec<f64> = candidates.values().map(|c| c.fused_score).collect();
-    pool_scores.sort_by(|a, b| b.total_cmp(a));
-    let boundary = pool_scores
-        .get(limit.saturating_sub(SYMBOL_EVIDENCE_MAX))
-        .or_else(|| pool_scores.last())
-        .copied()
-        .unwrap_or_default();
-    for (seed_id, seed_score) in &seeds {
-        let degree = store
-            .entity_relation_degree(snapshot_id, seed_id)?
-            .min(SYMBOL_EVIDENCE_SEED_DEGREE);
-        for relation in
-            store.relations_for_entity(snapshot_id, seed_id, RelationDirection::Outgoing, degree)?
-        {
-            if !matches!(
-                relation.kind,
-                RelationKind::References | RelationKind::Calls
-            ) {
-                continue;
-            }
-            let entry = neighbors
-                .entry(relation.target_entity_id.clone())
-                .or_default();
-            entry.0 += 1;
-            entry.1 = entry.1.max(*seed_score);
-        }
-    }
-    if neighbors.is_empty() {
-        return Ok(());
-    }
-
-    // Score each neighbor: consensus pointers plus identifier overlap.
-    // Either signal alone can admit — a symbol named like the query is
-    // topical, one referenced by the head is structural — so a neighbor
-    // needs at least one of them, and raw score orders the emission cap.
-    // Neighbor resolution is one batched fetch: hundreds of entities
-    // fan out per query, and point lookups dominate the join's cost.
-    let neighbor_ids: Vec<String> = neighbors.keys().cloned().collect();
-    let entities: HashMap<String, CodeEntity> = store
-        .entities_by_ids(snapshot_id, &neighbor_ids)?
-        .into_iter()
-        .map(|entity| (entity.id.clone(), entity))
-        .collect();
-    let mut scored: Vec<(f64, usize, CodeEntity)> = Vec::new();
-    for (entity_id, (pointers, best_referrer)) in neighbors {
-        let Some(entity) = entities.get(&entity_id) else {
-            continue;
-        };
-        if !matches!(
-            entity.kind,
-            EntityKind::Function
-                | EntityKind::Struct
-                | EntityKind::Enum
-                | EntityKind::Trait
-                | EntityKind::Class
-                | EntityKind::Interface
-                | EntityKind::Constant
-        ) {
-            continue;
-        }
-        let overlap = prf_terms_in(&entity.name)
-            .iter()
-            .filter(|term| {
-                tolerant_terms.contains(term.as_str())
-                    || (term.len() > 3
-                        && term.ends_with('s')
-                        && tolerant_terms.contains(&term[..term.len() - 1]))
-            })
-            .count();
-        if pointers < 2 && overlap == 0 {
-            continue;
-        }
-        // Raw score: consensus pointers dominate, identifier overlap
-        // weighs 1.5× a pointer, and the strongest referrer's fused
-        // score (~0.01-0.05) is a mild nudge that breaks pointer ties
-        // toward head-endorsed evidence.
-        let raw = 1.5f64.mul_add(overlap as f64, pointers as f64) + best_referrer;
-        scored.push((raw, overlap, entity.clone()));
-    }
-    scored.sort_by(|left, right| {
-        right
-            .0
-            .total_cmp(&left.0)
-            .then_with(|| left.2.id.cmp(&right.2.id))
-    });
-    // Two emission lanes, interleaved. The named lane is restricted to
-    // callable symbols: claim facts name functions and methods, while
-    // name-matched types still reach the list through the consensus
-    // lane on pointer count alone. Without the restriction, type hubs
-    // pointed at by everything crowd the exact claim evidence out of
-    // the emission cap.
-    let (named, plain): (Vec<_>, Vec<_>) = scored.into_iter().partition(|(_, overlap, entity)| {
-        *overlap > 0 && matches!(entity.kind, EntityKind::Function | EntityKind::Method)
-    });
-    let mut named = named.into_iter();
-    let mut plain = plain.into_iter();
-    let mut scored: Vec<(f64, usize, CodeEntity)> = Vec::new();
-    while scored.len() < SYMBOL_EVIDENCE_MAX {
-        let mut progressed = false;
-        for lane in [&mut named, &mut plain] {
-            if let Some(entry) = lane.next() {
-                scored.push(entry);
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    if scored.is_empty() {
-        return Ok(());
-    }
-    if std::env::var_os("CCE_DEBUG_SYMEV").is_some() {
-        for (i, (raw, ov, e)) in scored.iter().enumerate() {
-            eprintln!("[symev] #{i} raw={raw:.3} ov={ov} {}", e.name);
-        }
-    }
-
-    for (rank, (raw, overlap, entity)) in scored.into_iter().enumerate() {
-        if boundary <= 0.0 {
-            break;
-        }
-        // A hair above the boundary, decaying within the block so lane
-        // order is preserved among the emitted entries.
-        let mass =
-            boundary * SYMBOL_EVIDENCE_BOUNDARY_FRACTION * 0.005f64.mul_add(-(rank as f64), 1.0);
-        let snippet = entity
-            .signature
-            .clone()
-            .or_else(|| entity.qualified_name.clone())
-            .unwrap_or_else(|| entity.name.clone());
-        add_candidate(
-            candidates,
-            SearchHit {
-                document_id: format!("entity:{}", entity.id),
-                region_id: entity.region_id.clone(),
-                symbol_name: Some(entity.name.clone()),
-                entity_id: entity.id.clone(),
-                representation: RetrievalRepresentation::Signature,
-                route: SearchRoute::Structural,
-                rank: rank + 1,
-                score: mass,
-                contributing_routes: vec![SearchRoute::Structural],
-                address: entity.address,
-                evidence: Vec::new(),
-                snippet,
-                verified_current: verified_fresh,
-                explanation: vec![format!(
-                    "symbol evidence: referenced by retrieved candidates, consensus score {raw:.2}, term overlap {overlap}"
-                )],
-            },
-            mass,
-        );
-    }
-    Ok(())
-}
-
 /// Query-conditioned structural flow: the principled mechanism the
 /// graph-adjacent priors each approximate. Candidate entities are seeded
 /// with their fused topical score; mass then propagates along typed
@@ -1641,6 +1155,15 @@ const FLOW_HOP_DECAY: f64 = 0.5;
 const FLOW_BONUS: f64 = 0.25;
 const FLOW_EMIT_MAX: usize = 12;
 const FLOW_FRONTIER: usize = 16;
+/// `Contains` forward conductance for FILE-KIND SEED nodes only.
+/// Generic file→member flow dilutes across dozens of members (0.3),
+/// but a retrieved file is topical evidence for its own members —
+/// the granularity hop the champion file-vote approximated. Moderated
+/// between the generic forward rate and the member→file aggregation
+/// rate: strong enough that a strong file's member symbols become
+/// flow-reachable in hop 1, bounded so a file cannot flood its whole
+/// member list with near-seed mass.
+const FLOW_SEED_CONTAINS: f64 = 0.6;
 
 /// Per-kind conductance `(forward, backward)`: the fraction of a
 /// node's mass crossing an edge in each direction per hop. The table
@@ -1691,10 +1214,13 @@ const fn flow_kind_tag(kind: &RelationKind) -> u8 {
     }
 }
 
-/// Fetch `entity_id`'s relations (degree-capped) and append unseen
-/// `(source, target, kind)` edges with extractor confidence. Relation
-/// rows repeat per extractor merge, so `seen` dedups or flow mass
-/// multiplies.
+/// Fetch `entity_id`'s relations and append unseen `(source, target,
+/// kind)` edges with extractor confidence. Relation rows repeat per
+/// extractor merge, so `seen` dedups or flow mass multiplies. Each
+/// direction gets its own `FLOW_SEED_DEGREE` budget: a single shared
+/// cap lets a hub seed's incoming edges crowd its outgoing evidence
+/// pointers out of the universe — the emitted-consensus residual the
+/// symbol-evidence join's outgoing-only pointer fetch never had.
 fn flow_collect_edges(
     store: &MetadataStore,
     snapshot_id: &str,
@@ -1705,21 +1231,21 @@ fn flow_collect_edges(
     let degree = store
         .entity_relation_degree(snapshot_id, entity_id)?
         .min(FLOW_SEED_DEGREE);
-    for relation in
-        store.relations_for_entity(snapshot_id, entity_id, RelationDirection::Both, degree)?
-    {
-        let key = (
-            relation.source_entity_id.clone(),
-            relation.target_entity_id.clone(),
-            flow_kind_tag(&relation.kind),
-        );
-        if seen.insert(key) {
-            edges.push((
-                relation.source_entity_id,
-                relation.target_entity_id,
-                relation.kind,
-                f64::from(relation.confidence),
-            ));
+    for direction in [RelationDirection::Outgoing, RelationDirection::Incoming] {
+        for relation in store.relations_for_entity(snapshot_id, entity_id, direction, degree)? {
+            let key = (
+                relation.source_entity_id.clone(),
+                relation.target_entity_id.clone(),
+                flow_kind_tag(&relation.kind),
+            );
+            if seen.insert(key) {
+                edges.push((
+                    relation.source_entity_id,
+                    relation.target_entity_id,
+                    relation.kind,
+                    f64::from(relation.confidence),
+                ));
+            }
         }
     }
     Ok(())
@@ -1749,6 +1275,7 @@ fn apply_graph_flow(
     store: &MetadataStore,
     snapshot_id: &str,
     query: &str,
+    expansion: &ExpansionEvidence,
     candidates: &mut HashMap<String, Candidate>,
     verified_fresh: bool,
     limit: usize,
@@ -1771,12 +1298,76 @@ fn apply_graph_flow(
             .then_with(|| left.0.cmp(&right.0))
     });
     seeds.truncate(FLOW_SEEDS);
+    // Expansion-surfaced evidence seeds too — the corroboration-join
+    // subsumption: candidate → expansion-entity → candidate is the
+    // two-hop path that returns mass to docs expansion confirmed but
+    // `add_candidate` could never merge. Expansion seeds carry their
+    // recorded propagated score and append after candidate seeds
+    // inside the same FLOW_SEEDS budget. `regions` keys are not
+    // entity-graph nodes (no relations attach to them); their evidence
+    // already enters through the member entities that recorded them.
+    let mut seed_set: std::collections::HashSet<String> =
+        seeds.iter().map(|(id, _)| id.clone()).collect();
+    let mut expansion_seeds: Vec<(String, f64)> = Vec::new();
+    for (entity_id, (score, _)) in &expansion.entities {
+        if seed_set.insert(entity_id.clone()) {
+            expansion_seeds.push((entity_id.clone(), *score));
+        }
+    }
+    // File-path keys resolve to the file entity holding the surfaced
+    // symbols — the file-level corroboration granularity. Resolution
+    // is a name lookup per path, so it runs only against the seed
+    // budget candidate entities did not already fill.
+    if seeds.len() + expansion_seeds.len() < FLOW_SEEDS {
+        let mut paths: Vec<(&String, f64)> = expansion
+            .paths
+            .iter()
+            .map(|(path, (score, _))| (path, *score))
+            .collect();
+        paths.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+        let remaining = FLOW_SEEDS - seeds.len() - expansion_seeds.len();
+        // A few extra lookups cover paths with no file entity row.
+        let mut added = 0_usize;
+        for (path, score) in paths.into_iter().take(remaining + 4) {
+            if let Some(entity) = file_entity(store, snapshot_id, path)? {
+                if seed_set.insert(entity.id.clone()) {
+                    expansion_seeds.push((entity.id, score));
+                    added += 1;
+                }
+            }
+            if added >= remaining {
+                break;
+            }
+        }
+    }
+    expansion_seeds.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    seeds.extend(expansion_seeds);
+    seeds.truncate(FLOW_SEEDS);
     let Some(max_seed) = seeds.first().map(|(_, score)| *score) else {
         return Ok(());
     };
     if max_seed <= 0.0 {
         return Ok(());
     }
+    // File-kind seeds inject into their own members at a moderated
+    // rate (FLOW_SEED_CONTAINS) instead of the generic diluting
+    // contains-forward: a retrieved file is topical evidence for the
+    // symbols it contains — the granularity hop the champion
+    // file-vote approximated by fiat.
+    let file_seeds: std::collections::HashSet<String> = store
+        .entities_by_ids(
+            snapshot_id,
+            &seeds.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        )?
+        .into_iter()
+        .filter(|entity| entity.kind == EntityKind::File)
+        .map(|entity| entity.id)
+        .collect();
 
     // Edge universe: deduplicated relations touching any seed. Relation
     // rows repeat per extractor merge, so dedup by (source, target,
@@ -1816,6 +1407,10 @@ fn apply_graph_flow(
     // itself is excluded: a candidate's own topicality is not evidence
     // corroborating it.
     let mut received: HashMap<String, f64> = HashMap::new();
+    // Distinct senders per receiver — the flow analogue of the
+    // symbol-evidence join's referrer count: mass arriving over
+    // independent paths is consensus, one edge's worth of mass is not.
+    let mut senders: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     // Non-backtracking: an edge traversed at hop t cannot reverse at
     // t+1 — test↔mechanism ping-pong would inflate both endpoints
     // without adding corroboration. Re-firing the same direction is
@@ -1847,7 +1442,13 @@ fn apply_graph_flow(
         let used = std::mem::take(&mut traversed);
         let mut delta = std::collections::BTreeMap::<String, f64>::new();
         for (index, (source, target, kind, confidence)) in edges.iter().enumerate() {
-            let (forward, backward) = flow_edge_weights(kind);
+            let (mut forward, backward) = flow_edge_weights(kind);
+            // Seed-file member injection: contains edges out of a
+            // file-kind seed conduct at the moderated rate, not the
+            // generic diluting one.
+            if matches!(kind, RelationKind::Contains) && file_seeds.contains(source) {
+                forward = FLOW_SEED_CONTAINS;
+            }
             let source_mass = prev.get(source).copied().unwrap_or_default();
             if forward > 0.0 && source_mass > 0.0 && !used.contains(&(index, 1)) {
                 let share = confidence
@@ -1858,6 +1459,10 @@ fn apply_graph_flow(
                         .max(f64::EPSILON);
                 let flow = forward * source_mass * share;
                 *delta.entry(target.clone()).or_default() += flow;
+                senders
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(source.clone());
                 traversed.insert((index, 0));
             }
             let target_mass = prev.get(target).copied().unwrap_or_default();
@@ -1870,6 +1475,10 @@ fn apply_graph_flow(
                         .max(f64::EPSILON);
                 let flow = backward * target_mass * share;
                 *delta.entry(source.clone()).or_default() += flow;
+                senders
+                    .entry(source.clone())
+                    .or_default()
+                    .insert(target.clone());
                 traversed.insert((index, 1));
             }
         }
@@ -1881,19 +1490,90 @@ fn apply_graph_flow(
     }
 
     // Readout 1 — candidate bonus: received mass, normalized by the
-    // best-corroborated node, bounded at FLOW_BONUS.
+    // best-corroborated node, bounded at FLOW_BONUS. A candidate joins
+    // on every granularity the flow graph carries: its own entity AND
+    // the file entity its address lives in — member evidence
+    // aggregates into the file node (`contains` backward), so the
+    // file's received mass is the pooled vote backing every document
+    // the file owns. This is the corroboration/file-vote readout: the
+    // legacy priors keyed the same join on `address.path`.
+    //
+    // Expansion membership is the second channel — the corroboration
+    // join's direct readout. A document whose own entity, region, or
+    // path structural expansion surfaced is externally corroborated
+    // even when no flow returns to it (seed mass is not self-evidence),
+    // so membership strength joins the same bounded bonus. Candidates
+    // carrying the structural route ARE that evidence; bonusing them
+    // would double-count.
     let max_received = received.values().copied().fold(0.0_f64, f64::max);
-    if max_received > 0.0 {
+    if max_received > 0.0 || expansion.max_score > 0.0 {
+        let mut file_entities = HashMap::<String, Option<String>>::new();
         for candidate in candidates.values_mut() {
-            let Some(flow) = received.get(&candidate.hit.entity_id) else {
+            if candidate
+                .hit
+                .contributing_routes
+                .contains(&SearchRoute::Structural)
+            {
                 continue;
+            }
+            let mut flow = received
+                .get(&candidate.hit.entity_id)
+                .copied()
+                .unwrap_or_default();
+            if let Some(path) = candidate.hit.address.as_ref().map(|a| a.path.clone()) {
+                let file_id = match file_entities.entry(path) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let resolved =
+                            file_entity(store, snapshot_id, entry.key())?.map(|entity| entity.id);
+                        entry.insert(resolved).clone()
+                    }
+                };
+                if let Some(file_id) = file_id {
+                    if file_id != candidate.hit.entity_id {
+                        flow += received.get(&file_id).copied().unwrap_or_default();
+                    }
+                }
+            }
+            let mut strength = if max_received > 0.0 {
+                (flow / max_received).min(1.0)
+            } else {
+                0.0
             };
-            let bonus = FLOW_BONUS * (flow / max_received) / RRF_K;
-            candidate.fused_score += bonus;
-            candidate.hit.explanation.push(format!(
-                "graph flow corroboration {:.2}",
-                flow / max_received
-            ));
+            let mut notes = Vec::new();
+            if flow > 0.0 {
+                notes.push(format!("graph flow corroboration {strength:.2}"));
+            }
+            if expansion.max_score > 0.0 {
+                let membership = [
+                    expansion.entities.get(&candidate.hit.entity_id),
+                    candidate
+                        .hit
+                        .region_id
+                        .as_ref()
+                        .and_then(|region_id| expansion.regions.get(region_id)),
+                    candidate
+                        .hit
+                        .address
+                        .as_ref()
+                        .and_then(|address| expansion.paths.get(&address.path)),
+                ]
+                .into_iter()
+                .flatten()
+                .max_by(|left, right| left.0.total_cmp(&right.0));
+                if let Some(&(score, edges)) = membership {
+                    strength = strength.max((score / expansion.max_score).min(1.0));
+                    notes.push(format!(
+                        "corroborated by graph expansion ({edges} edge{})",
+                        if edges == 1 { "" } else { "s" }
+                    ));
+                }
+            }
+            if strength <= 0.0 {
+                continue;
+            }
+            candidate.fused_score += FLOW_BONUS * strength / RRF_K;
+            candidate.hit.explanation.extend(notes);
         }
     }
 
@@ -1917,7 +1597,19 @@ fn apply_graph_flow(
         .map(|entity| (entity.id.clone(), entity))
         .collect();
     let query_terms = prf_terms_in(query);
-    let mut scored: Vec<(f64, usize, &CodeEntity)> = Vec::new();
+    // Plural-tolerant term set, same rule as the symbol-evidence join:
+    // "views" in prose should match the "view" inside `set_view_status`.
+    // Both spellings are admitted so singular/plural collapse onto the
+    // symbol token — without it the named lane silently narrows versus
+    // the join it replaces (v7: set_view_status lost on "views").
+    let mut tolerant_terms = query_terms.clone();
+    for term in &query_terms {
+        if term.len() > 3 && term.ends_with('s') {
+            tolerant_terms.insert(term[..term.len() - 1].to_owned());
+        }
+    }
+    let mass_norm = max_received.max(f64::EPSILON);
+    let mut scored: Vec<(f64, f64, usize, &CodeEntity)> = Vec::new();
     for (id, entity) in &entities {
         if !matches!(
             entity.kind,
@@ -1933,24 +1625,53 @@ fn apply_graph_flow(
             continue;
         }
         let flow = received.get(id).copied().unwrap_or_default();
+        // Emission score is the pointer rule stated in flow terms:
+        // distinct SEED senders are consensus votes (the join's
+        // referrer count), name overlap is topical evidence, and
+        // normalized received mass is the tie-breaking nudge the
+        // referrer score played. Raw mass ordering alone dilutes
+        // multi-sender evidence: seven thin seed→struct edges lose
+        // to one fat call edge even though the struct is what the
+        // retrieved head actually points at.
+        let seed_consensus = senders.get(id).map_or(0, |set| {
+            set.iter()
+                .filter(|sender| seed_ids.contains(sender))
+                .count()
+        });
         let overlap = prf_terms_in(&entity.name)
             .iter()
-            .filter(|term| query_terms.contains(term.as_str()))
+            .filter(|term| {
+                tolerant_terms.contains(term.as_str())
+                    || (term.len() > 3
+                        && term.ends_with('s')
+                        && tolerant_terms.contains(&term[..term.len() - 1]))
+            })
             .count();
-        scored.push((flow, overlap, entity));
+        let sender_count = senders.get(id).map_or(0, std::collections::HashSet::len);
+        // Admission floor, the join's `pointers < 2 && overlap == 0`
+        // gate stated over flow senders: a node needs consensus —
+        // mass arriving over at least two independent paths — or a
+        // topical name. Single-sender incidental mass must not spend
+        // an emission slot that displaces a lexical incumbent.
+        if sender_count < 2 && overlap == 0 {
+            continue;
+        }
+        let score = 1.5f64.mul_add(overlap as f64, seed_consensus as f64) + flow / mass_norm;
+        scored.push((score, flow, overlap, entity));
     }
     scored.sort_by(|left, right| {
         right
             .0
             .total_cmp(&left.0)
-            .then_with(|| left.2.id.cmp(&right.2.id))
+            .then_with(|| left.3.id.cmp(&right.3.id))
     });
-    let (named, plain): (Vec<_>, Vec<_>) = scored.into_iter().partition(|(_, overlap, entity)| {
-        *overlap > 0 && matches!(entity.kind, EntityKind::Function | EntityKind::Method)
-    });
+    let (named, plain): (Vec<_>, Vec<_>) =
+        scored.into_iter().partition(|(_, _, overlap, entity)| {
+            *overlap > 0 && matches!(entity.kind, EntityKind::Function | EntityKind::Method)
+        });
     let mut named = named.into_iter();
     let mut plain = plain.into_iter();
-    let mut block: Vec<(f64, usize, &CodeEntity)> = Vec::new();
+    let mut block: Vec<(f64, f64, usize, &CodeEntity)> = Vec::new();
     while block.len() < FLOW_EMIT_MAX {
         let mut progressed = false;
         for lane in [&mut named, &mut plain] {
@@ -1976,7 +1697,7 @@ fn apply_graph_flow(
     if boundary <= 0.0 {
         return Ok(());
     }
-    for (rank, (flow, _, entity)) in block.into_iter().enumerate() {
+    for (rank, (_, flow, _, entity)) in block.into_iter().enumerate() {
         let mass_hit = boundary * 0.005f64.mul_add(-(rank as f64), 1.0);
         let snippet = entity
             .signature
@@ -2466,10 +2187,6 @@ mod tests {
         }
     }
 
-    fn references(source: &str, target: &str) -> cce_core::Relation {
-        relation(source, target, RelationKind::References)
-    }
-
     fn calls(source: &str, target: &str) -> cce_core::Relation {
         relation(source, target, RelationKind::Calls)
     }
@@ -2644,166 +2361,8 @@ mod tests {
         assert_eq!(count_of("src/b.rs"), 1);
     }
 
-    #[test]
-    fn co_change_partner_receives_bonus() {
-        // The edge is stored once with the smaller id as source; the bonus
-        // must still find it from the larger-id endpoint. Twenty 1.0-
-        // confidence references crowd the co-change edge out of any naive
-        // confidence-ordered head fetch — the fetch must span the degree.
-        let mut relations = vec![changed_with("file:src/a.rs", "file:src/b.rs", 0.6)];
-        for index in 0..20 {
-            relations.push(references("file:src/a.rs", &format!("dummy:{index}")));
-        }
-        let records = SnapshotRecords {
-            entities: vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")],
-            relations,
-            ..SnapshotRecords::default()
-        };
-        let (_dir, store, snapshot_id) = store_with(&records);
 
-        let mut candidates = HashMap::new();
-        candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
-        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.1));
-        candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.1));
-        apply_structural_features(
-            &store,
-            &snapshot_id,
-            QueryIntent::NaturalLanguageBehavior,
-            0,
-            "query",
-            &mut candidates,
-        )
-        .expect("structural features");
 
-        // All three files sit in top_paths and take the same-file 0.25, so
-        // the fused-score gap between a partner and the unrelated file is
-        // exactly the co-change bonus. Both endpoints are top hits and the
-        // lookup is bidirectional, so a is itself b's partner.
-        let expected = CO_CHANGE_SCALE * 0.6 / RRF_K;
-        for endpoint in ["a", "b"] {
-            let gap = candidates[endpoint].fused_score - candidates["c"].fused_score;
-            assert!(
-                (gap - expected).abs() < 1e-9,
-                "{endpoint} fused {} vs unrelated {}",
-                candidates[endpoint].fused_score,
-                candidates["c"].fused_score
-            );
-            assert!(
-                candidates[endpoint]
-                    .hit
-                    .explanation
-                    .iter()
-                    .any(|line| line.contains("co-change"))
-            );
-        }
-        assert!(candidates["c"].hit.explanation.is_empty());
-    }
-
-    #[test]
-    fn corroborated_candidate_outranks_isolated() {
-        // The expansion set is the join key `add_candidate` cannot
-        // provide: a file entity surfaced as a co-change neighbor
-        // corroborates its document candidate through `entity_id`, and a
-        // surfaced symbol corroborates every candidate in its file
-        // through `address.path`.
-        let mut expansion = ExpansionEvidence::default();
-        expansion.record(&file("src/b.rs"), 0.05); // ChangedWith neighbor of a seed
-        expansion.record(&symbol("helper", "src/d.rs"), 0.04); // Calls neighbor
-
-        let mut candidates = HashMap::new();
-        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.1));
-        candidates.insert("d".to_owned(), candidate("d", "src/d.rs", 0.1));
-        candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.1));
-        let mut structural = candidate("s", "src/e.rs", 0.1);
-        structural.hit.route = SearchRoute::Structural;
-        structural.hit.contributing_routes = vec![SearchRoute::Structural];
-        candidates.insert("s".to_owned(), structural);
-
-        // No file entities are indexed, so no head file resolves and the
-        // cluster pass contributes nothing — the gap is pure corroboration.
-        let records = SnapshotRecords::default();
-        let (_dir, store, snapshot_id) = store_with(&records);
-        apply_corroboration(&store, &snapshot_id, &expansion, &mut candidates)
-            .expect("corroboration");
-
-        // b matches its entity id at full strength; d matches through the
-        // symbol's file at 0.04/0.05 strength; c is isolated; the
-        // structural hit IS the evidence and must not corroborate itself.
-        let expected = |score: f64| CORROBORATION_BONUS * (score / 0.05) / RRF_K;
-        assert!((candidates["b"].fused_score - 0.1 - expected(0.05)).abs() < 1e-9);
-        assert!((candidates["d"].fused_score - 0.1 - expected(0.04)).abs() < 1e-9);
-        assert!((candidates["c"].fused_score - 0.1).abs() < f64::EPSILON);
-        assert!((candidates["s"].fused_score - 0.1).abs() < f64::EPSILON);
-        for key in ["b", "d"] {
-            assert!(
-                candidates[key]
-                    .hit
-                    .explanation
-                    .iter()
-                    .any(|line| line.contains("corroborated by graph expansion")),
-                "{key} must explain its corroboration"
-            );
-        }
-        assert!(candidates["c"].hit.explanation.is_empty());
-    }
-
-    #[test]
-    fn symbol_evidence_surfaces_pointed_symbols() {
-        // Seeds are the retrieved file entities; their outgoing
-        // references edges name the atomic symbols claim evidence lives
-        // in. `set_view_status` is admitted on query overlap alone
-        // ("views" tolerates the singular "view"), `consensus_target`
-        // on two pointers without any name match, while a single
-        // pointer with no overlap is noise and a `changed_with` edge
-        // is the wrong kind entirely.
-        let records = SnapshotRecords {
-            entities: vec![
-                file("src/a.rs"),
-                file("src/b.rs"),
-                symbol("set_view_status", "src/m.rs"),
-                symbol("consensus_target", "src/m.rs"),
-                symbol("unrelated_helper", "src/m.rs"),
-                symbol("decoy_only_changed", "src/m.rs"),
-            ],
-            relations: vec![
-                references("file:src/a.rs", "symbol:set_view_status"),
-                references("file:src/a.rs", "symbol:consensus_target"),
-                references("file:src/b.rs", "symbol:consensus_target"),
-                references("file:src/a.rs", "symbol:unrelated_helper"),
-                changed_with("file:src/a.rs", "symbol:decoy_only_changed", 0.9),
-            ],
-            ..SnapshotRecords::default()
-        };
-        let (_dir, store, snapshot_id) = store_with(&records);
-
-        let mut candidates = HashMap::new();
-        candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
-        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.05));
-
-        symbol_evidence_join(
-            &store,
-            &snapshot_id,
-            "mark views stale",
-            &mut candidates,
-            true,
-            50,
-        )
-        .expect("symbol evidence");
-
-        let emitted = &candidates["entity:symbol:set_view_status"].hit;
-        assert_eq!(emitted.route, SearchRoute::Structural);
-        assert_eq!(emitted.symbol_name.as_deref(), Some("set_view_status"));
-        assert!(emitted.verified_current);
-        assert!(
-            emitted
-                .explanation
-                .iter()
-                .any(|line| line.contains("symbol evidence"))
-        );
-        assert!(candidates.contains_key("entity:symbol:consensus_target"));
-        assert!(!candidates.contains_key("entity:symbol:unrelated_helper"));
-        assert!(!candidates.contains_key("entity:symbol:decoy_only_changed"));
-    }
 
     #[test]
     fn graph_flow_emits_called_mechanism_and_corroborates() {
@@ -2838,6 +2397,7 @@ mod tests {
             &store,
             &snapshot_id,
             "mark views stale",
+            &ExpansionEvidence::default(),
             &mut candidates,
             true,
             50,
@@ -2873,105 +2433,225 @@ mod tests {
     }
 
     #[test]
-    fn graph_flow_empty_pool_is_noop() {
-        // No-context guard: an empty candidate pool must not touch the
-        // store or panic — abstention stays clean.
-        let records = SnapshotRecords::default();
+    fn graph_flow_seeds_expansion_evidence_entities() {
+        // `relay_fn`/`relay_two` were surfaced by structural expansion —
+        // they are not candidates, but their recorded propagated scores
+        // seed flow, so the mechanism they both call becomes reachable
+        // in hop 1 and emits on two-path consensus. Without expansion
+        // seeding `mechanism_fn` is outside the seed star entirely:
+        // candidate → expansion-entity → mechanism is the
+        // corroboration-join path only this seeding opens.
+        let records = SnapshotRecords {
+            entities: vec![
+                file("src/a.rs"),
+                symbol("relay_fn", "src/x.rs"),
+                symbol("relay_two", "src/y.rs"),
+                symbol("mechanism_fn", "src/m.rs"),
+            ],
+            relations: vec![
+                calls("symbol:relay_fn", "symbol:mechanism_fn"),
+                calls("symbol:relay_two", "symbol:mechanism_fn"),
+            ],
+            ..SnapshotRecords::default()
+        };
         let (_dir, store, snapshot_id) = store_with(&records);
+
+        let mut expansion = ExpansionEvidence::default();
+        expansion.record(&symbol("relay_fn", "src/x.rs"), 0.05);
+        expansion.record(&symbol("relay_two", "src/y.rs"), 0.04);
+
         let mut candidates = HashMap::new();
-        apply_graph_flow(&store, &snapshot_id, "anything", &mut candidates, true, 50)
-            .expect("graph flow");
-        assert!(candidates.is_empty());
+        candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
+        apply_graph_flow(
+            &store,
+            &snapshot_id,
+            "query",
+            &expansion,
+            &mut candidates,
+            true,
+            50,
+        )
+        .expect("graph flow");
+
+        let emitted = &candidates["entity:symbol:mechanism_fn"].hit;
+        assert_eq!(emitted.route, SearchRoute::Structural);
+        assert_eq!(emitted.symbol_name.as_deref(), Some("mechanism_fn"));
+        // The expansion seeds are evidence, not results — they must not
+        // emit themselves.
+        assert!(!candidates.contains_key("entity:symbol:relay_fn"));
+        assert!(!candidates.contains_key("entity:symbol:relay_two"));
     }
 
     #[test]
-    fn clustered_file_outranks_lone_file() {
-        // Mechanism density: a and b co-change inside the candidate head;
-        // c is isolated. Each endpoint counts the edge once, so both
-        // clustered files earn the ln-damped bonus and the lone file
-        // earns nothing — the sibling's presence in the ranking is the
-        // evidence.
+    fn graph_flow_bonuses_expansion_evidenced_candidate() {
+        // The corroboration join's direct channel: a candidate whose
+        // entity/path structural expansion surfaced is corroborated
+        // even when the flow graph returns no mass to it — seed mass
+        // is not self-evidence, but expansion membership is external
+        // evidence. `b` matches its file entity at full strength; `c`
+        // is unevidenced; the structural candidate IS the evidence and
+        // must not corroborate itself. The lone calls edge keeps the
+        // edge universe non-empty; its target stays unemitted under
+        // the single-sender admission floor.
         let records = SnapshotRecords {
-            entities: vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")],
-            relations: vec![changed_with("file:src/a.rs", "file:src/b.rs", 0.6)],
+            entities: vec![
+                file("src/b.rs"),
+                file("src/c.rs"),
+                symbol("helper_fn", "src/m.rs"),
+            ],
+            relations: vec![calls("file:src/b.rs", "symbol:helper_fn")],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, store, snapshot_id) = store_with(&records);
+
+        let mut expansion = ExpansionEvidence::default();
+        expansion.record(&file("src/b.rs"), 0.05);
+
+        let mut candidates = HashMap::new();
+        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.1));
+        candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.1));
+        let mut structural = candidate("s", "src/s.rs", 0.1);
+        structural
+            .hit
+            .contributing_routes
+            .push(SearchRoute::Structural);
+        candidates.insert("s".to_owned(), structural);
+        apply_graph_flow(
+            &store,
+            &snapshot_id,
+            "query",
+            &expansion,
+            &mut candidates,
+            true,
+            50,
+        )
+        .expect("graph flow");
+
+        let expected = FLOW_BONUS / RRF_K;
+        assert!((candidates["b"].fused_score - 0.1 - expected).abs() < 1e-9);
+        assert!((candidates["c"].fused_score - 0.1).abs() < f64::EPSILON);
+        assert!((candidates["s"].fused_score - 0.1).abs() < f64::EPSILON);
+        assert!(!candidates.contains_key("entity:symbol:helper_fn"));
+        assert!(
+            candidates["b"]
+                .hit
+                .explanation
+                .iter()
+                .any(|line| line.contains("corroborated by graph expansion"))
+        );
+    }
+
+    #[test]
+    fn graph_flow_emission_requires_consensus_or_overlap() {
+        // The emission admission floor is the join's pointer gate in
+        // flow terms: `noisy_neighbor` hangs off a single seed path
+        // with no name overlap and must not spend an emission slot,
+        // while `set_view_status` admits on the plural-tolerant name
+        // lane alone ("views" collapses onto "view") and
+        // `consensus_target` on two independent senders.
+        let records = SnapshotRecords {
+            entities: vec![
+                file("src/a.rs"),
+                file("src/b.rs"),
+                symbol("set_view_status", "src/m.rs"),
+                symbol("consensus_target", "src/m.rs"),
+                symbol("noisy_neighbor", "src/m.rs"),
+            ],
+            relations: vec![
+                calls("file:src/a.rs", "symbol:set_view_status"),
+                calls("file:src/a.rs", "symbol:consensus_target"),
+                calls("file:src/b.rs", "symbol:consensus_target"),
+                calls("file:src/a.rs", "symbol:noisy_neighbor"),
+            ],
             ..SnapshotRecords::default()
         };
         let (_dir, store, snapshot_id) = store_with(&records);
 
         let mut candidates = HashMap::new();
         candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
-        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.1));
-        candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.1));
-        apply_corroboration(
+        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.05));
+        apply_graph_flow(
             &store,
             &snapshot_id,
+            "mark views stale",
             &ExpansionEvidence::default(),
             &mut candidates,
+            true,
+            50,
         )
-        .expect("corroboration");
+        .expect("graph flow");
 
-        let expected = CLUSTER_SCALE * 2.0_f64.ln() / RRF_K;
-        for key in ["a", "b"] {
-            assert!(
-                (candidates[key].fused_score - 0.1 - expected).abs() < 1e-9,
-                "{key} fused {}",
-                candidates[key].fused_score
-            );
-            assert!(
-                candidates[key]
-                    .hit
-                    .explanation
-                    .iter()
-                    .any(|line| line.contains("intra-candidate edges (mechanism cluster)"))
-            );
-        }
-        assert!((candidates["c"].fused_score - 0.1).abs() < f64::EPSILON);
-        assert!(candidates["c"].hit.explanation.is_empty());
+        let named = &candidates["entity:symbol:set_view_status"].hit;
+        assert_eq!(named.route, SearchRoute::Structural);
+        assert_eq!(named.symbol_name.as_deref(), Some("set_view_status"));
+        assert!(candidates.contains_key("entity:symbol:consensus_target"));
+        assert!(!candidates.contains_key("entity:symbol:noisy_neighbor"));
     }
 
     #[test]
-    fn recurring_file_outranks_single_hit_file() {
-        // File vote: a.rs holds three pooled ranks, c.rs holds one — the
-        // recurring file's regions corroborate each other. Equal fused
-        // scores in, a.rs must come out ahead; the single-occurrence
-        // file earns nothing (occurrences > 1 gate).
-        let records = SnapshotRecords::default();
+    fn graph_flow_file_seed_reaches_member_through_contains() {
+        // A file-level candidate is topical evidence for its own
+        // members: the file-kind seed injects into `member_fn` through
+        // its contains edge, so the member becomes flow-reachable in
+        // hop 1 and emits through the named lane — the granularity hop
+        // the champion file-vote approximated by fiat. The contains
+        // edge is the member's ONLY path to seed mass, so its emission
+        // proves the hop conducted. An unrelated member of a non-seed
+        // file receives nothing.
+        let records = SnapshotRecords {
+            entities: vec![
+                file("src/a.rs"),
+                file("src/c.rs"),
+                symbol("member_fn", "src/a.rs"),
+                symbol("foreign_fn", "src/c.rs"),
+            ],
+            relations: vec![
+                relation("file:src/a.rs", "symbol:member_fn", RelationKind::Contains),
+                relation("file:src/c.rs", "symbol:foreign_fn", RelationKind::Contains),
+            ],
+            ..SnapshotRecords::default()
+        };
         let (_dir, store, snapshot_id) = store_with(&records);
 
         let mut candidates = HashMap::new();
-        candidates.insert("a1".to_owned(), candidate("a1", "src/a.rs", 0.1));
-        candidates.insert("a2".to_owned(), candidate("a2", "src/a.rs", 0.09));
-        candidates.insert("a3".to_owned(), candidate("a3", "src/a.rs", 0.08));
-        candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.1));
-        apply_corroboration(
+        candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
+        apply_graph_flow(
             &store,
             &snapshot_id,
+            "member function",
             &ExpansionEvidence::default(),
             &mut candidates,
+            true,
+            50,
         )
-        .expect("corroboration");
+        .expect("graph flow");
 
-        // a1 is a.rs's champion — the document at the file's best rank —
-        // and alone collects the vote; a2/a3 are the tail the vote is
-        // measured on, not recipients. strength = best-rank mass ×
-        // ln(occ)/ln(cap); c has one occurrence and earns nothing.
-        let strength =
-            RRF_K / (RRF_K + 1.0) * 3.0_f64.ln_1p() / (FILE_VOTE_MAX_OCCURRENCES as f64).ln_1p();
-        let expected = FILE_VOTE_BONUS * strength / RRF_K;
-        assert!((candidates["a1"].fused_score - 0.1 - expected).abs() < 1e-9);
-        assert!(
-            candidates["a1"]
-                .hit
-                .explanation
-                .iter()
-                .any(|line| line.contains("file vote: 3 pooled occurrences"))
-        );
-        assert!((candidates["a2"].fused_score - 0.09).abs() < f64::EPSILON);
-        assert!((candidates["a3"].fused_score - 0.08).abs() < f64::EPSILON);
-        assert!((candidates["c"].fused_score - 0.1).abs() < f64::EPSILON);
-        assert!(candidates["a2"].hit.explanation.is_empty());
-        assert!(candidates["c"].hit.explanation.is_empty());
+        let emitted = &candidates["entity:symbol:member_fn"].hit;
+        assert_eq!(emitted.route, SearchRoute::Structural);
+        assert_eq!(emitted.symbol_name.as_deref(), Some("member_fn"));
+        assert!(!candidates.contains_key("entity:symbol:foreign_fn"));
     }
+
+    #[test]
+    fn graph_flow_empty_pool_is_noop() {
+        // No-context guard: an empty candidate pool must not touch the
+        // store or panic — abstention stays clean.
+        let records = SnapshotRecords::default();
+        let (_dir, store, snapshot_id) = store_with(&records);
+        let mut candidates = HashMap::new();
+        apply_graph_flow(
+            &store,
+            &snapshot_id,
+            "anything",
+            &ExpansionEvidence::default(),
+            &mut candidates,
+            true,
+            50,
+        )
+        .expect("graph flow");
+        assert!(candidates.is_empty());
+    }
+
 
     fn file_touched(path: &str, last_touched: i64) -> CodeEntity {
         let mut entity = file(path);

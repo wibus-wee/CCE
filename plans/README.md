@@ -26,7 +26,7 @@ atlas correctness bug found during the audit.
 | 004 | Embedding model ladder: paired e5-small / Qwen3-0.6B / e5-base | P1 | S | 001, 003 | DONE (Qwen3 unavailable in fastembed; jina-code substituted) |
 | 005 | Task→Component Recall@K metric (package-granularity L0) | P1 | S | — (annotates 003's cases) | DONE |
 | 006 | Framework landmark extractor: axum route bindings | P2 | S | — (best after 003) | DONE |
-| 007 | Graph-flow parity: replace legacy ranking priors | P1 | L | — | TODO |
+| 007 | Graph-flow parity: replace legacy ranking priors | P1 | L | — | DONE (v7: both lanes GATE PASS; priors deleted, flow unconditional) |
 | 008 | Evidence paths: principled abstention + fact-granularity emission | P1 | L | 007 | TODO |
 | 009 | World-model surface: structural operators, source→sink dataflow, federation | P2 | L | 008 | TODO |
 

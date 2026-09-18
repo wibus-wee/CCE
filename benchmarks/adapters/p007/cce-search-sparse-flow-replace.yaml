@@ -1,0 +1,20 @@
+name: cce-search-sparse-flow-replace
+# Sparse consolidation test: flow replaces the legacy graph priors
+# without dense candidates — where structural evidence weighs most.
+command:
+  - .cce-benchmark-p007/bin/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 360
+model_identity: none
+model_revision: none
+dense: disabled
+environment:
+  CCE_DATA_DIR: /Users/wibus/dev/CCE/.cce-benchmark-p007
+  CCE_FLOW: "replace"
