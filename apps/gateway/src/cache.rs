@@ -43,12 +43,11 @@ impl SearchCache {
     /// body digest — identical semantic queries with different JSON
     /// framing miss rather than risk a wrong-body replay.
     pub(crate) fn get(&self, repo_id: &str, body_digest: &str) -> Option<(Bytes, Option<String>)> {
-        let entries = self.entries.lock();
-        let cached = entries.get(&(repo_id.to_owned(), body_digest.to_owned()))?;
-        if cached.inserted.elapsed() > self.ttl {
-            return None;
-        }
-        Some((cached.body.clone(), cached.content_type.clone()))
+        self.entries
+            .lock()
+            .get(&(repo_id.to_owned(), body_digest.to_owned()))
+            .filter(|cached| cached.inserted.elapsed() <= self.ttl)
+            .map(|cached| (cached.body.clone(), cached.content_type.clone()))
     }
 
     /// Store a successful upstream response. On overflow, expired
@@ -96,7 +95,7 @@ mod tests {
     use super::*;
 
     fn cache() -> SearchCache {
-        SearchCache::new(Duration::from_secs(60), 4)
+        SearchCache::new(Duration::from_mins(1), 4)
     }
 
     #[test]
@@ -141,7 +140,7 @@ mod tests {
 
     #[test]
     fn overflow_stays_bounded() {
-        let cache = SearchCache::new(Duration::from_secs(60), 3);
+        let cache = SearchCache::new(Duration::from_mins(1), 3);
         for index in 0..6 {
             cache.put("r1", &format!("d{index}"), Bytes::from_static(b"x"), None);
         }

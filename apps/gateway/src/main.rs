@@ -257,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
         registry: parking_lot::Mutex::new(registry),
         push_locks: parking_lot::Mutex::new(HashMap::new()),
-        search_cache: cache::SearchCache::new(Duration::from_secs(300), 512),
+        search_cache: cache::SearchCache::new(Duration::from_mins(5), 512),
         default_worker: arguments
             .default_worker
             .map(|url| url.trim_end_matches('/').to_owned()),
