@@ -273,6 +273,10 @@ async fn main() -> anyhow::Result<()> {
         .merge(SwaggerUi::new("/docs").url("/openapi.json", api))
         .route("/{repo}/v1/{*path}", any(proxy))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        // Gzip responses for clients that ask — search JSON is verbose
+        // and repeats, so compression buys 5-10x wire reduction. Applied
+        // after body-limit so request sizes are unaffected.
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state.clone());
     if let Some(web_root) = arguments.web_root {
         router = router.nest_service(
