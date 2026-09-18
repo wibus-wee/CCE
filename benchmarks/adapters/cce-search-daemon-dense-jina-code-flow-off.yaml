@@ -1,0 +1,21 @@
+name: cce-search-daemon-dense-jina-code-flow-off
+# v5.5 control: CCE_FLOW=off keeps only the legacy graph priors
+# (corroboration join + symbol evidence) on the flow-era binary.
+session: daemon
+command:
+  - target/release/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 360
+model_revision: none
+dense: local
+embedding_model: jinaai/jina-embeddings-v2-base-code
+environment:
+  CCE_DATA_DIR: .cce-benchmark
+  CCE_FLOW: "off"

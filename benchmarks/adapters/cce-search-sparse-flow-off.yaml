@@ -1,0 +1,19 @@
+name: cce-search-sparse-flow-off
+# Sparse control, legacy priors only (CCE_FLOW=off).
+command:
+  - target/release/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 360
+model_identity: none
+model_revision: none
+dense: disabled
+environment:
+  CCE_DATA_DIR: .cce-benchmark
+  CCE_FLOW: "off"
