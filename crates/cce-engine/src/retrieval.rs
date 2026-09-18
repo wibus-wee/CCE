@@ -626,22 +626,39 @@ impl CceEngine {
             &request.query,
             &mut candidates,
         )?;
-        apply_corroboration(
-            self.store(),
-            &request.snapshot_id,
-            &expansion_evidence,
-            &mut candidates,
-        )?;
-        // Symbol evidence runs last among scoring passes: its seeds are
-        // the candidates the other passes already ranked.
-        symbol_evidence_join(
-            self.store(),
-            &request.snapshot_id,
-            &request.query,
-            &mut candidates,
-            verified_fresh,
-            request.limit,
-        )?;
+        // Structural passes. `CCE_FLOW` selects the graph evidence
+        // mechanism: `off` keeps only the legacy priors, `replace` runs
+        // the unified flow pass INSTEAD of the priors it subsumes, and
+        // anything else unions them (flow is additive on top).
+        let flow_mode = std::env::var("CCE_FLOW").unwrap_or_default();
+        if !matches!(flow_mode.as_str(), "replace") {
+            apply_corroboration(
+                self.store(),
+                &request.snapshot_id,
+                &expansion_evidence,
+                &mut candidates,
+            )?;
+            // Symbol evidence runs last among scoring passes: its
+            // seeds are the candidates the other passes already ranked.
+            symbol_evidence_join(
+                self.store(),
+                &request.snapshot_id,
+                &request.query,
+                &mut candidates,
+                verified_fresh,
+                request.limit,
+            )?;
+        }
+        if flow_mode != "off" {
+            apply_graph_flow(
+                self.store(),
+                &request.snapshot_id,
+                &request.query,
+                &mut candidates,
+                verified_fresh,
+                request.limit,
+            )?;
+        }
 
         let mut hits = self.select_hits(&request, &candidates)?;
 
@@ -1598,6 +1615,373 @@ fn symbol_evidence_join(
     Ok(())
 }
 
+/// Query-conditioned structural flow: the principled mechanism the
+/// graph-adjacent priors each approximate. Candidate entities are seeded
+/// with their fused topical score; mass then propagates along typed
+/// edges — `calls`/`references`/`imports` carry topicality from a
+/// retrieved entity to the mechanism it uses, `tests` flows test
+/// topicality to its target, `contains` aggregates member evidence back
+/// into its file at reduced weight, `changed_with` diffuses
+/// symmetrically. One pass subsumes corroboration joins (mass flows from
+/// expansion neighbors into candidates), cluster support (shared
+/// neighbors relay mass between seeds), file-vote (`contains` backward
+/// flow IS file aggregation), and symbol-evidence emission (high-mass
+/// symbol nodes emit as `entity:` hits).
+///
+/// Direction and type are the signal lexical similarity lacks: a test
+/// that calls the mechanism is a flow *source*, the mechanism is a flow
+/// *sink* — the implementation-vs-adjacent distinction falls out of the
+/// topology instead of a hand-tuned bonus.
+const FLOW_SEEDS: usize = 32;
+const FLOW_SEED_DEGREE: usize = 64;
+const FLOW_HOPS: usize = 2;
+const FLOW_HOP_DECAY: f64 = 0.5;
+const FLOW_BONUS: f64 = 0.25;
+const FLOW_EMIT_MAX: usize = 8;
+
+/// Receiver-side hub gate `1/(1+ln degree)`: one inbound edge passes
+/// mass at full strength, while a type referenced by hundreds of
+/// functions absorbs proportionally little per sender. This is the
+/// target-side counterpart of source-side fan-out normalization —
+/// without it, signature types monopolize the flow exactly as pointer
+/// hubs did in the symbol-evidence join.
+fn flow_hub_gate(degree: f64) -> f64 {
+    1.0 / (1.0 + degree.max(1.0).ln())
+}
+
+/// Per-kind conductance `(forward, backward)`: the fraction of a
+/// node's mass crossing an edge in each direction per hop. The table
+/// follows the per-label parameterization of typed random walks
+/// (PCRW/metapath): mechanism-pointing edges conduct strongly
+/// downstream, callers/importers carry weaker backward impact
+/// evidence, `contains` aggregates member evidence upward, and
+/// symmetric couplings (`changed_with`, `tests`) conduct both ways.
+const fn flow_edge_weights(kind: &RelationKind) -> (f64, f64) {
+    match kind {
+        // A relevant route almost certainly means its handler is the
+        // mechanism; the route entity itself is a lookup anchor.
+        RelationKind::RouteHandledBy => (0.9, 0.3),
+        // The callee is part of the caller's mechanism (Portfolio);
+        // callers are usage/impact evidence — real but secondary.
+        RelationKind::Calls => (0.8, 0.5),
+        RelationKind::Imports => (0.7, 0.35),
+        // Tests encode expected behavior; either endpoint being on-topic
+        // lifts the other. Convention-inferred edges stay mid-band.
+        RelationKind::Tests => (0.6, 0.6),
+        // Signature/type use is the weakest semantic link and the
+        // hubbiest kind — always in-degree gated downstream.
+        RelationKind::References => (0.5, 0.4),
+        // Member→file aggregates evidence (the file-vote readout);
+        // file→member dilutes across dozens of members.
+        RelationKind::Contains => (0.3, 0.9),
+        // Co-change is coupling, not mechanism — symmetric, moderate.
+        RelationKind::ChangedWith => (0.4, 0.4),
+        // Declared package coupling is architecture-layer evidence.
+        RelationKind::BuildDependsOn => (0.25, 0.15),
+        _ => (0.0, 0.0),
+    }
+}
+
+/// A stable ordering tag for edge dedup and deterministic iteration —
+/// `RelationKind` carries data variants so it cannot cast to an int.
+const fn flow_kind_tag(kind: &RelationKind) -> u8 {
+    match kind {
+        RelationKind::Calls => 0,
+        RelationKind::References => 1,
+        RelationKind::Imports => 2,
+        RelationKind::Contains => 3,
+        RelationKind::Tests => 4,
+        RelationKind::ChangedWith => 5,
+        RelationKind::RouteHandledBy => 6,
+        RelationKind::BuildDependsOn => 7,
+        _ => 255,
+    }
+}
+
+fn apply_graph_flow(
+    store: &MetadataStore,
+    snapshot_id: &str,
+    query: &str,
+    candidates: &mut HashMap<String, Candidate>,
+    verified_fresh: bool,
+    limit: usize,
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    // Seeds: strongest unique candidate entities — the head carries the
+    // topical signal and the cap bounds relation fetches.
+    let mut unique = HashMap::<String, f64>::new();
+    for candidate in candidates.values() {
+        let entry = unique.entry(candidate.hit.entity_id.clone()).or_default();
+        *entry = entry.max(candidate.fused_score);
+    }
+    let mut seeds: Vec<(String, f64)> = unique.into_iter().collect();
+    seeds.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    seeds.truncate(FLOW_SEEDS);
+    let Some(max_seed) = seeds.first().map(|(_, score)| *score) else {
+        return Ok(());
+    };
+    if max_seed <= 0.0 {
+        return Ok(());
+    }
+
+    // Edge universe: deduplicated relations touching any seed. Relation
+    // rows repeat per extractor merge, so dedup by (source, target,
+    // kind) or the flow multiplies. Mass flows ALONG edge direction:
+    // only nodes with mass feed, so incoming edges matter exactly when
+    // their source is also a seed — seed→shared-neighbor→seed is how
+    // cluster support emerges in hop 2.
+    let mut edges: Vec<(String, String, RelationKind, f64)> = Vec::new();
+    {
+        let mut seen = std::collections::BTreeSet::<(String, String, u8)>::new();
+        for (seed_id, _) in &seeds {
+            let degree = store
+                .entity_relation_degree(snapshot_id, seed_id)?
+                .min(FLOW_SEED_DEGREE);
+            for relation in
+                store.relations_for_entity(snapshot_id, seed_id, RelationDirection::Both, degree)?
+            {
+                let key = (
+                    relation.source_entity_id.clone(),
+                    relation.target_entity_id.clone(),
+                    flow_kind_tag(&relation.kind),
+                );
+                if seen.insert(key) {
+                    edges.push((
+                        relation.source_entity_id,
+                        relation.target_entity_id,
+                        relation.kind,
+                        f64::from(relation.confidence),
+                    ));
+                }
+            }
+        }
+    }
+    if edges.is_empty() {
+        return Ok(());
+    }
+    edges.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| flow_kind_tag(&left.2).cmp(&flow_kind_tag(&right.2)))
+    });
+
+    // Multiplex normalization: each kind is its own stochastic layer —
+    // a source's mass splits across its same-kind edges proportional to
+    // extractor confidence, and the kind's conductance weight then
+    // decides how much of the source's total mass that layer carries.
+    // Per-kind in-degree powers the receiver-side hub gate: a type
+    // referenced by hundreds of functions absorbs little per sender,
+    // while a file `contains`-ing many members is a normal parent.
+    let mut out_conf = HashMap::<(String, RelationKind), f64>::new();
+    let mut in_conf = HashMap::<(String, RelationKind), f64>::new();
+    let mut out_deg = HashMap::<(String, RelationKind), f64>::new();
+    let mut in_deg = HashMap::<(String, RelationKind), f64>::new();
+    for (source, target, kind, confidence) in &edges {
+        *out_conf.entry((source.clone(), kind.clone())).or_default() += confidence;
+        *in_conf.entry((target.clone(), kind.clone())).or_default() += confidence;
+        *out_deg.entry((source.clone(), kind.clone())).or_default() += 1.0;
+        *in_deg.entry((target.clone(), kind.clone())).or_default() += 1.0;
+    }
+
+    let mut mass: HashMap<String, f64> = seeds.iter().cloned().collect();
+    // Mass RECEIVED from other nodes — the evidence signal. Seed mass
+    // itself is excluded: a candidate's own topicality is not evidence
+    // corroborating it.
+    let mut received: HashMap<String, f64> = HashMap::new();
+    // Non-backtracking: an edge traversed at hop t cannot reverse at
+    // t+1 — test↔mechanism ping-pong would inflate both endpoints
+    // without adding corroboration. Re-firing the same direction is
+    // legitimate accumulation; only immediate reversal is blocked. A
+    // node may still be reached via OTHER seeds — multi-path arrival
+    // is the consensus signal itself.
+    let mut traversed = std::collections::HashSet::<(usize, u8)>::new();
+    for hop in 1..=FLOW_HOPS {
+        let prev = mass.clone();
+        let used = std::mem::take(&mut traversed);
+        let mut delta = std::collections::BTreeMap::<String, f64>::new();
+        for (index, (source, target, kind, confidence)) in edges.iter().enumerate() {
+            let (forward, backward) = flow_edge_weights(kind);
+            let source_mass = prev.get(source).copied().unwrap_or_default();
+            if forward > 0.0 && source_mass > 0.0 && !used.contains(&(index, 1)) {
+                let share = confidence
+                    / out_conf
+                        .get(&(source.clone(), kind.clone()))
+                        .copied()
+                        .unwrap_or(1.0)
+                        .max(f64::EPSILON);
+                let hub_gate = flow_hub_gate(
+                    in_deg
+                        .get(&(target.clone(), kind.clone()))
+                        .copied()
+                        .unwrap_or(1.0),
+                );
+                *delta.entry(target.clone()).or_default() +=
+                    (forward * source_mass * share).mul_add(hub_gate, 0.0);
+                traversed.insert((index, 0));
+            }
+            let target_mass = prev.get(target).copied().unwrap_or_default();
+            if backward > 0.0 && target_mass > 0.0 && !used.contains(&(index, 0)) {
+                let share = confidence
+                    / in_conf
+                        .get(&(target.clone(), kind.clone()))
+                        .copied()
+                        .unwrap_or(1.0)
+                        .max(f64::EPSILON);
+                let hub_gate = flow_hub_gate(
+                    out_deg
+                        .get(&(source.clone(), kind.clone()))
+                        .copied()
+                        .unwrap_or(1.0),
+                );
+                *delta.entry(source.clone()).or_default() +=
+                    (backward * target_mass * share).mul_add(hub_gate, 0.0);
+                traversed.insert((index, 1));
+            }
+        }
+        let decay = FLOW_HOP_DECAY.powi(i32::try_from(hop).unwrap_or(0));
+        for (node, gain) in delta {
+            *mass.entry(node.clone()).or_default() += decay * gain;
+            *received.entry(node).or_default() += decay * gain;
+        }
+    }
+
+    // Readout 1 — candidate bonus: received mass, normalized by the
+    // best-corroborated node, bounded at FLOW_BONUS.
+    let max_received = received.values().copied().fold(0.0_f64, f64::max);
+    if max_received > 0.0 {
+        for candidate in candidates.values_mut() {
+            let Some(flow) = received.get(&candidate.hit.entity_id) else {
+                continue;
+            };
+            let bonus = FLOW_BONUS * (flow / max_received) / RRF_K;
+            candidate.fused_score += bonus;
+            candidate.hit.explanation.push(format!(
+                "graph flow corroboration {:.2}",
+                flow / max_received
+            ));
+        }
+    }
+
+    // Readout 2 — symbol emission: high-flow non-candidate symbol nodes
+    // emit as `entity:` hits at boundary mass, same slotting contract
+    // as the symbol-evidence join. Callable kinds get their own lane
+    // because claim facts name functions/methods and type hubs would
+    // otherwise monopolize emission on pointer mass.
+    let candidate_ids: std::collections::HashSet<&String> = candidates
+        .values()
+        .map(|candidate| &candidate.hit.entity_id)
+        .collect();
+    let emitted_ids: Vec<String> = received
+        .keys()
+        .filter(|id| !candidate_ids.contains(id))
+        .cloned()
+        .collect();
+    let entities: HashMap<String, CodeEntity> = store
+        .entities_by_ids(snapshot_id, &emitted_ids)?
+        .into_iter()
+        .map(|entity| (entity.id.clone(), entity))
+        .collect();
+    let query_terms = prf_terms_in(query);
+    let mut scored: Vec<(f64, usize, &CodeEntity)> = Vec::new();
+    for (id, entity) in &entities {
+        if !matches!(
+            entity.kind,
+            EntityKind::Function
+                | EntityKind::Method
+                | EntityKind::Struct
+                | EntityKind::Enum
+                | EntityKind::Trait
+                | EntityKind::Class
+                | EntityKind::Interface
+                | EntityKind::Constant
+        ) {
+            continue;
+        }
+        let flow = received.get(id).copied().unwrap_or_default();
+        let overlap = prf_terms_in(&entity.name)
+            .iter()
+            .filter(|term| query_terms.contains(term.as_str()))
+            .count();
+        scored.push((flow, overlap, entity));
+    }
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.2.id.cmp(&right.2.id))
+    });
+    let (named, plain): (Vec<_>, Vec<_>) = scored.into_iter().partition(|(_, overlap, entity)| {
+        *overlap > 0 && matches!(entity.kind, EntityKind::Function | EntityKind::Method)
+    });
+    let mut named = named.into_iter();
+    let mut plain = plain.into_iter();
+    let mut block: Vec<(f64, usize, &CodeEntity)> = Vec::new();
+    while block.len() < FLOW_EMIT_MAX {
+        let mut progressed = false;
+        for lane in [&mut named, &mut plain] {
+            if let Some(entry) = lane.next() {
+                block.push(entry);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    if block.is_empty() {
+        return Ok(());
+    }
+    let mut pool_scores: Vec<f64> = candidates.values().map(|c| c.fused_score).collect();
+    pool_scores.sort_by(|a, b| b.total_cmp(a));
+    let boundary = pool_scores
+        .get(limit.saturating_sub(FLOW_EMIT_MAX))
+        .or_else(|| pool_scores.last())
+        .copied()
+        .unwrap_or_default();
+    if boundary <= 0.0 {
+        return Ok(());
+    }
+    for (rank, (flow, _, entity)) in block.into_iter().enumerate() {
+        let mass_hit = boundary * 0.005f64.mul_add(-(rank as f64), 1.0);
+        let snippet = entity
+            .signature
+            .clone()
+            .or_else(|| entity.qualified_name.clone())
+            .unwrap_or_else(|| entity.name.clone());
+        add_candidate(
+            candidates,
+            SearchHit {
+                document_id: format!("entity:{}", entity.id),
+                region_id: entity.region_id.clone(),
+                symbol_name: Some(entity.name.clone()),
+                entity_id: entity.id.clone(),
+                representation: RetrievalRepresentation::Signature,
+                route: SearchRoute::Structural,
+                rank: rank + 1,
+                score: mass_hit,
+                contributing_routes: vec![SearchRoute::Structural],
+                address: entity.address.clone(),
+                evidence: Vec::new(),
+                snippet,
+                verified_current: verified_fresh,
+                explanation: vec![format!(
+                    "graph flow evidence: received mass {flow:.3} from retrieved candidates"
+                )],
+            },
+            mass_hit,
+        );
+    }
+    Ok(())
+}
+
 /// The package owning `path`: the longest matching `rootDir` prefix.
 /// A trailing-slash requirement keeps `crates/alpha` from claiming
 /// `crates/alpha2/…`, and the root package's empty rootDir matches every
@@ -2056,11 +2440,23 @@ mod tests {
     }
 
     fn references(source: &str, target: &str) -> cce_core::Relation {
+        relation(source, target, RelationKind::References)
+    }
+
+    fn calls(source: &str, target: &str) -> cce_core::Relation {
+        relation(source, target, RelationKind::Calls)
+    }
+
+    fn other(source: &str, target: &str) -> cce_core::Relation {
+        relation(source, target, RelationKind::Other("custom".to_owned()))
+    }
+
+    fn relation(source: &str, target: &str, kind: RelationKind) -> cce_core::Relation {
         cce_core::Relation {
-            id: format!("rel:{source}:{target}"),
+            id: format!("rel:{source}:{target}:{kind:?}"),
             source_entity_id: source.to_owned(),
             target_entity_id: target.to_owned(),
-            kind: RelationKind::References,
+            kind,
             origin: RelationOrigin::TreeSitter,
             confidence: 1.0,
             snapshot_id: "snap_test".to_owned(),
@@ -2380,6 +2776,85 @@ mod tests {
         assert!(candidates.contains_key("entity:symbol:consensus_target"));
         assert!(!candidates.contains_key("entity:symbol:unrelated_helper"));
         assert!(!candidates.contains_key("entity:symbol:decoy_only_changed"));
+    }
+
+    #[test]
+    fn graph_flow_emits_called_mechanism_and_corroborates() {
+        // Seeds a and b both call `set_view_status` — consensus flow makes
+        // the mechanism the dominant sink and it emits as an `entity:`
+        // hit. `isolated_helper` hangs off a zero-weight `Other` edge and
+        // receives nothing; the `changed_with` edge between the seeds
+        // relays mass both ways so both corroborate while the isolated
+        // candidate c earns none.
+        let records = SnapshotRecords {
+            entities: vec![
+                file("src/a.rs"),
+                file("src/b.rs"),
+                symbol("set_view_status", "src/m.rs"),
+                symbol("isolated_helper", "src/m.rs"),
+            ],
+            relations: vec![
+                calls("file:src/a.rs", "symbol:set_view_status"),
+                calls("file:src/b.rs", "symbol:set_view_status"),
+                other("file:src/a.rs", "symbol:isolated_helper"),
+                changed_with("file:src/a.rs", "file:src/b.rs", 0.9),
+            ],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, store, snapshot_id) = store_with(&records);
+
+        let mut candidates = HashMap::new();
+        candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
+        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.05));
+        candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.05));
+        apply_graph_flow(
+            &store,
+            &snapshot_id,
+            "mark views stale",
+            &mut candidates,
+            true,
+            50,
+        )
+        .expect("graph flow");
+
+        let emitted = &candidates["entity:symbol:set_view_status"].hit;
+        assert_eq!(emitted.route, SearchRoute::Structural);
+        assert_eq!(emitted.symbol_name.as_deref(), Some("set_view_status"));
+        assert!(emitted.verified_current);
+        assert!(
+            emitted
+                .explanation
+                .iter()
+                .any(|line| line.contains("graph flow evidence"))
+        );
+        assert!(!candidates.contains_key("entity:symbol:isolated_helper"));
+
+        for key in ["a", "b"] {
+            assert!(
+                candidates[key]
+                    .hit
+                    .explanation
+                    .iter()
+                    .any(|line| line.contains("graph flow corroboration")),
+                "{key} must explain its received flow"
+            );
+        }
+        assert!((candidates["a"].fused_score - 0.1).abs() > f64::EPSILON);
+        assert!((candidates["b"].fused_score - 0.05).abs() > f64::EPSILON);
+        assert!((candidates["c"].fused_score - 0.05).abs() < f64::EPSILON);
+        assert!(candidates["c"].hit.explanation.is_empty());
+    }
+
+    #[test]
+    fn graph_flow_empty_pool_is_noop() {
+        // No-context guard: an empty candidate pool must not touch the
+        // store or panic — abstention stays clean.
+        let records = SnapshotRecords::default();
+        let (_dir, store, snapshot_id) = store_with(&records);
+        let mut candidates = HashMap::new();
+        apply_graph_flow(&store, &snapshot_id, "anything", &mut candidates, true, 50)
+            .expect("graph flow");
+        assert!(candidates.is_empty());
     }
 
     #[test]
