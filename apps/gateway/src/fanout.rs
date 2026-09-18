@@ -166,48 +166,79 @@ pub(crate) async fn search_all(
 
     let mut tasks = JoinSet::new();
     for entry in selected {
-        let client = state.client.clone();
+        let state = Arc::clone(&state);
         let query = input.query.clone();
         tasks.spawn(async move {
             let started = Instant::now();
-            let outcome = tokio::time::timeout(FANOUT_TIMEOUT, async {
-                client
-                    .post(format!("{}/v1/search", entry.worker_url))
-                    .json(&serde_json::json!({"query": query, "limit": per_repo_limit}))
-                    .send()
-                    .await
-            })
-            .await;
-            let reply = match outcome {
-                Err(_) => Err("timeout".to_owned()),
-                Ok(Err(error)) => Err(format!("unreachable: {error}")),
-                Ok(Ok(response)) => {
-                    let status = response.status();
-                    match response.json::<Value>().await {
-                        Err(error) => Err(format!("invalid response ({status}): {error}")),
-                        Ok(_) if !status.is_success() => Err(format!("worker error {status}")),
-                        Ok(body) => {
-                            let hits = body
-                                .get("hits")
-                                .and_then(Value::as_array)
-                                .cloned()
-                                .unwrap_or_default();
-                            let missing = body
-                                .get("missingCapabilities")
-                                .and_then(Value::as_array)
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .filter_map(Value::as_str)
-                                        .map(str::to_owned)
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            Ok((hits, missing, body.get("verdict").cloned()))
+            // Fan-out shares the gateway-wide upstream bound, and the
+            // permit comes before the circuit admit — a local shed or an
+            // open circuit carries no verdict about the worker, while
+            // every admitted call reports exactly one outcome below.
+            let (reply, worker_ok): (_, Option<bool>) = match crate::acquire_upstream(&state).await
+            {
+                Err(_) => (Err("saturated".to_owned()), None),
+                Ok(_permit) if !state.breakers.admit(&entry.id) => {
+                    (Err("circuit open".to_owned()), None)
+                }
+                Ok(_permit) => {
+                    let outcome = tokio::time::timeout(FANOUT_TIMEOUT, async {
+                        state
+                            .client
+                            .post(format!("{}/v1/search", entry.worker_url))
+                            .json(&serde_json::json!({"query": query, "limit": per_repo_limit}))
+                            .send()
+                            .await
+                    })
+                    .await;
+                    match outcome {
+                        Err(_) => (Err("timeout".to_owned()), Some(false)),
+                        Ok(Err(error)) => (Err(format!("unreachable: {error}")), Some(false)),
+                        Ok(Ok(response)) => {
+                            let status = response.status();
+                            if status.is_server_error() {
+                                (Err(format!("worker error {status}")), Some(false))
+                            } else {
+                                match response.json::<Value>().await {
+                                    Err(error) => (
+                                        Err(format!("invalid response ({status}): {error}")),
+                                        Some(false),
+                                    ),
+                                    Ok(_) if !status.is_success() => {
+                                        (Err(format!("worker error {status}")), Some(true))
+                                    }
+                                    Ok(body) => {
+                                        let hits = body
+                                            .get("hits")
+                                            .and_then(Value::as_array)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        let missing = body
+                                            .get("missingCapabilities")
+                                            .and_then(Value::as_array)
+                                            .map(|items| {
+                                                items
+                                                    .iter()
+                                                    .filter_map(Value::as_str)
+                                                    .map(str::to_owned)
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        (
+                                            Ok((hits, missing, body.get("verdict").cloned())),
+                                            Some(true),
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             };
+            match worker_ok {
+                Some(true) => state.breakers.on_success(&entry.id),
+                Some(false) => state.breakers.on_failure(&entry.id),
+                None => {}
+            }
             (entry, started.elapsed(), reply)
         });
     }

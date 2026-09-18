@@ -17,7 +17,7 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -25,9 +25,16 @@ use utoipa::{OpenApi as _, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_swagger_ui::SwaggerUi;
 
+mod breaker;
 mod cache;
 mod fanout;
 mod mcp;
+
+/// In-flight upstream calls the gateway allows across proxy and fan-out;
+/// requests beyond it queue for at most `UPSTREAM_QUEUE_WAIT` before a
+/// 503 shed — bounded work instead of unbounded piling onto workers.
+const UPSTREAM_CONCURRENCY: usize = 64;
+const UPSTREAM_QUEUE_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Parser)]
 #[command(name = "cce-gateway", version)]
@@ -149,6 +156,16 @@ struct GatewayState {
     /// Search-response cache: replay is only valid because pushes are
     /// the sole content-mutation channel — see `cache` module docs.
     search_cache: cache::SearchCache,
+    /// Bounds in-flight upstream calls: every proxied request and every
+    /// fan-out branch must hold a permit before calling a worker. A
+    /// request that cannot queue within `UPSTREAM_QUEUE_WAIT` is shed
+    /// with 503 rather than piling unbounded work onto the workers.
+    upstream_permits: tokio::sync::Semaphore,
+    /// Per-worker circuits: repeated reachability failures fast-fail
+    /// upstream calls instead of burning a timeout per request. Cache
+    /// hits bypass the circuit — a dead worker still serves stale-but-
+    /// valid cached content.
+    breakers: breaker::Breakers,
 }
 
 /// Error envelope returned by every gateway endpoint.
@@ -190,7 +207,7 @@ struct EnsureRequest {
     name: String,
 }
 
-impl axum::response::IntoResponse for ApiError {
+impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(ErrorBody { error: self.1 })).into_response()
     }
@@ -250,14 +267,21 @@ async fn main() -> anyhow::Result<()> {
         // Upstream calls must never hang the front door: 5s to establish
         // the connection, 120s end-to-end for proxied requests and the
         // index kick. Per-request `.timeout()` (e.g. the 2s worker health
-        // probe) overrides the overall cap.
+        // probe) overrides the overall cap. Idle keep-alive connections
+        // are pooled per worker so steady traffic skips TCP/TLS setup.
         client: reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_mins(2))
+            .pool_max_idle_per_host(32)
+            .tcp_keepalive(Duration::from_mins(1))
             .build()?,
         registry: parking_lot::Mutex::new(registry),
         push_locks: parking_lot::Mutex::new(HashMap::new()),
         search_cache: cache::SearchCache::new(Duration::from_mins(5), 512),
+        upstream_permits: tokio::sync::Semaphore::new(UPSTREAM_CONCURRENCY),
+        // Three consecutive reachability failures open a worker's circuit
+        // for 30s; a single half-open probe then decides reopen-or-close.
+        breakers: breaker::Breakers::new(3, Duration::from_secs(30)),
         default_worker: arguments
             .default_worker
             .map(|url| url.trim_end_matches('/').to_owned()),
@@ -299,6 +323,42 @@ async fn main() -> anyhow::Result<()> {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Releases a singleflight leader slot on drop: every proxy exit path
+/// after claiming leadership — early `?` returns included — wakes its
+/// followers instead of stranding them.
+struct FlightDone<'a> {
+    cache: &'a cache::SearchCache,
+    key: (String, String),
+}
+
+impl Drop for FlightDone<'_> {
+    fn drop(&mut self) {
+        self.cache.finish_flight(&self.key.0, &self.key.1);
+    }
+}
+
+/// Wait up to `UPSTREAM_QUEUE_WAIT` for an upstream permit. On timeout
+/// the request is shed with 503 + `Retry-After` so callers can tell
+/// gateway overload apart from worker failure.
+async fn acquire_upstream(
+    state: &GatewayState,
+) -> Result<tokio::sync::SemaphorePermit<'_>, Response> {
+    match tokio::time::timeout(UPSTREAM_QUEUE_WAIT, state.upstream_permits.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        _ => Err(Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("retry-after", "2")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&ErrorBody {
+                    error: "gateway saturated: too many upstream calls".to_owned(),
+                })
+                .unwrap_or_default(),
+            ))
+            .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())),
+    }
 }
 
 #[utoipa::path(get, path = "/healthz", tag = "meta",
@@ -818,7 +878,14 @@ async fn proxy(
     // `cache` module docs for why that is exact, not heuristic).
     let cacheable = method == axum::http::Method::POST && path == "search" && query.is_empty();
     let body_digest = cacheable.then(|| blake3::hash(&body).to_hex().to_string());
-    if let Some(digest) = &body_digest {
+    // Singleflight: a cacheable miss claims the in-flight slot or follows
+    // the leader already running it. Followers wait for the leader's
+    // finish, then replay what it stored — a stampede on a hot query
+    // costs one upstream call. The leader path calls `finish_flight` on
+    // every exit below so followers can never hang.
+    // `Some` only while this request holds the singleflight leader slot;
+    // the guard's Drop wakes followers on every exit path below.
+    let _flight_done = if let Some(digest) = &body_digest {
         if let Some((cached_body, cached_type)) = state.search_cache.get(&entry.id, digest) {
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
@@ -830,7 +897,35 @@ async fn proxy(
                 .body(axum::body::Body::from(cached_body))
                 .map_err(ApiError::from);
         }
-    }
+        match state.search_cache.begin_flight(&entry.id, digest) {
+            cache::Flight::Leader => Some(FlightDone {
+                cache: &state.search_cache,
+                key: (entry.id.clone(), digest.clone()),
+            }),
+            cache::Flight::Follower(mut receiver) => {
+                // Sender dropped at finish_flight resolves changed() as
+                // Err — Ok and Err mean the same here: re-check the cache.
+                let _ = receiver.changed().await;
+                if let Some((cached_body, cached_type)) = state.search_cache.get(&entry.id, digest)
+                {
+                    let mut builder = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("x-cce-cache", "hit")
+                        .header("x-cce-flight", "follower");
+                    if let Some(content_type) = cached_type {
+                        builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+                    }
+                    return builder
+                        .body(axum::body::Body::from(cached_body))
+                        .map_err(ApiError::from);
+                }
+                // Leader failed — this follower fetches upstream itself.
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut upstream = state.client.request(method, &url).body(body);
     for (name, value) in &headers {
         if matches!(
@@ -841,8 +936,34 @@ async fn proxy(
         }
         upstream = upstream.header(name, value);
     }
+    // Bound in-flight upstream work: queue briefly, then shed — the
+    // permit covers the whole upstream call including the body read.
+    // The permit comes BEFORE the circuit check: an admit obligates an
+    // outcome report, so shedding first keeps a queued-out request from
+    // stranding a half-open probe permit.
+    let _permit = match acquire_upstream(&state).await {
+        Ok(permit) => permit,
+        Err(shed) => return Ok(shed),
+    };
+    // Circuit check after the cache: a worker whose circuit is open
+    // fails fast — no timeout wait per request. Cache hits already
+    // returned above, so a broken worker still serves cached content.
+    if !state.breakers.admit(&entry.id) {
+        return Ok(Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("x-cce-breaker", "open")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&ErrorBody {
+                    error: format!("worker {} circuit open — failing fast", entry.worker_url),
+                })
+                .unwrap_or_default(),
+            ))
+            .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response()));
+    }
     let started = Instant::now();
     let response = upstream.send().await.map_err(|error| {
+        state.breakers.on_failure(&entry.id);
         tracing::warn!(
             repo = %entry.id,
             latency_ms = elapsed_ms(started),
@@ -874,8 +995,10 @@ async fn proxy(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     // A worker that dies mid-response is an upstream failure too — same
-    // classification as the send path above.
+    // classification as the send path above, and it counts against the
+    // circuit even though the status line already arrived.
     let body = response.bytes().await.map_err(|error| {
+        state.breakers.on_failure(&entry.id);
         tracing::warn!(
             repo = %entry.id,
             latency_ms = elapsed_ms(started),
@@ -897,6 +1020,15 @@ async fn proxy(
             )
         }
     })?;
+    // One outcome report per admitted call: a reached response reports
+    // breaker health by status — anything under 500 means the worker
+    // answered, 4xx included; a 5xx counts as failure even when its
+    // body parsed fine.
+    if status.is_server_error() {
+        state.breakers.on_failure(&entry.id);
+    } else {
+        state.breakers.on_success(&entry.id);
+    }
     if let Some(digest) = &body_digest {
         if status == StatusCode::OK {
             state

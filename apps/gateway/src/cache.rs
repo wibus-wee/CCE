@@ -26,17 +26,62 @@ struct Cached {
 #[derive(Debug)]
 pub(crate) struct SearchCache {
     entries: parking_lot::Mutex<HashMap<(String, String), Cached>>,
+    /// In-flight upstream fetches keyed like `entries`. One leader per
+    /// key; followers subscribe and replay the leader's `put` once it
+    /// lands — a cache stampede on a hot query costs one upstream call,
+    /// not one per concurrent request.
+    inflight: parking_lot::Mutex<HashMap<(String, String), tokio::sync::watch::Sender<()>>>,
     ttl: Duration,
     max_entries: usize,
+}
+
+/// Who may fetch upstream for a cache key — see `SearchCache::begin_flight`.
+#[derive(Debug)]
+pub(crate) enum Flight {
+    /// This caller performs the fetch, `put`s the response on success,
+    /// then calls `finish_flight` on EVERY exit path (success or
+    /// failure) to wake followers.
+    Leader,
+    /// Wait on the receiver until the leader finishes, then re-check
+    /// `get`: a hit replays the leader's stored response; a miss means
+    /// the leader failed — this caller fetches upstream itself.
+    Follower(tokio::sync::watch::Receiver<()>),
 }
 
 impl SearchCache {
     pub(crate) fn new(ttl: Duration, max_entries: usize) -> Self {
         Self {
             entries: parking_lot::Mutex::new(HashMap::new()),
+            inflight: parking_lot::Mutex::new(HashMap::new()),
             ttl,
             max_entries,
         }
+    }
+
+    /// Claim the in-flight slot for `(repo_id, body_digest)`: `Leader`
+    /// when no fetch is running for the key, `Follower` holding a
+    /// receiver that resolves when the leader finishes. The follower
+    /// obtains its `Receiver` inside the lock before the leader can
+    /// remove the entry, so `changed()` can never miss the wake-up.
+    pub(crate) fn begin_flight(&self, repo_id: &str, body_digest: &str) -> Flight {
+        let key = (repo_id.to_owned(), body_digest.to_owned());
+        let mut inflight = self.inflight.lock();
+        if let Some(sender) = inflight.get(&key) {
+            return Flight::Follower(sender.subscribe());
+        }
+        let (sender, _) = tokio::sync::watch::channel(());
+        inflight.insert(key, sender);
+        Flight::Leader
+    }
+
+    /// Leader finished — success or failure. Removing the entry drops
+    /// the `Sender`, which makes every follower's `changed()` return
+    /// `Err` immediately; followers treat Ok/Err identically and
+    /// re-check the cache either way.
+    pub(crate) fn finish_flight(&self, repo_id: &str, body_digest: &str) {
+        self.inflight
+            .lock()
+            .remove(&(repo_id.to_owned(), body_digest.to_owned()));
     }
 
     /// Replay a cached response when fresh. Key = repo + exact request
@@ -145,5 +190,42 @@ mod tests {
             cache.put("r1", &format!("d{index}"), Bytes::from_static(b"x"), None);
         }
         assert!(cache.len() <= 3);
+    }
+
+    #[test]
+    fn second_caller_on_same_key_follows() {
+        let cache = cache();
+        assert!(matches!(cache.begin_flight("r1", "d1"), Flight::Leader));
+        assert!(matches!(
+            cache.begin_flight("r1", "d1"),
+            Flight::Follower(_)
+        ));
+        assert!(matches!(cache.begin_flight("r1", "d2"), Flight::Leader));
+        assert!(matches!(cache.begin_flight("r2", "d1"), Flight::Leader));
+    }
+
+    #[test]
+    fn finish_releases_the_slot() {
+        let cache = cache();
+        assert!(matches!(cache.begin_flight("r1", "d1"), Flight::Leader));
+        cache.finish_flight("r1", "d1");
+        assert!(matches!(cache.begin_flight("r1", "d1"), Flight::Leader));
+        cache.finish_flight("r1", "missing");
+    }
+
+    #[tokio::test]
+    async fn finish_wakes_followers_into_the_stored_response() {
+        let cache = cache();
+        assert!(matches!(cache.begin_flight("r1", "d1"), Flight::Leader));
+        let Flight::Follower(mut receiver) = cache.begin_flight("r1", "d1") else {
+            panic!("second caller must follow");
+        };
+        let waiter = tokio::spawn(async move { receiver.changed().await });
+        cache.put("r1", "d1", Bytes::from_static(b"{}"), None);
+        cache.finish_flight("r1", "d1");
+        // The sender dropped inside finish_flight — changed() resolves
+        // Err, and the follower's next get() replays the leader's put.
+        assert!(waiter.await.expect("waiter task").is_err());
+        assert!(cache.get("r1", "d1").is_some());
     }
 }
