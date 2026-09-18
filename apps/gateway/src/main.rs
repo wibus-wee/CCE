@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -55,6 +56,18 @@ struct RepoEntry {
     worker_url: String,
     created_at: String,
     last_push: Option<PushRecord>,
+}
+
+/// `GET /v1/repos/{id}` response: the registry entry plus a live probe of
+/// its worker's liveness endpoint. `flatten` keeps the wire shape
+/// identical to `RepoEntry` with one additive field.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct RepoDetail {
+    #[serde(flatten)]
+    entry: RepoEntry,
+    /// `healthy` | `unreachable` | `timeout` — see `probe_worker`.
+    worker_status: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -192,6 +205,12 @@ fn bad_request(message: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, message.into())
 }
 
+/// Milliseconds since `started`, for tracing fields — saturates instead
+/// of truncating `Duration`'s u128 millisecond count.
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -223,7 +242,14 @@ async fn main() -> anyhow::Result<()> {
     }
     let state = Arc::new(GatewayState {
         data_dir,
-        client: reqwest::Client::new(),
+        // Upstream calls must never hang the front door: 5s to establish
+        // the connection, 120s end-to-end for proxied requests and the
+        // index kick. Per-request `.timeout()` (e.g. the 2s worker health
+        // probe) overrides the overall cap.
+        client: reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_mins(2))
+            .build()?,
         registry: parking_lot::Mutex::new(registry),
         push_locks: parking_lot::Mutex::new(HashMap::new()),
         default_worker: arguments
@@ -322,6 +348,95 @@ fn blob_path(state: &GatewayState, digest: &str) -> Result<PathBuf, ApiError> {
     Ok(state.data_dir.join("blobs").join(&digest[..2]).join(digest))
 }
 
+/// One manifest entry resolved for ingest: `rel` is the validated
+/// repo-relative target path, `blob` its content-addressed source. Built
+/// once per file — the same plan feeds the presence check and
+/// materialization, so validation never runs twice.
+#[derive(Debug)]
+struct StagedFile {
+    rel: PathBuf,
+    blob: PathBuf,
+    digest: String,
+}
+
+fn plan_entry(state: &GatewayState, path: &str, digest: &str) -> Result<StagedFile, ApiError> {
+    Ok(StagedFile {
+        rel: safe_relpath(path)?,
+        blob: blob_path(state, digest)?,
+        digest: digest.to_owned(),
+    })
+}
+
+/// Stat every blob in `plan`, chunked across up to 16 OS threads — a
+/// serial `exists()` loop over a 500k-file manifest can take seconds on a
+/// cold page cache. Must run on `spawn_blocking`, never on the executor.
+/// Returns the missing digests, sorted + deduped.
+fn missing_blobs(plan: &[StagedFile]) -> Result<Vec<String>, ApiError> {
+    const MAX_WORKERS: usize = 16;
+    if plan.is_empty() {
+        return Ok(Vec::new());
+    }
+    let chunk_size = plan.len().div_ceil(MAX_WORKERS.min(plan.len()));
+    let mut missing = std::thread::scope(|scope| {
+        let handles: Vec<_> = plan
+            .chunks(chunk_size)
+            .map(|files| {
+                scope.spawn(move || {
+                    files
+                        .iter()
+                        .filter(|file| !file.blob.exists())
+                        .map(|file| file.digest.clone())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut missing = Vec::new();
+        for handle in handles {
+            // The panic itself was already reported by the panic hook;
+            // surface it to the caller as a 500 rather than unwrap.
+            let found = handle.join().map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "blob scan worker panicked".to_owned(),
+                )
+            })?;
+            missing.extend(found);
+        }
+        Ok::<_, ApiError>(missing)
+    })?;
+    missing.sort();
+    missing.dedup();
+    Ok(missing)
+}
+
+/// Fill `staging` with links to CAS blobs, then swap it over `source_dir`
+/// — the worker never sees a half-written source tree. CAS objects are
+/// immutable, so same-filesystem hardlinks are safe and O(1) (the `OSTree`
+/// pattern); fall back to a byte copy when the blob store lives on a
+/// different filesystem. Runs on a `spawn_blocking` thread.
+fn materialize(plan: &[StagedFile], staging: &Path, source_dir: &Path) -> Result<u64, ApiError> {
+    if staging.exists() {
+        std::fs::remove_dir_all(staging).map_err(ApiError::from)?;
+    }
+    std::fs::create_dir_all(staging).map_err(ApiError::from)?;
+    let mut bytes_total = 0_u64;
+    for file in plan {
+        let target = staging.join(&file.rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(ApiError::from)?;
+        }
+        if std::fs::hard_link(&file.blob, &target).is_err() {
+            std::fs::copy(&file.blob, &target).map_err(ApiError::from)?;
+        }
+        bytes_total += std::fs::metadata(&target).map_err(ApiError::from)?.len();
+    }
+    if source_dir.exists() {
+        std::fs::remove_dir_all(source_dir).map_err(ApiError::from)?;
+    }
+    std::fs::rename(staging, source_dir).map_err(ApiError::from)?;
+    Ok(bytes_total)
+}
+
 #[utoipa::path(get, path = "/v1/repos", tag = "repos",
     summary = "list registered repositories",
     responses(
@@ -336,22 +451,49 @@ async fn list_repos(State(state): State<Arc<GatewayState>>) -> Json<Vec<RepoEntr
 }
 
 #[utoipa::path(get, path = "/v1/repos/{id}", tag = "repos", params(("id" = String, Path, description = "repo id or slug")),
-    summary = "repo detail incl. last push",
+    summary = "repo detail incl. last push + worker liveness",
     responses(
-        (status = 200, body = RepoEntry),
+        (status = 200, body = RepoDetail),
         (status = "4XX", description = "client error", body = ErrorBody),
         (status = 500, description = "internal error", body = ErrorBody)
     ))]
 async fn repo_detail(
     State(state): State<Arc<GatewayState>>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<RepoEntry>, ApiError> {
-    let registry = state.registry.lock();
-    registry
+) -> Result<Json<RepoDetail>, ApiError> {
+    // Registry lock is released before the network probe — never hold a
+    // sync mutex across .await.
+    let entry = state
+        .registry
+        .lock()
         .get(&id)
         .cloned()
-        .map(Json)
-        .ok_or_else(|| not_found(format!("unknown repo {id}")))
+        .ok_or_else(|| not_found(format!("unknown repo {id}")))?;
+    let worker_status = probe_worker(&state.client, &entry.worker_url).await;
+    Ok(Json(RepoDetail {
+        entry,
+        worker_status,
+    }))
+}
+
+/// Best-effort liveness probe of a repo's worker — never fails the detail
+/// request, the verdict is reported in the `workerStatus` field instead.
+/// cce-daemon serves liveness at `/healthz`; the 2s per-request timeout
+/// caps the probe so a dead worker can't stall the detail call.
+async fn probe_worker(client: &reqwest::Client, worker_url: &str) -> &'static str {
+    match client
+        .get(format!("{worker_url}/healthz"))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => "healthy",
+        // A non-2xx answer proves reachability but means the worker is
+        // not serving normally — report it in the failure bucket.
+        Ok(_) => "unreachable",
+        Err(error) if error.is_timeout() => "timeout",
+        Err(_) => "unreachable",
+    }
 }
 
 #[utoipa::path(post, path = "/v1/repos", tag = "repos",
@@ -454,16 +596,16 @@ async fn check_blobs(
     Json(input): Json<CheckRequest>,
 ) -> Result<Json<CheckResponse>, ApiError> {
     require_repo(&state, &id)?;
-    let mut missing = Vec::new();
-    for file in &input.files {
-        safe_relpath(&file.path)?;
-        let path = blob_path(&state, &file.digest)?;
-        if !path.exists() {
-            missing.push(file.digest.clone());
-        }
-    }
-    missing.sort();
-    missing.dedup();
+    let plan: Vec<StagedFile> = input
+        .files
+        .iter()
+        .map(|file| plan_entry(&state, &file.path, &file.digest))
+        .collect::<Result<_, _>>()?;
+    // The stat scan is parallelized filesystem I/O — keep it off the
+    // async executor.
+    let missing = tokio::task::spawn_blocking(move || missing_blobs(&plan))
+        .await
+        .map_err(ApiError::from)??;
     Ok(Json(CheckResponse { missing }))
 }
 
@@ -481,23 +623,29 @@ async fn put_blob(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     require_repo(&state, &id)?;
-    let actual = blake3::hash(&body).to_hex().to_string();
-    if actual != digest {
-        return Err(bad_request(format!(
-            "blob digest mismatch: declared {digest}, content hashes to {actual}"
-        )));
-    }
     let path = blob_path(&state, &digest)?;
-    if path.exists() {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(ApiError::from)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &body).map_err(ApiError::from)?;
-    std::fs::rename(tmp, path).map_err(ApiError::from)?;
-    Ok(StatusCode::CREATED)
+    // Hashing a blob up to the 64MB body limit plus the CAS write are
+    // blocking work — run the whole store op on a blocking thread.
+    tokio::task::spawn_blocking(move || -> Result<StatusCode, ApiError> {
+        let actual = blake3::hash(&body).to_hex().to_string();
+        if actual != digest {
+            return Err(bad_request(format!(
+                "blob digest mismatch: declared {digest}, content hashes to {actual}"
+            )));
+        }
+        if path.exists() {
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(ApiError::from)?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &body).map_err(ApiError::from)?;
+        std::fs::rename(tmp, path).map_err(ApiError::from)?;
+        Ok(StatusCode::CREATED)
+    })
+    .await
+    .map_err(ApiError::from)?
 }
 
 #[utoipa::path(post, path = "/v1/repos/{id}/push", tag = "repos", params(("id" = String, Path, description = "repo id or slug")),
@@ -517,15 +665,26 @@ async fn push(
     if input.files.len() > 500_000 {
         return Err(bad_request("push manifest exceeds 500k files"));
     }
+    let started = Instant::now();
+    // Validate the manifest once — the resolved plan feeds both the
+    // presence check and materialization below.
+    let plan = Arc::new(
+        input
+            .files
+            .iter()
+            .map(|file| plan_entry(&state, &file.path, &file.digest))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     // Verify every blob is present before touching the source dir — a
-    // partial materialization would index a truncated worktree.
-    let mut missing = Vec::new();
-    for file in &input.files {
-        safe_relpath(&file.path)?;
-        if !blob_path(&state, &file.digest)?.exists() {
-            missing.push(file.digest.clone());
-        }
-    }
+    // partial materialization would index a truncated worktree. The stat
+    // scan runs on blocking threads: 500k serial exists() calls can take
+    // seconds and would stall the async executor.
+    let missing = {
+        let plan = Arc::clone(&plan);
+        tokio::task::spawn_blocking(move || missing_blobs(&plan))
+            .await
+            .map_err(ApiError::from)??
+    };
     if !missing.is_empty() {
         return Err(bad_request(format!(
             "{} blobs missing — upload them via PUT /v1/repos/{id}/blobs/{{digest}} first",
@@ -544,24 +703,14 @@ async fn push(
         .data_dir
         .join("sources")
         .join(format!(".{}", repo.slug));
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging).map_err(ApiError::from)?;
-    }
-    std::fs::create_dir_all(&staging).map_err(ApiError::from)?;
-    let mut bytes_total = 0_u64;
-    for file in &input.files {
-        let rel = safe_relpath(&file.path)?;
-        let target = staging.join(&rel);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(ApiError::from)?;
-        }
-        std::fs::copy(blob_path(&state, &file.digest)?, &target).map_err(ApiError::from)?;
-        bytes_total += std::fs::metadata(&target).map_err(ApiError::from)?.len();
-    }
-    if source_dir.exists() {
-        std::fs::remove_dir_all(&source_dir).map_err(ApiError::from)?;
-    }
-    std::fs::rename(&staging, &source_dir).map_err(ApiError::from)?;
+    // Staging fill + swap happen inside one blocking call — hardlink
+    // fan-out over a huge manifest is fast but still synchronous fs I/O.
+    let bytes_total = {
+        let plan = Arc::clone(&plan);
+        tokio::task::spawn_blocking(move || materialize(&plan, &staging, &source_dir))
+            .await
+            .map_err(ApiError::from)??
+    };
     let record = PushRecord {
         push_id: format!("push_{}", uuid::Uuid::now_v7().simple()),
         at: chrono::Utc::now().to_rfc3339(),
@@ -593,6 +742,13 @@ async fn push(
             }
         }
     });
+    tracing::info!(
+        repo = %repo.id,
+        files = record.file_count,
+        bytes = record.bytes,
+        elapsed_ms = elapsed_ms(started),
+        "push materialized"
+    );
     Ok(Json(PushResponse {
         push_id: record.push_id,
         materialized: record.file_count,
@@ -622,7 +778,8 @@ fn require_repo(state: &GatewayState, id: &str) -> Result<RepoEntry, ApiError> {
     responses(
         (status = 200, description = "upstream worker response"),
         (status = 404, description = "unknown repo", body = ErrorBody),
-        (status = 502, description = "worker unreachable", body = ErrorBody)
+        (status = 502, description = "worker unreachable", body = ErrorBody),
+        (status = 504, description = "worker timed out", body = ErrorBody)
     ))]
 async fn proxy(
     State(state): State<Arc<GatewayState>>,
@@ -651,11 +808,30 @@ async fn proxy(
         }
         upstream = upstream.header(name, value);
     }
+    let started = Instant::now();
     let response = upstream.send().await.map_err(|error| {
-        ApiError(
-            StatusCode::BAD_GATEWAY,
-            format!("worker {} unreachable: {error}", entry.worker_url),
-        )
+        tracing::warn!(
+            repo = %entry.id,
+            latency_ms = elapsed_ms(started),
+            %error,
+            "worker upstream request failed"
+        );
+        if error.is_timeout() {
+            ApiError(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("worker {} timed out: {error}", entry.worker_url),
+            )
+        } else if error.is_connect() {
+            ApiError(
+                StatusCode::BAD_GATEWAY,
+                format!("worker {} connection failed: {error}", entry.worker_url),
+            )
+        } else {
+            ApiError(
+                StatusCode::BAD_GATEWAY,
+                format!("worker {} unreachable: {error}", entry.worker_url),
+            )
+        }
     })?;
     let status = StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -664,7 +840,30 @@ async fn proxy(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body = response.bytes().await.map_err(ApiError::from)?;
+    // A worker that dies mid-response is an upstream failure too — same
+    // classification as the send path above.
+    let body = response.bytes().await.map_err(|error| {
+        tracing::warn!(
+            repo = %entry.id,
+            latency_ms = elapsed_ms(started),
+            %error,
+            "worker response body failed"
+        );
+        if error.is_timeout() {
+            ApiError(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "worker {} timed out mid-response: {error}",
+                    entry.worker_url
+                ),
+            )
+        } else {
+            ApiError(
+                StatusCode::BAD_GATEWAY,
+                format!("worker {} dropped the response: {error}", entry.worker_url),
+            )
+        }
+    })?;
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
@@ -672,4 +871,106 @@ async fn proxy(
     builder
         .body(axum::body::Body::from(body))
         .map_err(ApiError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cce-gateway-{tag}-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// The detail response must be the `RepoEntry` shape plus one
+    /// additive field — no nesting, no renamed keys.
+    #[test]
+    fn repo_detail_serializes_flat_with_worker_status() {
+        let detail = RepoDetail {
+            entry: RepoEntry {
+                id: "repo_abc".to_owned(),
+                name: "Demo".to_owned(),
+                slug: "demo".to_owned(),
+                worker_url: "http://127.0.0.1:7700".to_owned(),
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                last_push: None,
+            },
+            worker_status: "healthy",
+        };
+        let value = serde_json::to_value(&detail).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object["workerStatus"], serde_json::json!("healthy"));
+        assert_eq!(
+            object["workerUrl"],
+            serde_json::json!("http://127.0.0.1:7700")
+        );
+        assert_eq!(object["id"], serde_json::json!("repo_abc"));
+        assert!(!object.contains_key("entry"));
+    }
+
+    #[test]
+    fn safe_relpath_rejects_traversal() {
+        assert!(safe_relpath("").is_err());
+        assert!(safe_relpath("/absolute").is_err());
+        assert!(safe_relpath("../escape").is_err());
+        assert!(safe_relpath("a/../b").is_err());
+        assert!(safe_relpath("src/main.rs").is_ok());
+    }
+
+    #[test]
+    fn missing_blobs_reports_absent_digests() {
+        let root = temp_root("missing");
+        let present = root.join("present");
+        std::fs::write(&present, b"blob").unwrap();
+        let plan = vec![
+            StagedFile {
+                rel: PathBuf::from("a.rs"),
+                blob: present,
+                digest: "aa".to_owned(),
+            },
+            StagedFile {
+                rel: PathBuf::from("b.rs"),
+                blob: root.join("absent"),
+                digest: "bb".to_owned(),
+            },
+        ];
+        assert_eq!(missing_blobs(&plan).unwrap(), vec!["bb".to_owned()]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Materialization hardlinks CAS blobs (same inode on unix) and swaps
+    /// the staging dir over the source dir atomically.
+    #[test]
+    fn materialize_links_blobs_into_source() {
+        let root = temp_root("materialize");
+        let blob = root.join("blob");
+        std::fs::write(&blob, b"fn main() {}\n").unwrap();
+        let plan = vec![StagedFile {
+            rel: PathBuf::from("src").join("main.rs"),
+            blob: blob.clone(),
+            digest: "dd".to_owned(),
+        }];
+        let staging = root.join(".staging");
+        let source = root.join("source");
+        let bytes = materialize(&plan, &staging, &source).unwrap();
+        let target = source.join("src").join("main.rs");
+        assert_eq!(std::fs::read(&target).unwrap(), b"fn main() {}\n");
+        assert_eq!(bytes, 13);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().ino(),
+                std::fs::metadata(&blob).unwrap().ino()
+            );
+        }
+        // Re-materializing swaps over the existing source dir cleanly.
+        materialize(&plan, &staging, &source).unwrap();
+        assert!(target.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
