@@ -1173,10 +1173,13 @@ impl MetadataStore {
             .map(|(index, _)| format!("?{}", index + 2))
             .collect::<Vec<_>>()
             .join(",");
+        // INDEXED BY: the planner prefers the snapshot-PK prefix scan
+        // (184k docs on a large corpus) over the region index here —
+        // milliseconds vs seconds per call.
         let sql = format!(
             "SELECT d.id, d.entity_id, d.region_id, e.name, d.representation,
                     d.address_json, d.evidence_json
-             FROM retrieval_documents d
+             FROM retrieval_documents d INDEXED BY retrieval_documents_region
              JOIN entities e ON e.snapshot_id=d.snapshot_id AND e.id=d.entity_id
              WHERE d.snapshot_id=?1 AND d.region_id IN ({placeholders})"
         );
@@ -1222,14 +1225,22 @@ impl MetadataStore {
             .collect::<Vec<_>>()
             .join(",");
         let representation = json(&RetrievalRepresentation::FileDescriptor)?;
+        // Path filtering goes through `regions` (`regions_path` is a real
+        // index); `documents_fts.path` lives in an FTS5 table and cannot
+        // be indexed, so joining through it scanned the whole corpus.
+        // CROSS JOIN pins the join order: regions-by-path drives
+        // documents-by-region — the planner otherwise drives the 184k-row
+        // documents table by snapshot prefix and filters regions after.
         let sql = format!(
             "SELECT d.id, d.entity_id, d.region_id, e.name, d.representation,
                     d.address_json, d.evidence_json
-             FROM retrieval_documents d
-             JOIN documents_fts f ON f.snapshot_id=d.snapshot_id AND f.document_id=d.id
-             JOIN entities e ON e.snapshot_id=d.snapshot_id AND e.id=d.entity_id
-             WHERE d.snapshot_id=?1 AND f.path IN ({placeholders})
+             FROM regions r
+             CROSS JOIN retrieval_documents d INDEXED BY retrieval_documents_region
+             CROSS JOIN entities e
+             WHERE r.snapshot_id=?1 AND r.path IN ({placeholders})
+                   AND d.snapshot_id=r.snapshot_id AND d.region_id=r.id
                    AND d.representation=?{}
+                   AND e.snapshot_id=d.snapshot_id AND e.id=d.entity_id
              GROUP BY d.id",
             paths.len() + 2
         );
@@ -1289,29 +1300,37 @@ impl MetadataStore {
                 |row| row.get(0),
             )
             .unwrap_or(0);
+        // Ubiquitous terms first — see `UBIQUITY_*` constants. Small
+        // live sets then pair whole under the clause budget regardless.
+        let ubiquity_cutoff = (total_docs / UBIQUITY_DOC_FRACTION).max(UBIQUITY_DF_MIN);
         let mut statement = connection
             .prepare(
-                "SELECT count(*) FROM documents_fts
-                 WHERE documents_fts MATCH ?1 AND snapshot_id=?2",
+                "SELECT count(*) FROM (
+                     SELECT 1 FROM documents_fts
+                     WHERE documents_fts MATCH ?1 AND snapshot_id=?2
+                     LIMIT ?3
+                 )",
             )
             .map_err(storage_error)?;
         let mut scored: Vec<(i64, &str)> = Vec::with_capacity(terms.len());
         for term in terms {
             // Prefix frequency: the pair stage emits `term*`, so rank by
             // what the stage will actually scan. `fts_terms` output is
-            // alphanumeric/underscore only, safe unquoted.
+            // alphanumeric/underscore only, safe unquoted. The count is
+            // capped at cutoff+1: every classification below reads
+            // `df <= cutoff` or `df >= 1` exactly, and ordering among
+            // ubiquitous terms — all capped-equal — is the only
+            // resolution lost.
             let df: i64 = statement
-                .query_row(rusqlite::params![format!("{term}*"), snapshot_id], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    rusqlite::params![format!("{term}*"), snapshot_id, ubiquity_cutoff + 1],
+                    |row| row.get(0),
+                )
                 .unwrap_or(i64::MAX);
             scored.push((df, term.as_str()));
         }
         drop(statement);
         drop(connection);
-        // Ubiquitous terms first — see `UBIQUITY_*` constants. Small
-        // live sets then pair whole under the clause budget regardless.
-        let ubiquity_cutoff = (total_docs / UBIQUITY_DOC_FRACTION).max(UBIQUITY_DF_MIN);
         let mut live: Vec<(i64, &str)> = scored
             .iter()
             .filter(|(df, _)| (1..=ubiquity_cutoff).contains(df))
@@ -1366,6 +1385,35 @@ impl MetadataStore {
                 "SELECT count(*) FROM documents_fts
                  WHERE documents_fts MATCH ?1 AND snapshot_id=?2",
                 rusqlite::params![format!("\"{term}\""), snapshot_id],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)
+    }
+
+    /// `term_document_frequency` truncated at `cap` — min(df, cap).
+    /// Callers that only compare df against a threshold (`<= cap`,
+    /// `== 0`) get identical answers while the `LIMIT` lets FTS5 stop
+    /// enumerating a common term's posting instead of counting it to
+    /// the end — the difference between milliseconds and seconds on a
+    /// large corpus.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn term_document_frequency_capped(
+        &self,
+        snapshot_id: &str,
+        term: &str,
+        cap: i64,
+    ) -> Result<i64> {
+        let connection = self.connection.read();
+        connection
+            .query_row(
+                "SELECT count(*) FROM (
+                   SELECT 1 FROM documents_fts
+                   WHERE documents_fts MATCH ?1 AND snapshot_id=?2
+                   LIMIT ?3
+                 )",
+                rusqlite::params![format!("\"{term}\""), snapshot_id, cap],
                 |row| row.get(0),
             )
             .map_err(storage_error)
@@ -1743,14 +1791,27 @@ impl MetadataStore {
         name: &str,
         limit: usize,
     ) -> Result<Vec<CodeEntity>> {
+        // Two index-seekable probes merged name-side first: the
+        // `(name=? OR qualified_name=?)` predicate cannot use
+        // `entities_name`/`entities_qualified_name` and scanned the
+        // snapshot's whole entity set per call. Exact-name rows keep
+        // their precedence over qualified-name rows; ordering within
+        // each class was unspecified before and stays unspecified.
+        const COLS: &str = "id, kind, name, qualified_name, signature, language, region_id,
+                 address_json, capabilities_json, attributes_json";
         let connection = self.connection.read();
         let mut statement = connection
-            .prepare(
-                "SELECT id, kind, name, qualified_name, signature, language, region_id,
-                 address_json, capabilities_json, attributes_json FROM entities
-                 WHERE snapshot_id=?1 AND (name=?2 OR qualified_name=?2)
-                 ORDER BY CASE WHEN name=?2 THEN 0 ELSE 1 END LIMIT ?3",
-            )
+            .prepare(&format!(
+                "SELECT {COLS} FROM (
+                     SELECT {COLS}, 0 AS pref FROM entities
+                     WHERE snapshot_id=?1 AND name=?2
+                     UNION ALL
+                     SELECT {COLS}, 1 AS pref FROM entities
+                     WHERE snapshot_id=?1 AND qualified_name=?2
+                         AND id NOT IN (SELECT id FROM entities
+                                        WHERE snapshot_id=?1 AND name=?2)
+                 ) ORDER BY pref, id LIMIT ?3",
+            ))
             .map_err(storage_error)?;
         let rows = statement
             .query_map(params![snapshot_id, name, usize_to_i64(limit)?], |row| {
@@ -1969,10 +2030,41 @@ impl MetadataStore {
         direction: RelationDirection,
         limit: usize,
     ) -> Result<Vec<Relation>> {
-        let predicate = match direction {
-            RelationDirection::Outgoing => "source_entity_id=?2",
-            RelationDirection::Incoming => "target_entity_id=?2",
-            RelationDirection::Both => "(source_entity_id=?2 OR target_entity_id=?2)",
+        // Both directions merge the two index-seekable top-`limit`
+        // lists: an OR predicate cannot use either relations index and
+        // scans the snapshot's whole edge set. Each direction's top
+        // `limit` contains every row the union's top `limit` needs —
+        // a row in the union's top `limit` has fewer than `limit`
+        // same-direction rows ahead of it, so it is inside its own
+        // direction's limit. Self-loop edges arrive over both branches;
+        // the id dedup keeps them counted once.
+        if direction == RelationDirection::Both {
+            let mut merged = self.relations_for_entity(
+                snapshot_id,
+                entity_id,
+                RelationDirection::Outgoing,
+                limit,
+            )?;
+            merged.extend(self.relations_for_entity(
+                snapshot_id,
+                entity_id,
+                RelationDirection::Incoming,
+                limit,
+            )?);
+            merged.sort_by(|left, right| {
+                right
+                    .confidence
+                    .total_cmp(&left.confidence)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            merged.dedup_by(|left, right| left.id == right.id);
+            merged.truncate(limit);
+            return Ok(merged);
+        }
+        let predicate = if direction == RelationDirection::Outgoing {
+            "source_entity_id=?2"
+        } else {
+            "target_entity_id=?2"
         };
         let sql = format!(
             "SELECT id, source_entity_id, target_entity_id, kind, origin, confidence,
@@ -2068,8 +2160,16 @@ impl MetadataStore {
         self.connection
             .read()
             .query_row(
-                "SELECT COUNT(*) FROM relations
-                 WHERE snapshot_id=?1 AND (source_entity_id=?2 OR target_entity_id=?2)",
+                // Inclusion-exclusion over the two relations indexes:
+                // an OR predicate scans the whole snapshot's edges,
+                // and plain source+target double-counts self-loops.
+                "SELECT (SELECT COUNT(*) FROM relations
+                        WHERE snapshot_id=?1 AND source_entity_id=?2)
+                      + (SELECT COUNT(*) FROM relations
+                        WHERE snapshot_id=?1 AND target_entity_id=?2)
+                      - (SELECT COUNT(*) FROM relations
+                        WHERE snapshot_id=?1 AND source_entity_id=?2
+                             AND target_entity_id=?2)",
                 params![snapshot_id, entity_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -3368,5 +3468,199 @@ mod tests {
                 .is_empty(),
             "current-source-only vocabulary has no history witness"
         );
+    }
+
+    #[test]
+    fn indexed_relation_and_name_lookups_preserve_or_semantics() {
+        // The hot-path lookups rewrite `(a=? OR b=?)` predicates as two
+        // index-seekable branches merged in Rust/SQL — this fixture pins
+        // the edge cases the rewrite must not change: a self-loop edge
+        // counted once, confidence-ordered union across directions,
+        // exact-name precedence over qualified-name, and capped df as
+        // min(df, cap).
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        store
+            .register_repository(&RepositoryIdentity {
+                id: "repo_t".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            })
+            .expect("repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_t".to_owned(),
+            repository_id: "repo_t".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        store.begin_snapshot(&snapshot).expect("begin snapshot");
+        let entity = |id: &str, name: &str, qualified: Option<&str>| CodeEntity {
+            id: id.to_owned(),
+            kind: cce_core::EntityKind::Function,
+            name: name.to_owned(),
+            qualified_name: qualified.map(str::to_owned),
+            signature: None,
+            language: None,
+            region_id: None,
+            address: None,
+            capabilities: Vec::new(),
+            attributes: serde_json::Map::new(),
+        };
+        let relation = |id: &str, source: &str, target: &str, confidence: f32| Relation {
+            id: id.to_owned(),
+            source_entity_id: source.to_owned(),
+            target_entity_id: target.to_owned(),
+            kind: cce_core::RelationKind::Calls,
+            origin: cce_core::RelationOrigin::Scip,
+            confidence,
+            snapshot_id: "snap_t".to_owned(),
+            extractor: "test".to_owned(),
+            evidence: Vec::new(),
+            attributes: serde_json::Map::new(),
+        };
+        let document = |id: &str, entity: &str, region: Option<&str>| IndexedDocument {
+            document: RetrievalDocument {
+                id: id.to_owned(),
+                entity_id: entity.to_owned(),
+                snapshot_id: "snap_t".to_owned(),
+                representation: RetrievalRepresentation::RawCode,
+                body_artifact_digest: format!("digest:{id}"),
+                region_id: region.map(str::to_owned),
+                address: None,
+                embedding_profile: None,
+                generated_by: None,
+                evidence: Vec::new(),
+                terms: Vec::new(),
+            },
+            path: "src/lib.rs".to_owned(),
+            name: "f".to_owned(),
+            body: "shared alpha_probe".to_owned(),
+        };
+        let mut records = SnapshotRecords {
+            artifacts: ["doc:0", "doc:1", "doc:2", "doc:fd"]
+                .iter()
+                .map(|id| ArtifactRecord {
+                    digest: format!("digest:{id}"),
+                    kind: crate::ArtifactKind::Source,
+                    size_bytes: 40,
+                    relative_path: format!("artifacts/{id}"),
+                })
+                .collect(),
+            entities: vec![
+                entity("e:a", "alpha", None),
+                entity("e:b", "beta", Some("alpha")),
+                entity("e:c", "gamma", None),
+            ],
+            relations: vec![
+                relation("r:1", "e:a", "e:b", 0.9),
+                // A recursive call is one edge touching `e:a` at both
+                // ends — the Both/degree paths must count it once.
+                relation("r:2", "e:a", "e:a", 0.8),
+                relation("r:3", "e:c", "e:a", 0.7),
+                relation("r:4", "e:b", "e:c", 0.95),
+            ],
+            regions: vec![CodeRegion {
+                id: "reg:file".to_owned(),
+                snapshot_id: "snap_t".to_owned(),
+                path: "src/lib.rs".to_owned(),
+                kind: cce_core::RegionKind::File,
+                language: None,
+                symbol_name: None,
+                symbol_kind: None,
+                qualified_name: None,
+                parent_region_id: None,
+                start_byte: 0,
+                end_byte: 100,
+                start_line: 1,
+                end_line: 10,
+            }],
+            documents: vec![
+                document("doc:0", "e:a", Some("reg:file")),
+                document("doc:1", "e:b", Some("reg:file")),
+                document("doc:2", "e:c", None),
+            ],
+            ..SnapshotRecords::default()
+        };
+        records.documents.push({
+            let mut descriptor = document("doc:fd", "e:a", Some("reg:file"));
+            descriptor.document.representation = RetrievalRepresentation::FileDescriptor;
+            descriptor
+        });
+        store.commit_snapshot(&snapshot, &records).expect("commit");
+
+        // Both = confidence-ordered union of both directions; the
+        // self-loop arrives over both branches yet lands once, and
+        // unrelated `r:4` never enters `e:a`'s neighborhood.
+        let both = store
+            .relations_for_entity("snap_t", "e:a", RelationDirection::Both, 10)
+            .expect("both");
+        let ids: Vec<&str> = both.iter().map(|relation| relation.id.as_str()).collect();
+        assert_eq!(ids, ["r:1", "r:2", "r:3"]);
+        let top_two = store
+            .relations_for_entity("snap_t", "e:a", RelationDirection::Both, 2)
+            .expect("top two");
+        let ids: Vec<&str> = top_two
+            .iter()
+            .map(|relation| relation.id.as_str())
+            .collect();
+        assert_eq!(ids, ["r:1", "r:2"], "limit keeps the union's top rows");
+        assert_eq!(
+            store
+                .entity_relation_degree("snap_t", "e:a")
+                .expect("degree"),
+            3,
+            "the self-loop edge counts once"
+        );
+
+        // Exact-name rows precede qualified-name rows — `e:a` is the
+        // real `alpha`, `e:b` only carries it as a qualified alias.
+        let named = store
+            .entity_by_name("snap_t", "alpha", 10)
+            .expect("by name");
+        let ids: Vec<&str> = named.iter().map(|entity| entity.id.as_str()).collect();
+        assert_eq!(ids, ["e:a", "e:b"]);
+        assert_eq!(
+            store
+                .entity_by_name("snap_t", "beta", 10)
+                .expect("beta")
+                .len(),
+            1
+        );
+
+        // Capped df is min(df, cap): rarity checks read `<= cap` and
+        // absence checks read `== 0` exactly as the unbounded count did.
+        for (cap, expected) in [(0, 0), (1, 1), (2, 2), (4, 4), (9, 4)] {
+            assert_eq!(
+                store
+                    .term_document_frequency_capped("snap_t", "shared", cap)
+                    .expect("capped"),
+                expected,
+                "cap {cap}"
+            );
+        }
+        assert_eq!(
+            store
+                .term_document_frequency_capped("snap_t", "absent", 4)
+                .expect("absent"),
+            0
+        );
+
+        // Path-driven descriptor lookup resolves through the region row.
+        let descriptors = store
+            .file_descriptors_for_paths("snap_t", &["src/lib.rs".to_owned()])
+            .expect("descriptors");
+        let ids: Vec<&str> = descriptors
+            .iter()
+            .map(|hit| hit.document_id.as_str())
+            .collect();
+        assert_eq!(ids, ["doc:fd"]);
+        let region_docs = store
+            .documents_for_regions("snap_t", &["reg:file".to_owned()])
+            .expect("region docs");
+        assert_eq!(region_docs.len(), 3);
     }
 }

@@ -257,9 +257,10 @@ impl CceEngine {
         if !anchors.is_empty() && !patch_grep_planned {
             let mut absent = Vec::new();
             for anchor in &anchors {
+                // `== 0` only needs to know one row exists — cap the count.
                 if self
                     .store()
-                    .term_document_frequency(&request.snapshot_id, anchor)?
+                    .term_document_frequency_capped(&request.snapshot_id, anchor, 1)?
                     == 0
                 {
                     absent.push(anchor.as_str());
@@ -2921,7 +2922,9 @@ fn resolve_distinguishing(
     let cap = (documents / 200).max(32);
     let mut rare = Vec::new();
     for term in terms.iter().take(24) {
-        let df = store.term_document_frequency(snapshot_id, term)?;
+        // Only `df <= cap` is needed — cap the count so a ubiquitous
+        // term stops at cap+1 rows instead of enumerating its posting.
+        let df = store.term_document_frequency_capped(snapshot_id, term, cap + 1)?;
         if df <= cap {
             rare.push((df, term.clone()));
         }
