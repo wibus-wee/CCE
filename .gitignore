@@ -23,3 +23,14 @@
 *.sqlite-wal
 .DS_Store
 /index.scip
+
+# Agent skills from npm packages (managed by skills-npm)
+**/skills/npm-*
+
+/research/external
+/benchmarks/results/
+
+.workbuddy-ai
+
+# pnpm workspace — stray npm lockfile from running `npm` inside apps/web
+/apps/web/package-lock.json

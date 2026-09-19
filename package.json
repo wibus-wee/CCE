@@ -5,7 +5,10 @@
   "scripts": {
     "web:dev": "pnpm --filter @cce/web dev",
     "web:build": "pnpm --filter @cce/web build",
-    "web:check": "pnpm --filter @cce/web check"
+    "web:check": "pnpm --filter @cce/web check",
+    "prepare": "skills-npm -s node_modules -r -a universal -a windsurf --yes"
+  },
+  "devDependencies": {
+    "skills-npm": "^1.2.0"
   }
 }
-

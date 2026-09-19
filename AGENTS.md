@@ -22,3 +22,11 @@ CCE is a local-first, Agent-agnostic repository intelligence runtime. It is not 
 
 Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace --all-features`. Run the self-index smoke benchmark when retrieval, storage, parsing, or packing changes.
 
+Daemon-mode adapters resolve `cce-daemon` as the sibling binary of `target/release/cce` — rebuild both before benchmarking (`cargo build --release -p cce-cli -p cce-daemon`) or the daemon keeps serving the previous build.
+
+
+## Web UI design system
+
+- When making UI or using components, always check if components from `@antfu/design` can be reused, before making new components or creating inline DOM elements. The React ports live in `apps/web/src/ui/` (Base UI + StyleX, same prefixed names: `Action*`, `Display*`, `Form*`, `Feedback*`, `Layout*`, `Overlay*`).
+- Style with the semantic tokens in `apps/web/src/ui/tokens.stylex.ts` — never hard-code colors; keep light/dark parity and use mono/tabular numerals for technical values.
+- Mock/fixture data for surfaces without a backend endpoint lives only in `apps/web/src/mock/` (typed, one export per surface) and every consumer must label the surface `preview` — never present fixtures as live index truth.
