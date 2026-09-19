@@ -1693,3 +1693,392 @@ async fn prf_skips_type_pinned_queries() {
         "type:commit must not run the feedback pass"
     );
 }
+
+/// Build an engine with the deterministic dense baseline — offline and
+/// deterministic, so hit scores are reproducible across runs.
+fn dense_engine(dir: &Path) -> CceEngine {
+    let mut config = EngineConfig::for_repository(dir);
+    config.dense = cce_engine::DenseBackendConfig::DeterministicBaseline { dimensions: 64 };
+    CceEngine::open(config).expect("open dense engine")
+}
+
+/// A request routed at the dense passes only.
+fn dense_request(query: &str, limit: usize) -> SearchRequest {
+    let mut request = search_request(query, true);
+    request.routes = vec![
+        cce_core::SearchRoute::DenseRaw,
+        cce_core::SearchRoute::DenseSummary,
+    ];
+    request.limit = limit;
+    request
+}
+
+/// Enough documents that `limit * 3` dense hits are a strict subset —
+/// the corpus-vs-hitset distinction the materialization fix must prove.
+fn dense_fixture_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for index in 0..14 {
+        write(
+            dir.path(),
+            &format!("src/module_{index}.rs"),
+            &format!(
+                "pub fn cursor_helper_{index}(cursor: &str) -> bool {{\n    cursor.len() > {index}\n}}\n\npub fn unrelated_{index}() {{}}\n"
+            ),
+        );
+    }
+    dir
+}
+
+/// Dense search must materialize only the hit documents — never the
+/// whole snapshot — and batch entity names through one lookup.
+#[tokio::test]
+async fn dense_query_materializes_only_hit_documents() {
+    let repo = dense_fixture_repo();
+    let engine = dense_engine(repo.path());
+    let report = engine.index().await.expect("index");
+    let total_docs = engine
+        .store()
+        .documents_for_snapshot(&report.snapshot.id)
+        .expect("documents")
+        .len();
+    assert!(total_docs > 6, "fixture must exceed the hit budget");
+
+    let counters_before = engine.retrieval_counters().snapshot();
+    let reads_before = engine.store().artifacts().read_count();
+    // Union plan: lexical supplies strict-tier evidence while the dense
+    // pass runs in the same query — a dense-only plan abstains by design
+    // (dense hits are inferred vicinity, never literal-term evidence).
+    let mut request = search_request("cursor helper", true);
+    request.limit = 2;
+    let result = engine.search(request).await.expect("dense search");
+    assert!(!result.hits.is_empty());
+    let counters = engine.retrieval_counters().snapshot();
+    let restored = counters.dense_documents_restored - counters_before.dense_documents_restored;
+    assert!(restored > 0, "dense hits must materialize their documents");
+    assert!(
+        restored <= 2 * 3,
+        "restored documents must not exceed the limit*3 hit set, got {restored}"
+    );
+    assert!(
+        restored < total_docs,
+        "restored {restored} == corpus {total_docs}: full-snapshot materialization regressed"
+    );
+    // Entity names must flow through the batched lookup.
+    assert!(
+        result.hits.iter().any(|hit| hit.symbol_name.is_some()),
+        "batched entity lookup must populate symbol_name"
+    );
+    // Each distinct body artifact is read at most once; plus one read for
+    // the vector index blob on this cold query.
+    let reads = engine.store().artifacts().read_count() - reads_before;
+    assert!(
+        reads <= restored + 1,
+        "artifact reads {reads} exceed one per hit document + index blob ({restored} + 1)"
+    );
+}
+
+/// Warm queries must reuse the decoded index — no second artifact read,
+/// no second decode.
+#[tokio::test]
+async fn dense_index_decodes_once_across_queries() {
+    let repo = dense_fixture_repo();
+    let engine = dense_engine(repo.path());
+    engine.index().await.expect("index");
+
+    engine
+        .search(dense_request("cursor helper", 3))
+        .await
+        .expect("cold search");
+    let cold = engine.retrieval_counters().snapshot();
+    assert_eq!(cold.dense_index_decodes, 1);
+    assert_eq!(cold.dense_artifact_reads, 1);
+
+    engine
+        .search(dense_request("cursor helper", 3))
+        .await
+        .expect("warm search");
+    engine
+        .search(dense_request("cursor persistence", 3))
+        .await
+        .expect("third search");
+    let warm = engine.retrieval_counters().snapshot();
+    assert_eq!(
+        warm.dense_index_decodes, 1,
+        "warm queries must not re-decode"
+    );
+    assert_eq!(
+        warm.dense_artifact_reads, 1,
+        "warm queries must not re-read the vector artifact"
+    );
+}
+
+/// Concurrent first queries share a single decode — the per-key
+/// `OnceCell` serializes initialization instead of letting N callers
+/// each decode.
+#[tokio::test]
+async fn dense_index_decodes_once_under_concurrency() {
+    let repo = dense_fixture_repo();
+    let engine = std::sync::Arc::new(dense_engine(repo.path()));
+    engine.index().await.expect("index");
+
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        let engine = engine.clone();
+        tasks.push(tokio::spawn(async move {
+            engine
+                .search(dense_request("cursor helper", 3))
+                .await
+                .expect("concurrent search")
+        }));
+    }
+    for task in tasks {
+        task.await.expect("join");
+    }
+    let counters = engine.retrieval_counters().snapshot();
+    assert_eq!(
+        counters.dense_index_decodes, 1,
+        "six concurrent cold queries must share one decode"
+    );
+    assert_eq!(counters.dense_artifact_reads, 1);
+}
+
+/// A failed decode is never published: after repairing the artifact the
+/// next query retries and succeeds.
+#[tokio::test]
+async fn dense_index_failure_is_not_cached() {
+    let repo = dense_fixture_repo();
+    let engine = dense_engine(repo.path());
+    engine.index().await.expect("index");
+    let manifest = engine.status().expect("status");
+    let digest = manifest.views[&ViewKind::Dense]
+        .artifact_digest
+        .clone()
+        .expect("dense artifact digest");
+    let object = repo
+        .path()
+        .join(".cce")
+        .join("artifacts")
+        .join("blake3")
+        .join(&digest[..2])
+        .join(&digest[2..]);
+    let bytes = fs::read(&object).expect("read index blob");
+    fs::remove_file(&object).expect("remove index blob");
+
+    let failed = engine.search(dense_request("cursor helper", 3)).await;
+    assert!(failed.is_err(), "missing index blob must fail, not degrade");
+    let after_failure = engine.retrieval_counters().snapshot();
+    assert_eq!(after_failure.dense_index_decodes, 0);
+    assert_eq!(after_failure.dense_artifact_reads, 1);
+
+    fs::write(&object, &bytes).expect("restore index blob");
+    engine
+        .search(dense_request("cursor helper", 3))
+        .await
+        .expect("retry after repair must succeed");
+    let recovered = engine.retrieval_counters().snapshot();
+    assert_eq!(
+        recovered.dense_index_decodes, 1,
+        "failure must not be cached — retry decodes once"
+    );
+    assert_eq!(recovered.dense_artifact_reads, 2);
+}
+
+/// A→B→A snapshot switches must not mix indexes: each digest decodes
+/// once, and reactivated A reuses its cached decode with identical hits.
+#[tokio::test]
+async fn dense_cache_isolated_across_snapshots() {
+    let repo = dense_fixture_repo();
+    let engine = dense_engine(repo.path());
+    let first = engine.index().await.expect("index A");
+    let a_hits = engine
+        .search(dense_request("cursor helper", 3))
+        .await
+        .expect("search A")
+        .hits;
+
+    write(
+        repo.path(),
+        "src/extra.rs",
+        "pub fn brand_new_file_marker() {}\n",
+    );
+    let second = engine.index().await.expect("index B");
+    assert_ne!(first.snapshot.id, second.snapshot.id);
+    engine
+        .search(dense_request("cursor helper", 3))
+        .await
+        .expect("search B");
+    let after_ab = engine.retrieval_counters().snapshot();
+    assert_eq!(after_ab.dense_index_decodes, 2, "A and B each decode once");
+
+    fs::remove_file(repo.path().join("src/extra.rs")).expect("restore A");
+    let reactivated = engine.index().await.expect("reactivate A");
+    assert_eq!(reactivated.snapshot.id, first.snapshot.id);
+    let a_again = engine
+        .search(dense_request("cursor helper", 3))
+        .await
+        .expect("search A again")
+        .hits;
+    let after_aba = engine.retrieval_counters().snapshot();
+    assert_eq!(
+        after_aba.dense_index_decodes, 2,
+        "reactivated A must hit the cache, not re-decode or mix"
+    );
+    assert_eq!(
+        a_hits
+            .iter()
+            .map(|hit| (hit.document_id.as_str(), hit.score))
+            .collect::<Vec<_>>(),
+        a_again
+            .iter()
+            .map(|hit| (hit.document_id.as_str(), hit.score))
+            .collect::<Vec<_>>(),
+        "A→B→A must serve A's index — identical hits"
+    );
+}
+
+/// A search with no dense routes never touches the index cache.
+#[tokio::test]
+async fn search_without_dense_never_touches_index_cache() {
+    let repo = fixture_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+    engine
+        .search(search_request("resume_attempt cursor", true))
+        .await
+        .expect("sparse search");
+    let counters = engine.retrieval_counters().snapshot();
+    assert_eq!(counters.dense_index_decodes, 0);
+    assert_eq!(counters.dense_artifact_reads, 0);
+    assert_eq!(counters.dense_documents_restored, 0);
+}
+
+/// Replaying the same query must return identical hits — scores, order,
+/// snippets, verdict — modulo wall time.
+#[tokio::test]
+async fn dense_replay_is_deterministic() {
+    let repo = dense_fixture_repo();
+    let engine = dense_engine(repo.path());
+    engine.index().await.expect("index");
+
+    let first = engine
+        .search(dense_request("cursor helper", 3))
+        .await
+        .expect("first");
+    let second = engine
+        .search(dense_request("cursor helper", 3))
+        .await
+        .expect("second");
+    let shape = |result: &cce_engine::SearchResult| {
+        (
+            result
+                .hits
+                .iter()
+                .map(|hit| {
+                    (
+                        hit.document_id.clone(),
+                        hit.score,
+                        hit.snippet.clone(),
+                        hit.address.clone(),
+                        hit.symbol_name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            result.verdict.clone(),
+        )
+    };
+    assert_eq!(shape(&first), shape(&second));
+}
+
+/// Plan 018 performance contract: document materialization follows the
+/// hit set, not the corpus. Two corpora of very different sizes must
+/// restore the same number of documents per query; the retained O(Nd)
+/// boundary is the flat dot product, which grows with corpus size while
+/// document load stays flat.
+#[tokio::test]
+async fn dense_query_perf_follows_hits_not_corpus() {
+    fn corpus(files: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..files {
+            write(
+                dir.path(),
+                &format!("src/module_{index}.rs"),
+                &format!(
+                    "pub fn cursor_helper_{index}(cursor: &str) -> bool {{\n    cursor.len() > {index}\n}}\n\npub fn padding_{index}() {{}}\n"
+                ),
+            );
+        }
+        dir
+    }
+    fn percentile(sorted: &[u64], p: usize) -> u64 {
+        sorted
+            .get(sorted.len() * p / 100)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    let mut report = serde_json::json!({ "requests": 30, "hit_k": 3 });
+    for (label, files) in [("small", 14), ("large", 42)] {
+        let repo = corpus(files);
+        let engine = dense_engine(repo.path());
+        let index = engine.index().await.expect("index");
+        let total_docs = engine
+            .store()
+            .documents_for_snapshot(&index.snapshot.id)
+            .expect("documents")
+            .len();
+
+        // Cold query, then 29 warm ones.
+        let mut latencies = Vec::new();
+        for iteration in 0..30 {
+            let mut request = dense_request("cursor helper", 3);
+            request.query = format!("cursor helper {}", iteration % 4);
+            let result = engine.search(request).await.expect("search");
+            latencies.push(result.latency_ms);
+        }
+        latencies.sort_unstable();
+        let counters = engine.retrieval_counters().snapshot();
+        let artifact_reads = engine.store().artifacts().read_count();
+        report[label] = serde_json::json!({
+            "files": files,
+            "documents": total_docs,
+            "latency_p50_ms": percentile(&latencies, 50),
+            "latency_p95_ms": percentile(&latencies, 95),
+            "dense_index_decodes": counters.dense_index_decodes,
+            "dense_artifact_reads": counters.dense_artifact_reads,
+            "dense_documents_restored_total": counters.dense_documents_restored,
+            "dense_documents_restored_per_query":
+                counters.dense_documents_restored as f64 / 30.0,
+            "dense_body_artifact_reads_per_query":
+                counters.dense_body_artifact_reads as f64 / 30.0,
+            "artifact_reads_total": artifact_reads,
+            "dense_index_load_ns_total": counters.dense_index_load_ns,
+            "dense_embed_ns_total": counters.dense_embed_ns,
+            "dense_score_ns_total": counters.dense_score_ns,
+            "dense_document_load_ns_total": counters.dense_document_load_ns,
+        });
+    }
+    let small = &report["small"];
+    let large = &report["large"];
+    assert!(
+        large["documents"].as_u64().unwrap() > small["documents"].as_u64().unwrap() * 2,
+        "corpora must differ materially"
+    );
+    // The key invariant: restored documents per query are identical — the
+    // hit K is fixed, so materialization cost cannot scale with N.
+    assert_eq!(
+        small["dense_documents_restored_per_query"], large["dense_documents_restored_per_query"],
+        "hit-scoped materialization must not grow with the corpus"
+    );
+    assert_eq!(small["dense_index_decodes"], 1);
+    assert_eq!(large["dense_index_decodes"], 1);
+    // The retained O(Nd) boundary: dot-product work grows with corpus.
+    assert!(
+        large["dense_score_ns_total"].as_u64().unwrap()
+            >= small["dense_score_ns_total"].as_u64().unwrap(),
+        "flat dot product is the retained O(Nd) stage"
+    );
+    println!(
+        "p018-perf {}",
+        serde_json::to_string_pretty(&report).unwrap()
+    );
+}

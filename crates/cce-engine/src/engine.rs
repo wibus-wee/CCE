@@ -79,6 +79,105 @@ pub struct CceEngine {
     /// re-running on every search; a fixed environment heals on the next
     /// process/index invocation.
     repair_attempts: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Decoded dense indexes keyed by (snapshot, view profile, digest).
+    /// Each entry is a `OnceCell` so concurrent first queries share one
+    /// decode; a failed decode leaves the cell empty — corruption is
+    /// retried on the next query, never published as a usable index.
+    /// Bounded: a full map clears rather than retaining history.
+    dense_indexes: std::sync::Mutex<
+        HashMap<DenseIndexKey, std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<DenseIndex>>>>,
+    >,
+    /// Cumulative retrieval counters — the proof that dense query work
+    /// follows the hit set, not the corpus.
+    retrieval_counters: RetrievalCounters,
+}
+
+/// Identity of a decoded dense index for caching. The digest is
+/// content-addressed so equal keys are byte-identical; snapshot and
+/// profile hash scope the entry so an A→B→A snapshot switch can never
+/// reuse an index the live view no longer points at.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DenseIndexKey {
+    snapshot_id: String,
+    profile_hash: String,
+    digest: String,
+}
+
+/// Bound on decoded dense indexes held at once. A corpus's indexes are
+/// ~tens of MB; four covers A/B switching and multi-view snapshots with
+/// headroom, and clearing on overflow keeps retention bounded.
+const DENSE_INDEX_CACHE_CAP: usize = 4;
+
+/// Cumulative dense-stage counters, monotonic for the engine's lifetime.
+/// Tests and benchmarks diff `snapshot()` readings to prove the query
+/// path scales with the hit set rather than the corpus.
+#[derive(Debug, Default)]
+pub struct RetrievalCounters {
+    /// Dense vector artifact reads (index blob fetches pre-decode).
+    pub dense_artifact_reads: std::sync::atomic::AtomicUsize,
+    /// Successful `DenseIndex::decode` runs — warm queries stay at zero.
+    pub dense_index_decodes: std::sync::atomic::AtomicUsize,
+    /// Documents materialized for dense hits (deduped, hits only).
+    pub dense_documents_restored: std::sync::atomic::AtomicUsize,
+    /// Distinct body/source artifacts read while materializing dense-hit
+    /// documents — bounded by the hit set's digest diversity, not the
+    /// corpus.
+    pub dense_body_artifact_reads: std::sync::atomic::AtomicUsize,
+    /// Nanoseconds in dense index load+decode (cache hits ~0).
+    pub dense_index_load_ns: std::sync::atomic::AtomicU64,
+    /// Nanoseconds embedding query text for dense search.
+    pub dense_embed_ns: std::sync::atomic::AtomicU64,
+    /// Nanoseconds in the flat dot-product pass.
+    pub dense_score_ns: std::sync::atomic::AtomicU64,
+    /// Nanoseconds materializing dense-hit documents and their entities.
+    pub dense_document_load_ns: std::sync::atomic::AtomicU64,
+}
+
+/// Point-in-time copy of `RetrievalCounters` for diffing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetrievalCountersSnapshot {
+    /// See `RetrievalCounters::dense_artifact_reads`.
+    pub dense_artifact_reads: usize,
+    /// See `RetrievalCounters::dense_index_decodes`.
+    pub dense_index_decodes: usize,
+    /// See `RetrievalCounters::dense_documents_restored`.
+    pub dense_documents_restored: usize,
+    /// See `RetrievalCounters::dense_body_artifact_reads`.
+    pub dense_body_artifact_reads: usize,
+    /// See `RetrievalCounters::dense_index_load_ns`.
+    pub dense_index_load_ns: u64,
+    /// See `RetrievalCounters::dense_embed_ns`.
+    pub dense_embed_ns: u64,
+    /// See `RetrievalCounters::dense_score_ns`.
+    pub dense_score_ns: u64,
+    /// See `RetrievalCounters::dense_document_load_ns`.
+    pub dense_document_load_ns: u64,
+}
+
+impl RetrievalCounters {
+    /// Atomically snapshot every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> RetrievalCountersSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        RetrievalCountersSnapshot {
+            dense_artifact_reads: self.dense_artifact_reads.load(Relaxed),
+            dense_index_decodes: self.dense_index_decodes.load(Relaxed),
+            dense_documents_restored: self.dense_documents_restored.load(Relaxed),
+            dense_body_artifact_reads: self.dense_body_artifact_reads.load(Relaxed),
+            dense_index_load_ns: self.dense_index_load_ns.load(Relaxed),
+            dense_embed_ns: self.dense_embed_ns.load(Relaxed),
+            dense_score_ns: self.dense_score_ns.load(Relaxed),
+            dense_document_load_ns: self.dense_document_load_ns.load(Relaxed),
+        }
+    }
+
+    /// Record one dense stage's elapsed time.
+    pub(crate) fn record(counter: &std::sync::atomic::AtomicU64, elapsed: std::time::Duration) {
+        counter.fetch_add(
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 impl CceEngine {
@@ -95,6 +194,8 @@ impl CceEngine {
             embedder: tokio::sync::OnceCell::new(),
             reranker: tokio::sync::OnceCell::new(),
             repair_attempts: std::sync::Mutex::new(std::collections::HashSet::new()),
+            dense_indexes: std::sync::Mutex::new(HashMap::new()),
+            retrieval_counters: RetrievalCounters::default(),
         })
     }
 
@@ -326,7 +427,10 @@ impl CceEngine {
                 ViewKind::Graph,
                 &repaired_graph_status(
                     snapshot,
-                    &crate::providers::detect_all(&self.config.repository_root),
+                    &crate::providers::detect_all(
+                        &self.config.repository_root,
+                        &self.config.data_root,
+                    ),
                     scip_edges,
                 ),
             )?;
@@ -504,6 +608,60 @@ impl CceEngine {
     #[must_use]
     pub const fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// Cumulative dense-stage counters (decode counts, restored-document
+    /// totals, stage timings) for tests and benchmarks.
+    #[must_use]
+    pub const fn retrieval_counters(&self) -> &RetrievalCounters {
+        &self.retrieval_counters
+    }
+
+    /// The decoded dense index for `(snapshot, view profile, digest)`.
+    /// Concurrent first queries share one decode through a per-key
+    /// `OnceCell`; a failed decode leaves the cell empty so corruption is
+    /// retried, never cached as usable.
+    ///
+    /// # Errors
+    /// `ArtifactCorrupt`/I/O on unreadable or malformed index blobs.
+    pub(crate) async fn dense_index(
+        &self,
+        snapshot_id: &str,
+        profile_hash: &str,
+        digest: &str,
+    ) -> Result<std::sync::Arc<DenseIndex>> {
+        let key = DenseIndexKey {
+            snapshot_id: snapshot_id.to_owned(),
+            profile_hash: profile_hash.to_owned(),
+            digest: digest.to_owned(),
+        };
+        let cell = {
+            let mut cache = self
+                .dense_indexes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !cache.contains_key(&key) && cache.len() >= DENSE_INDEX_CACHE_CAP {
+                cache.clear();
+            }
+            cache
+                .entry(key)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+        let index = cell
+            .get_or_try_init(|| async {
+                self.retrieval_counters
+                    .dense_artifact_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let bytes = self.store.artifacts().read(digest)?;
+                let decoded = DenseIndex::decode(&bytes)?;
+                self.retrieval_counters
+                    .dense_index_decodes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<std::sync::Arc<DenseIndex>, CceError>(std::sync::Arc::new(decoded))
+            })
+            .await?;
+        Ok(index.clone())
     }
 
     /// Current view manifest, marking views `Stale` when the worktree has
@@ -1609,7 +1767,7 @@ impl CceEngine {
     /// Detect-state report for every known provider (no execution).
     #[must_use]
     pub fn providers(&self) -> Vec<crate::providers::ProviderReport> {
-        crate::providers::detect_all(&self.config.repository_root)
+        crate::providers::detect_all(&self.config.repository_root, &self.config.data_root)
     }
 
     /// Worktree regex search honoring ignore/sensitive policy; always

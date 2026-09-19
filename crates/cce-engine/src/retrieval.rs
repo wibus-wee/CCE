@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    CceEngine, DenseIndex, Embedder, GraphPolicy, QueryPlan, QueryPlanner, RepositoryScanner,
+    CceEngine, Embedder, GraphPolicy, QueryPlan, QueryPlanner, RepositoryScanner, RetrievalCounters,
 };
 
 const RRF_K: f64 = 60.0;
@@ -755,16 +755,69 @@ impl CceEngine {
                     if let (Some(digest), Some(embedder)) =
                         (dense_status.artifact_digest.as_deref(), embedder.as_ref())
                     {
-                        let index = DenseIndex::decode(&self.store().artifacts().read(digest)?)?;
-                        let dense_hits = index
-                            .search(&request.query, embedder, request.limit.saturating_mul(3))
+                        let counters = self.retrieval_counters();
+                        // Index load+decode — a cache hit is a map lookup;
+                        // a miss reads the vector artifact once.
+                        let index_started = Instant::now();
+                        let index = self
+                            .dense_index(&request.snapshot_id, &dense_status.profile_hash, digest)
                             .await?;
+                        RetrievalCounters::record(
+                            &counters.dense_index_load_ns,
+                            index_started.elapsed(),
+                        );
+                        // Query embedding.
+                        let embed_started = Instant::now();
+                        let query = index.embed_query(&request.query, embedder).await?;
+                        RetrievalCounters::record(
+                            &counters.dense_embed_ns,
+                            embed_started.elapsed(),
+                        );
+                        // Flat dot product over the corpus — the one stage
+                        // that is O(Nd) by design.
+                        let score_started = Instant::now();
+                        let dense_hits = index.score(&query, request.limit.saturating_mul(3));
+                        RetrievalCounters::record(
+                            &counters.dense_score_ns,
+                            score_started.elapsed(),
+                        );
+                        // Materialize only the hit set: bodies and entity
+                        // names batch-read, never the whole snapshot.
+                        let docs_started = Instant::now();
+                        let body_reads_before = self.store().artifacts().read_count();
+                        let dense_ids: Vec<String> = dense_hits
+                            .iter()
+                            .map(|hit| hit.document_id.clone())
+                            .collect();
                         let documents = self
                             .store()
-                            .documents_for_snapshot(&request.snapshot_id)?
+                            .documents_by_ids(&request.snapshot_id, &dense_ids)?
                             .into_iter()
                             .map(|document| (document.document_id.clone(), document))
                             .collect::<HashMap<_, _>>();
+                        counters
+                            .dense_documents_restored
+                            .fetch_add(documents.len(), std::sync::atomic::Ordering::Relaxed);
+                        let mut seen_entities = std::collections::HashSet::new();
+                        let entity_ids: Vec<String> = documents
+                            .values()
+                            .filter(|document| seen_entities.insert(document.entity_id.clone()))
+                            .map(|document| document.entity_id.clone())
+                            .collect();
+                        let entities: HashMap<String, CodeEntity> = self
+                            .store()
+                            .entities_by_ids(&request.snapshot_id, &entity_ids)?
+                            .into_iter()
+                            .map(|entity| (entity.id.clone(), entity))
+                            .collect();
+                        counters.dense_body_artifact_reads.fetch_add(
+                            self.store().artifacts().read_count() - body_reads_before,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        RetrievalCounters::record(
+                            &counters.dense_document_load_ns,
+                            docs_started.elapsed(),
+                        );
                         for (offset, hit) in dense_hits.into_iter().enumerate() {
                             let Some(document) = documents.get(&hit.document_id) else {
                                 continue;
@@ -775,10 +828,9 @@ impl CceEngine {
                                 | RetrievalRepresentation::TestBehavior => SearchRoute::DenseRaw,
                                 _ => SearchRoute::DenseSummary,
                             };
-                            let symbol_name = self
-                                .store()
-                                .entity_by_id(&request.snapshot_id, &document.entity_id)?
-                                .map(|entity| entity.name);
+                            let symbol_name = entities
+                                .get(&document.entity_id)
+                                .map(|entity| entity.name.clone());
                             add_candidate(
                                 &mut candidates,
                                 SearchHit {
@@ -1643,7 +1695,7 @@ impl CceEngine {
         if !usable {
             return Ok(None);
         }
-        let Some(tools) = crate::zoekt::detect() else {
+        let Some(tools) = crate::zoekt::detect(&self.config().data_root) else {
             return Ok(None);
         };
         let index_dir = crate::zoekt::index_dir(&self.config().data_root);

@@ -38,7 +38,7 @@ pub use config::{
 pub use context::{ContextPacker, ContextRequest};
 pub use dense::{DenseIndex, DenseSearchHit, EmbedRole, Embedder, EmbeddingBackend, LocalEmbedder};
 pub use diff::DEFAULT_DIFF_LIMIT;
-pub use engine::{CceEngine, IndexReport};
+pub use engine::{CceEngine, IndexReport, RetrievalCounters, RetrievalCountersSnapshot};
 pub use grep::{DEFAULT_GREP_LIMIT, GrepHit, GrepReport, GrepRequest};
 pub use parser::{ParsedFile, ParsedUnit, SourceParser};
 pub use planner::{QueryPlan, QueryPlanner};
@@ -46,3 +46,4 @@ pub use providers::{ProviderReport, ProviderState};
 pub use repository::{RepositoryScanner, ScannedFile, ScannedRepository};
 pub use rerank::LocalReranker;
 pub use retrieval::SearchResult;
+pub use zoekt::provision as provision_zoekt;

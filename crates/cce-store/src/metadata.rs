@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicUsize},
@@ -2351,94 +2352,281 @@ impl MetadataStore {
     /// # Errors
     /// Storage error on query failure.
     pub fn documents_for_snapshot(&self, snapshot_id: &str) -> Result<Vec<DocumentContent>> {
-        let rows = {
+        let ids = {
             let connection = self.connection.read();
             let mut statement = connection
-                .prepare(
-                    "SELECT id, entity_id, region_id, representation, address_json,
-                     body_artifact_digest, evidence_json, generated_by
-                     FROM retrieval_documents WHERE snapshot_id=?1 ORDER BY id",
-                )
+                .prepare("SELECT id FROM retrieval_documents WHERE snapshot_id=?1 ORDER BY id")
                 .map_err(storage_error)?;
             statement
-                .query_map([snapshot_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                })
+                .query_map([snapshot_id], |row| row.get::<_, String>(0))
                 .map_err(storage_error)?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(storage_error)?
         };
-        rows.into_iter()
-            .map(
-                |(
-                    document_id,
-                    entity_id,
-                    region_id,
-                    representation,
-                    address_json,
-                    digest,
-                    evidence_json,
-                    generated_by,
-                )| {
-                    let address: Option<SourceAddress> =
-                        address_json.as_deref().map(parse_json).transpose()?;
-                    let artifact_text = |digest: &str| -> Result<String> {
-                        let bytes = self.artifacts.read(digest)?;
-                        String::from_utf8(bytes)
-                            .map_err(|_| CceError::ArtifactCorrupt(digest.to_owned()))
-                    };
-                    // Body location is a contract keyed on generated_by, not
-                    // on whether an address exists: v2 descriptors carry their
-                    // own artifact while `address` keeps pointing at source
-                    // for provenance. v1 descriptors never persisted their
-                    // body — their artifact IS the source file, so they keep
-                    // the old slice semantics. Anything else follows the
-                    // original rule: address → source slice, else artifact.
-                    let representation: RetrievalRepresentation = parse_json(&representation)?;
-                    let text = match representation {
-                        RetrievalRepresentation::FileDescriptor
-                        | RetrievalRepresentation::SymbolSummary => match generated_by.as_deref() {
-                            Some("cce-file-descriptor-v2" | "cce-symbol-descriptor-v2") => {
-                                artifact_text(&digest)?
-                            }
-                            Some("cce-file-descriptor-v1" | "cce-symbol-descriptor-v1") | None => {
-                                match &address {
-                                    Some(address) => self.source_text(address)?,
-                                    None => artifact_text(&digest)?,
-                                }
-                            }
-                            Some(other) => {
-                                return Err(CceError::ArtifactCorrupt(format!(
-                                    "{document_id}: unknown descriptor version {other}"
-                                )));
-                            }
-                        },
-                        _ => match &address {
-                            Some(address) => self.source_text(address)?,
-                            None => artifact_text(&digest)?,
-                        },
-                    };
-                    Ok(DocumentContent {
-                        document_id,
-                        entity_id,
-                        region_id,
-                        representation,
-                        address,
-                        evidence: parse_json(&evidence_json)?,
-                        text,
+        self.documents_by_ids(snapshot_id, &ids)
+    }
+
+    /// Materialize only the requested documents (text included), in input
+    /// order with duplicate ids collapsed. Empty input reads nothing.
+    /// Ids absent from the snapshot are skipped — the caller decides
+    /// whether a missing document is a degrade or an error.
+    ///
+    /// Bodies resolve through the shared `body_request` rule and fetch in
+    /// digest groups: each distinct body/source artifact is read and
+    /// integrity-verified at most once per call.
+    ///
+    /// # Errors
+    /// Storage error on query failure; `ArtifactCorrupt` on an
+    /// inconsistent row (bad JSON, unknown descriptor version, or a
+    /// source slice that does not resolve).
+    pub fn documents_by_ids(
+        &self,
+        snapshot_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<DocumentContent>> {
+        const SQLITE_VARIABLE_LIMIT: usize = 900;
+        // Dedup preserving input order; empty input must not touch the DB.
+        let mut seen = std::collections::HashSet::new();
+        let ordered_ids: Vec<&String> = ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+        if ordered_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = {
+            let connection = self.connection.read();
+            let mut rows = Vec::new();
+            for chunk in ordered_ids.chunks(SQLITE_VARIABLE_LIMIT) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT id, entity_id, region_id, representation, address_json,
+                     body_artifact_digest, evidence_json, generated_by
+                     FROM retrieval_documents
+                     WHERE snapshot_id=?1 AND id IN ({placeholders})"
+                );
+                let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+                let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 1);
+                params.push(snapshot_id.to_owned().into());
+                params.extend(chunk.iter().map(|id| (*id).clone().into()));
+                let mapped = statement
+                    .query_map(rusqlite::params_from_iter(params), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
                     })
-                },
+                    .map_err(storage_error)?;
+                for row in mapped {
+                    rows.push(row.map_err(storage_error)?);
+                }
+            }
+            rows
+        };
+        // Classify each row: parse metadata and decide where the body
+        // lives — a byte slice of a source artifact, or a whole artifact.
+        let mut pending = Vec::with_capacity(rows.len());
+        let mut slice_keys = std::collections::BTreeSet::new();
+        for (
+            document_id,
+            entity_id,
+            region_id,
+            representation,
+            address_json,
+            digest,
+            evidence_json,
+            generated_by,
+        ) in rows
+        {
+            let address: Option<SourceAddress> =
+                address_json.as_deref().map(parse_json).transpose()?;
+            let representation: RetrievalRepresentation = parse_json(&representation)?;
+            let request = body_request(
+                &representation,
+                generated_by.as_deref(),
+                address.as_ref(),
+                &digest,
             )
-            .collect()
+            .map_err(|error| match error {
+                CceError::ArtifactCorrupt(message) => {
+                    CceError::ArtifactCorrupt(format!("{document_id}: {message}"))
+                }
+                other => other,
+            })?;
+            if let BodyRequest::Slice { path, .. } = &request {
+                // The slice resolves against the address's own snapshot —
+                // never rebind a foreign snapshot's path onto this one.
+                let snapshot = address.as_ref().map_or_else(
+                    || snapshot_id.to_owned(),
+                    |address| address.snapshot_id.clone(),
+                );
+                slice_keys.insert((snapshot, path.clone()));
+            }
+            pending.push(PendingRow {
+                document_id,
+                entity_id,
+                region_id,
+                representation,
+                address,
+                evidence_json,
+                request,
+            });
+        }
+        // Resolve every needed (snapshot, path) → artifact digest in one
+        // batched pass per snapshot bucket.
+        let mut source_digests = HashMap::<(String, String), String>::new();
+        {
+            let connection = self.connection.read();
+            let mut by_snapshot = std::collections::BTreeMap::<String, Vec<String>>::new();
+            for (snapshot, path) in slice_keys {
+                by_snapshot.entry(snapshot).or_default().push(path);
+            }
+            for (source_snapshot, paths) in by_snapshot {
+                for chunk in paths.chunks(SQLITE_VARIABLE_LIMIT) {
+                    let placeholders = vec!["?"; chunk.len()].join(",");
+                    let sql = format!(
+                        "SELECT path, artifact_digest FROM source_files
+                         WHERE snapshot_id=?1 AND path IN ({placeholders})"
+                    );
+                    let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+                    let mut params: Vec<rusqlite::types::Value> =
+                        Vec::with_capacity(chunk.len() + 1);
+                    params.push(source_snapshot.clone().into());
+                    params.extend(chunk.iter().map(|path| path.clone().into()));
+                    let mapped = statement
+                        .query_map(rusqlite::params_from_iter(params), |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .map_err(storage_error)?;
+                    for row in mapped {
+                        let (path, digest) = row.map_err(storage_error)?;
+                        source_digests.insert((source_snapshot.clone(), path), digest);
+                    }
+                }
+            }
+        }
+        // Group every body fetch by final artifact digest: one read and
+        // one integrity verification per distinct artifact per call.
+        let mut bytes_by_digest = HashMap::<String, Vec<u8>>::new();
+        let mut contents = HashMap::<String, DocumentContent>::new();
+        for row in pending {
+            let (digest, range) = match &row.request {
+                BodyRequest::Whole(digest) => (digest.clone(), None),
+                BodyRequest::Slice { path, start, end } => {
+                    let key = (
+                        row.address.as_ref().map_or_else(
+                            || snapshot_id.to_owned(),
+                            |address| address.snapshot_id.clone(),
+                        ),
+                        path.clone(),
+                    );
+                    let digest = source_digests
+                        .get(&key)
+                        .ok_or_else(|| CceError::ArtifactCorrupt(format!("{}:{}", key.0, key.1)))?;
+                    (digest.clone(), Some((*start, *end)))
+                }
+            };
+            let bytes = match bytes_by_digest.entry(digest.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(self.artifacts.read(&digest)?)
+                }
+            };
+            let slice = match range {
+                Some((start, end)) => bytes
+                    .get(start..end)
+                    .ok_or_else(|| CceError::ArtifactCorrupt(digest.clone()))?,
+                None => bytes.as_slice(),
+            };
+            let text = String::from_utf8(slice.to_vec())
+                .map_err(|_| CceError::ArtifactCorrupt(digest.clone()))?;
+            contents.insert(
+                row.document_id.clone(),
+                DocumentContent {
+                    document_id: row.document_id,
+                    entity_id: row.entity_id,
+                    region_id: row.region_id,
+                    representation: row.representation,
+                    address: row.address,
+                    evidence: parse_json(&row.evidence_json)?,
+                    text,
+                },
+            );
+        }
+        // Emit in input order — never trust `IN` ordering.
+        Ok(ordered_ids
+            .iter()
+            .filter_map(|id| contents.remove(id.as_str()))
+            .collect())
+    }
+}
+
+/// A document row awaiting body resolution — metadata parsed, body
+/// location classified into `request`.
+struct PendingRow {
+    document_id: String,
+    entity_id: String,
+    region_id: Option<String>,
+    representation: RetrievalRepresentation,
+    address: Option<SourceAddress>,
+    evidence_json: String,
+    request: BodyRequest,
+}
+
+/// Where a document's body bytes live — the single rule shared by
+/// `documents_for_snapshot` and `documents_by_ids` so there is never a
+/// second representation dispatch to drift.
+enum BodyRequest {
+    /// The artifact IS the body (v2 descriptor text, or a legacy
+    /// addressless document whose body digest is the payload).
+    Whole(String),
+    /// The body is a byte range of the source file artifact at `path`.
+    Slice {
+        path: String,
+        start: usize,
+        end: usize,
+    },
+}
+
+/// Body location is a contract keyed on `generated_by`, not on whether an
+/// address exists: v2 descriptors carry their own artifact while
+/// `address` keeps pointing at source for provenance. v1 descriptors
+/// never persisted their body — their artifact IS the source file, so
+/// they keep the old slice semantics. Anything else follows the original
+/// rule: address → source slice, else artifact.
+fn body_request(
+    representation: &RetrievalRepresentation,
+    generated_by: Option<&str>,
+    address: Option<&SourceAddress>,
+    body_digest: &str,
+) -> Result<BodyRequest> {
+    let slice = |address: &SourceAddress| -> Result<BodyRequest> {
+        Ok(BodyRequest::Slice {
+            path: address.path.clone(),
+            start: usize::try_from(address.start_byte)
+                .map_err(|_| CceError::ArtifactCorrupt(body_digest.to_owned()))?,
+            end: usize::try_from(address.end_byte)
+                .map_err(|_| CceError::ArtifactCorrupt(body_digest.to_owned()))?,
+        })
+    };
+    match representation {
+        RetrievalRepresentation::FileDescriptor | RetrievalRepresentation::SymbolSummary => {
+            match generated_by {
+                Some("cce-file-descriptor-v2" | "cce-symbol-descriptor-v2") => {
+                    Ok(BodyRequest::Whole(body_digest.to_owned()))
+                }
+                Some("cce-file-descriptor-v1" | "cce-symbol-descriptor-v1") | None => {
+                    address.map_or_else(|| Ok(BodyRequest::Whole(body_digest.to_owned())), &slice)
+                }
+                Some(other) => Err(CceError::ArtifactCorrupt(format!(
+                    "unknown descriptor version {other}"
+                ))),
+            }
+        }
+        _ => address.map_or_else(|| Ok(BodyRequest::Whole(body_digest.to_owned())), &slice),
     }
 }
 
@@ -4065,5 +4253,245 @@ mod tests {
             matches!(error, Err(CceError::ArtifactCorrupt(_))),
             "unknown descriptor version must error, got {error:?}"
         );
+    }
+    /// `documents_by_ids` materializes exactly the requested documents —
+    /// in input order, deduplicated, skipping misses — and reads each
+    /// distinct body artifact at most once.
+    #[test]
+    fn documents_by_ids_materializes_only_the_hit_set() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        store
+            .register_repository(&RepositoryIdentity {
+                id: "repo_b".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            })
+            .expect("repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_b".to_owned(),
+            repository_id: "repo_b".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 2,
+            source_bytes: 64,
+        };
+        store.begin_snapshot(&snapshot).expect("begin");
+
+        // Two source artifacts; three documents — two slice the same
+        // source file, one is a dedicated descriptor artifact.
+        let source_a = store
+            .artifacts()
+            .put_bytes(
+                crate::ArtifactKind::Source,
+                b"fn alpha() {}\nfn beta() {}\n",
+            )
+            .expect("source a");
+        let source_b = store
+            .artifacts()
+            .put_bytes(crate::ArtifactKind::Source, b"fn gamma() {}\n")
+            .expect("source b");
+        let descriptor = store
+            .artifacts()
+            .put_bytes(crate::ArtifactKind::RetrievalText, b"descriptor body")
+            .expect("descriptor");
+        let doc = |id: &str,
+                   representation: RetrievalRepresentation,
+                   digest: &str,
+                   address: Option<SourceAddress>,
+                   generated_by: Option<&str>| IndexedDocument {
+            document: RetrievalDocument {
+                id: id.to_owned(),
+                entity_id: format!("e_{id}"),
+                region_id: None,
+                snapshot_id: "snap_b".to_owned(),
+                representation,
+                body_artifact_digest: digest.to_owned(),
+                address,
+                embedding_profile: None,
+                generated_by: generated_by.map(str::to_owned),
+                evidence: Vec::new(),
+                terms: Vec::new(),
+            },
+            path: "src/a.rs".to_owned(),
+            name: id.to_owned(),
+            body: String::new(),
+        };
+        let slice_a = |start: u64, end: u64| {
+            SourceAddress::new("repo_b", "snap_b", "src/a.rs", start..end, 1..=2).expect("address")
+        };
+        let records = SnapshotRecords {
+            artifacts: vec![source_a.clone(), source_b.clone(), descriptor.clone()],
+            files: vec![
+                SourceFileRecord {
+                    path: "src/a.rs".to_owned(),
+                    language: Some("rust".to_owned()),
+                    content_hash: "ha".to_owned(),
+                    artifact: source_a.clone(),
+                    byte_count: 27,
+                    line_count: 2,
+                    analysis_artifact_digest: None,
+                },
+                SourceFileRecord {
+                    path: "src/b.rs".to_owned(),
+                    language: Some("rust".to_owned()),
+                    content_hash: "hb".to_owned(),
+                    artifact: source_b.clone(),
+                    byte_count: 14,
+                    line_count: 1,
+                    analysis_artifact_digest: None,
+                },
+            ],
+            documents: vec![
+                doc(
+                    "d_alpha",
+                    RetrievalRepresentation::RawCode,
+                    &source_a.digest,
+                    Some(slice_a(0, 14)),
+                    None,
+                ),
+                doc(
+                    "d_beta",
+                    RetrievalRepresentation::RawCode,
+                    &source_a.digest,
+                    Some(slice_a(14, 27)),
+                    None,
+                ),
+                doc(
+                    "d_gamma",
+                    RetrievalRepresentation::RawCode,
+                    &source_b.digest,
+                    Some(
+                        SourceAddress::new("repo_b", "snap_b", "src/b.rs", 0..14, 1..=1)
+                            .expect("address"),
+                    ),
+                    None,
+                ),
+                doc(
+                    "d_desc",
+                    RetrievalRepresentation::FileDescriptor,
+                    &descriptor.digest,
+                    None,
+                    Some("cce-file-descriptor-v2"),
+                ),
+            ],
+            ..SnapshotRecords::default()
+        };
+        store.commit_snapshot(&snapshot, &records).expect("commit");
+
+        // Empty input reads nothing at all.
+        let before = store.artifacts().read_count();
+        assert!(
+            store
+                .documents_by_ids("snap_b", &[])
+                .expect("empty")
+                .is_empty()
+        );
+        assert_eq!(store.artifacts().read_count(), before);
+
+        // Input order, deduped, missing ids skipped.
+        let contents = store
+            .documents_by_ids(
+                "snap_b",
+                &[
+                    "d_beta".to_owned(),
+                    "d_alpha".to_owned(),
+                    "d_missing".to_owned(),
+                    "d_beta".to_owned(),
+                    "d_desc".to_owned(),
+                ],
+            )
+            .expect("by ids");
+        let ids: Vec<&str> = contents
+            .iter()
+            .map(|doc| doc.document_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["d_beta", "d_alpha", "d_desc"]);
+        assert_eq!(contents[0].text, "fn beta() {}\n");
+        assert_eq!(contents[1].text, "fn alpha() {}\n");
+        assert_eq!(contents[2].text, "descriptor body");
+
+        // d_beta + d_alpha share src/a.rs's artifact, d_desc is its own:
+        // exactly two artifact reads for three documents.
+        let reads = store.artifacts().read_count() - before;
+        assert_eq!(reads, 2, "each body artifact read once, got {reads}");
+
+        // Cross-snapshot binding: an id belonging to another snapshot is
+        // skipped, never rebound onto this snapshot's rows.
+        let other = SnapshotIdentity {
+            id: "snap_other".to_owned(),
+            repository_id: "repo_b".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay2".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        store.begin_snapshot(&other).expect("begin other");
+        let foreign = store
+            .artifacts()
+            .put_bytes(crate::ArtifactKind::Source, b"foreign body")
+            .expect("foreign artifact");
+        store
+            .commit_snapshot(
+                &other,
+                &SnapshotRecords {
+                    artifacts: vec![foreign.clone()],
+                    documents: vec![IndexedDocument {
+                        document: RetrievalDocument {
+                            id: "d_foreign".to_owned(),
+                            entity_id: "e_foreign".to_owned(),
+                            region_id: None,
+                            snapshot_id: "snap_other".to_owned(),
+                            representation: RetrievalRepresentation::FileDescriptor,
+                            body_artifact_digest: foreign.digest,
+                            address: None,
+                            embedding_profile: None,
+                            generated_by: Some("cce-file-descriptor-v2".to_owned()),
+                            evidence: Vec::new(),
+                            terms: Vec::new(),
+                        },
+                        path: "src/f.rs".to_owned(),
+                        name: "foreign".to_owned(),
+                        body: String::new(),
+                    }],
+                    ..SnapshotRecords::default()
+                },
+            )
+            .expect("commit other");
+        assert!(
+            store
+                .documents_by_ids("snap_b", &["d_foreign".to_owned()])
+                .expect("scoped")
+                .is_empty(),
+            "foreign snapshot's document must not resolve under snap_b"
+        );
+
+        // Bodies equal the full-snapshot projection for the same ids.
+        let all = store.documents_for_snapshot("snap_b").expect("all docs");
+        let projected: HashMap<_, _> = all
+            .iter()
+            .map(|doc| (doc.document_id.as_str(), doc.text.as_str()))
+            .collect();
+        let subset = store
+            .documents_by_ids(
+                "snap_b",
+                &[
+                    "d_alpha".to_owned(),
+                    "d_desc".to_owned(),
+                    "d_gamma".to_owned(),
+                ],
+            )
+            .expect("subset");
+        for doc in &subset {
+            assert_eq!(
+                Some(doc.text.as_str()),
+                projected.get(doc.document_id.as_str()).copied(),
+                "by_ids text must equal the full-snapshot projection"
+            );
+        }
     }
 }
