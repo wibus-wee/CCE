@@ -16,11 +16,12 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use utoipa::{OpenApi as _, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_swagger_ui::SwaggerUi;
@@ -299,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
             .default_worker
             .map(|url| url.trim_end_matches('/').to_owned()),
     });
+    let request_id = HeaderName::from_static("x-request-id");
     let (api_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(health))
         .routes(routes!(list_repos))
@@ -321,6 +323,12 @@ async fn main() -> anyhow::Result<()> {
         // and repeats, so compression buys 5-10x wire reduction. Applied
         // after body-limit so request sizes are unaffected.
         .layer(tower_http::compression::CompressionLayer::new())
+        // Request ids: generate when the caller didn't supply one, echo
+        // back in the response. The proxy's header copy carries it
+        // upstream, so gateway and worker logs share the correlation id
+        // — same layers the daemon applies.
+        .layer(PropagateRequestIdLayer::new(request_id.clone()))
+        .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
         .with_state(state.clone());
     if let Some(web_root) = arguments.web_root {
         router = router.nest_service(
