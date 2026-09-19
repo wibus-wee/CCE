@@ -53,10 +53,20 @@ agents ───▶ MCP endpoint     ├─ /                  static web UI
   only when its slug matches.
 - Freshness is push-time: queries serve the last pushed tree. The
   gateway's `lastPush` record carries the source git revision.
-- Scaling out: add another `worker-b` service pinned to a different
-  `CCE_WORKER_REPO`, mount the shared `cce-sources` volume, and register
-  the repo explicitly (`POST /v1/repos` with `workerUrl`) instead of
-  relying on `--default-worker`.
+- Scaling out: workers are not scaled by replica count — each owns one
+  repo slug plus a private data volume, so horizontal scale is more
+  services. `--profile multi` brings up a ready-made second `worker2`
+  (`CCE_WORKER2_REPO`, default `worker2`) on the shared `cce-sources`
+  volume; register it explicitly (`POST /v1/repos` with `workerUrl`)
+  rather than relying on `--default-worker`. `POST /v1/search/all`
+  fans a query out across every registered repo and merges ranked hits,
+  listing unreachable workers under `degraded` instead of failing.
+- Verification: `research/e2e_gateway.py` runs the built gateway binary
+  against stub workers and asserts fan-out/degraded/cache/breaker/
+  metrics (CI job `gateway-e2e`); `deploy/e2e-fanout.sh` drives the real
+  compose topology end-to-end — push → materialize → index → merge →
+  degrade. `research/loadtest.py` sweeps concurrency and reports
+  QPS/p50/p95/p99 plus cache-hit ratio for baseline numbers.
 - The Web UI auto-detects its host: behind a gateway it shows a repository
   selector and proxies calls under `/{slug}/v1/*`; behind a standalone
   daemon it talks to `/v1/*` directly.

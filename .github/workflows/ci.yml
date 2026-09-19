@@ -25,6 +25,19 @@ jobs:
           tool: cargo-nextest@0.9.145
       - run: cargo nextest run --workspace --all-features --locked
 
+  # Gateway production mechanics against stub workers — no embedding
+  # model needed: fan-out merge, degraded tolerance, cache replay,
+  # breaker fast-fail, metrics surfaces. Complements the unit tests,
+  # which cannot see cross-process behavior.
+  gateway-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: cargo build -p cce-gateway --locked
+      - run: python3 research/e2e_gateway.py --gateway ./target/debug/cce-gateway
+
   # Verifies the declared `rust-version` floor, not just the pinned toolchain.
   msrv:
     runs-on: ubuntu-latest

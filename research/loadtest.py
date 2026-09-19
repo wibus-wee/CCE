@@ -5,8 +5,11 @@ per level: wall time, achieved QPS, latency p50/p95/p99 (ms), error count
 (transport errors + non-2xx, with a status-code distribution), and — when
 the header is present — the share of responses carrying ``x-cce-cache: hit``.
 
-Example:
-    python research/loadtest.py http://127.0.0.1:7820/v1/search/all --method POST --body '{"query":"x","limit":10}' --concurrency 1,8,32 --requests 200
+Example::
+
+    python research/loadtest.py http://127.0.0.1:7820/v1/search/all \
+        --method POST --body '{"query":"x","limit":10}' \
+        --concurrency 1,8,32 --requests 200
 
 Python standard library only. Lives in research/ per the repo's
 Python-confinement rule: this is infra tooling, not an algorithm experiment.
@@ -15,6 +18,7 @@ Python-confinement rule: this is infra tooling, not an algorithm experiment.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import itertools
 import json
 import sys
@@ -162,10 +166,8 @@ def send_once(opener, url, method, headers, body, timeout):
             status = resp.status
             cache = resp.headers.get(CACHE_HEADER)
     except urllib.error.HTTPError as exc:
-        try:
+        with contextlib.suppress(Exception):
             exc.read()
-        except Exception:
-            pass
         status = exc.code
         cache = exc.headers.get(CACHE_HEADER) if exc.headers else None
     except Exception:

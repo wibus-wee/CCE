@@ -97,6 +97,57 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Second worker for fan-out deployments. Workers are not scaled by
+  # replica count: each owns exactly one repo (CCE_WORKER_REPO) plus a
+  # private data volume, so horizontal scale = more services. Deliberately
+  # no depends_on edge from the gateway — backends may come and go and
+  # the gateway answers with `degraded` semantics, which is the point of
+  # exercising this topology.
+  #   docker compose --profile multi up -d --build
+  worker2:
+    profiles: ["multi"]
+    build: .
+    image: cce:latest
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - mkdir -p "/sources/${CCE_WORKER_REPO:-worker2}" &&
+        exec cce-daemon
+        "/sources/${CCE_WORKER_REPO:-worker2}"
+        --data-dir /var/lib/cce
+        --bind 0.0.0.0:7734
+        --allow-non-loopback
+    environment:
+      CCE_WORKER_REPO: ${CCE_WORKER2_REPO:-worker2}
+      CCE_DENSE: ${CCE_DENSE:-local}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - cce-sources:/sources
+      - cce-worker2-data:/var/lib/cce
+    tmpfs:
+      - /tmp
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7734/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: "4"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   # Original single-service layout — the daemon reads a live, read-only
   # worktree mount instead of pushed snapshots. No gateway involved.
   #   CCE_REPO=/path/to/repo docker compose --profile standalone up -d cce
@@ -142,4 +193,5 @@ volumes:
   cce-gateway-state:
   cce-sources:
   cce-worker-data:
+  cce-worker2-data:
   cce-standalone-data:
