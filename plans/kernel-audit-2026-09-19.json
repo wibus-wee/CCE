@@ -1,0 +1,32 @@
+{
+  "date": "2026-09-19",
+  "head": "d7c2c2a1a6110637d3912124659187e99c6c49bc",
+  "basis": "HEAD plus existing uncommitted work; hashes identify the reviewed files, not a clean commit or a reproducible build",
+  "files": {
+    "crates/cce-core/src/context.rs": "eec4e10a91a981e9ca75501132e4036f9567cd798b28bef5c203b5e3759b97f9",
+    "crates/cce-core/src/retrieval.rs": "5b7a65795edcaeb986c3b1e042e670d7ad97acf1a13a1b067b2fb55427c3c596",
+    "crates/cce-core/src/snapshot.rs": "7622a5e98178ffce35652412cc01bc34caf8ac2fd67db2ca5f29b98586c171a3",
+    "crates/cce-engine/src/config.rs": "092288970cc3e747a680ad923966942ab24039cc22798fc52c1dc9bb9c95a01b",
+    "crates/cce-engine/src/engine.rs": "7e3d9e69397e268aab167684cc4f811e31bbe61d6403d9acc37161fd39440376",
+    "crates/cce-engine/src/retrieval.rs": "7c31637a013f90144da35d0d6020a0ccdea62d39177009b6cede17c792114fed",
+    "crates/cce-engine/src/context.rs": "93e5cec9635693d9e302748e815e4a5ebbb86175d9bab28caa911117b5bc1daa",
+    "crates/cce-engine/src/dense.rs": "e894a697dab6816c8107a77df27dde2975dd5aedca8cb5f02df9ba521874fc98",
+    "crates/cce-engine/src/parser.rs": "f0e38e99882e2e93daa6cae4d8e257334a3fcff234951ede2e86827b1038ddc6",
+    "crates/cce-engine/src/scip.rs": "46e17ddeac3b9074d2de4eea82b10fef166cf01446e2d3d11ecf3edcfb30481c",
+    "crates/cce-engine/src/relations.rs": "30f20e13a23d52781c469a9321882cd0b20a1aa330e80316370562f87147e1a6",
+    "crates/cce-engine/src/providers.rs": "fd82725903fe8a3521c79c3f3a3d2e566e37fdc42e4869eeaa4f335e575d4247",
+    "crates/cce-engine/src/repository.rs": "2b3aa554ea0747456b233bff41d787df364fa988ee5ded2c7781d2c8ff566ccb",
+    "crates/cce-engine/tests/integration.rs": "58b1ba3ebfa7717bb323945bb48341705f0bb714af975a2cd36639add178c7eb",
+    "crates/cce-store/src/metadata.rs": "8f07bf66d8677ba7a51910941035742ba745cb4fd30db2129be7fecd5fc32c66",
+    "crates/cce-store/src/artifact.rs": "111df50ce446f11010a79eb41e1284e4568778e9687fd7745f6b311723e55aad",
+    "research/cce_research/schema.py": "38b9216884206c6e58cee8b6081bc2b4ac9b73c1154e46cac988fea95f8e900f",
+    "research/cce_research/adapters.py": "a3cdeefa3701ae18a7456e9f08ea094dc4c69b17b7eb4f926fd42577426c1052",
+    "research/cce_research/metrics.py": "51ca910d09ac6e6da02b77f877aca35835fe836b682a54079a333efcc4b9b979",
+    "research/cce_research/cli.py": "341e7edffa3492969e12c7177ba1089777528eedc509298cb04f9c6b83309a21",
+    "research/tests/test_metrics.py": "37a281c1e7c18c15a641a94c0fc7858cf7e8bbd82f16a0ab2609a93d7ee70620",
+    "research/tests/test_adapters.py": "9de375349c60d984097110c010804f020dc2c437cecc20efaadb7fa4ec5cce40",
+    "benchmarks/datasets/cce-self.jsonl": "3ad10097501e46c89734dc56e8a812b63ddb6ea8f557572fca026443f923f37c",
+    "benchmarks/results/self-v12-search.jsonl": "932698849f1ef1b868da5a4bc83a7d791aee1526e8902794db59e6f6942df7c9",
+    "benchmarks/results/self-v12-search.jsonl.manifest.json": "b602ca97f09661fc2f035c29dea9d744c4d97fd0dfd4615da6e05d507280b5f0"
+  }
+}

@@ -1,5 +1,12 @@
 # Plan 009: World-model surface — structural operators, source→sink dataflow, and federated query fan-out
 
+> **STALE — reconciled 2026-09-19.** Re-scope this historical plan before
+> execution: export/snapshot-diff and federation have existing implementations.
+> Calls/References reachability does not establish value flow or precise
+> source-to-sink taint. Do not promote PreciseDataflow to Ready using the
+> original Track B instructions. The [current index](README.md) and
+> [kernel audit](kernel-audit-2026-09-19.md) own the active work queue.
+
 > **Executor instructions**: Follow this plan step by step. Run every
 > verification command and confirm the expected result before moving to the
 > next step. If anything in the "STOP conditions" section occurs, stop and

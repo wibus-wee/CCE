@@ -1,5 +1,12 @@
 # Plan 008: Evidence paths — principled abstention and fact-granularity emission from graph flow
 
+> **STALE — reconciled 2026-09-19.** This is a historical design, not a
+> ready-to-execute plan. Evidence paths and SearchVerdict already exist in
+> the current worktree; its baseline numbers and commands are outdated.
+> Continue context delivery work through [017](017-preserve-verdict-through-context.md).
+> Revalidate the abstention policy separately; do not enable a disabled gate
+> merely to follow this document. See the [current index](README.md).
+
 > **Executor instructions**: Follow this plan step by step. Run every
 > verification command and confirm the expected result before moving to the
 > next step. If anything in the "STOP conditions" section occurs, stop and
