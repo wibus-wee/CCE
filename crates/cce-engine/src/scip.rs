@@ -46,6 +46,33 @@ pub(crate) struct ScipIngest {
 const DEFINITION_ROLE: i32 = 1; // scip.SymbolRole.Definition bit
 const MAX_EVIDENCE_PER_EDGE: usize = 8;
 
+/// SCIP symbol identity. `local <id>` symbols are unique only within
+/// their own Document — the same spelling in another file is a different
+/// symbol, so keying them globally would fabricate cross-file edges at
+/// confidence 1.0. Everything else is a global descriptor and resolves
+/// across documents.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SymbolKey {
+    Global(String),
+    Local { path: String, symbol: String },
+}
+
+impl SymbolKey {
+    /// The only constructor — every lookup in definitions, references
+    /// and relationships goes through it, so the three resolution paths
+    /// can never disagree about scope. Only the exact SCIP spelling
+    /// `local <id>` scopes to a document; no substring guessing.
+    fn of(symbol: &str, document_path: &str) -> Self {
+        symbol.strip_prefix("local ").map_or_else(
+            || Self::Global(symbol.to_owned()),
+            |rest| Self::Local {
+                path: document_path.to_owned(),
+                symbol: rest.trim().to_owned(),
+            },
+        )
+    }
+}
+
 /// One non-definition occurrence awaiting symbol resolution.
 struct ReferenceSite {
     path: String,
@@ -83,7 +110,7 @@ pub(crate) fn ingest(bytes: &[u8], context: &ScipContext<'_>) -> Result<ScipInge
     // Pass 1: definitions (symbol → defining entity + site) and raw
     // reference sites. Resolution needs the complete definition map, so
     // references and relationships emit afterwards.
-    let mut definitions: HashMap<String, (String, SourceAddress)> = HashMap::new();
+    let mut definitions: HashMap<SymbolKey, (String, SourceAddress)> = HashMap::new();
     let mut sites: Vec<(String, ReferenceSite)> = Vec::new();
     for document in &index.documents {
         let path = normalize_path(&document.relative_path);
@@ -110,7 +137,7 @@ pub(crate) fn ingest(bytes: &[u8], context: &ScipContext<'_>) -> Result<ScipInge
             if occurrence.symbol_roles & DEFINITION_ROLE != 0 {
                 if let Some(address) = site_address(context, &path, range, bytes, &entity) {
                     definitions
-                        .entry(occurrence.symbol.clone())
+                        .entry(SymbolKey::of(&occurrence.symbol, &path))
                         .or_insert((entity, address));
                     outcome.definitions += 1;
                 }
@@ -130,12 +157,12 @@ pub(crate) fn ingest(bytes: &[u8], context: &ScipContext<'_>) -> Result<ScipInge
 
     // Pass 2: references resolve through the definition map. Unresolved
     // symbols are external — counted, never fabricated into entities.
-    let mut external: HashSet<String> = HashSet::new();
+    let mut external: HashSet<SymbolKey> = HashSet::new();
     let mut evidence: HashMap<(String, String), Vec<SourceAddress>> = HashMap::new();
     let mut order: Vec<(String, String)> = Vec::new();
     for (symbol, site) in sites {
-        let Some(target) = definitions.get(&symbol) else {
-            external.insert(symbol);
+        let Some(target) = definitions.get(&SymbolKey::of(&symbol, &site.path)) else {
+            external.insert(SymbolKey::of(&symbol, &site.path));
             continue;
         };
         let target_entity = &target.0;
@@ -161,12 +188,19 @@ pub(crate) fn ingest(bytes: &[u8], context: &ScipContext<'_>) -> Result<ScipInge
     // `S implements T`. Both sides must resolve to ingested definitions.
     let extractor = format!("scip:{}", outcome.tool);
     for document in &index.documents {
+        // SymbolInformation lives on the document that owns the symbol —
+        // locals on either side of a relationship resolve inside it.
+        let document_path = normalize_path(&document.relative_path);
         for info in &document.symbols {
-            let Some((source_entity, source_site)) = definitions.get(&info.symbol) else {
+            let Some((source_entity, source_site)) =
+                definitions.get(&SymbolKey::of(&info.symbol, &document_path))
+            else {
                 continue;
             };
             for relationship in &info.relationships {
-                let Some((target_entity, _)) = definitions.get(&relationship.symbol) else {
+                let Some((target_entity, _)) =
+                    definitions.get(&SymbolKey::of(&relationship.symbol, &document_path))
+                else {
                     continue;
                 };
                 let kind = if relationship.is_implementation {
@@ -429,6 +463,168 @@ mod tests {
         assert_eq!(edge.kind, RelationKind::References);
         assert!(!edge.evidence.is_empty());
         assert_eq!(outcome.tool, "fixture-analyzer 1.0.0");
+    }
+
+    /// Two documents each define `local 0` on a different entity. Local
+    /// identity is document-scoped: refs must land on their own file's
+    /// entity, never borrow the other file's definition. A shared global
+    /// symbol still resolves across files, and `SymbolInformation`
+    /// relationships honor the same scope on both sides.
+    #[test]
+    fn local_symbols_resolve_within_their_document() {
+        use scip::types::Relationship;
+
+        let mut index = Index::new();
+        let mut metadata = Metadata::new();
+        let mut tool = ToolInfo::new();
+        tool.name = "fixture-analyzer".to_owned();
+        tool.version = "1.0.0".to_owned();
+        metadata.tool_info = MessageField::some(tool);
+        metadata.text_document_encoding = EnumOrUnknown::new(TextEncoding::UTF8);
+        index.metadata = MessageField::some(metadata);
+
+        let occurrence = |range: &[i32], symbol: &str, roles: i32| {
+            let mut occurrence = Occurrence::new();
+            occurrence.range = range.to_vec();
+            occurrence.symbol = symbol.to_owned();
+            occurrence.symbol_roles = roles;
+            occurrence
+        };
+
+        // src/a.rs: "fn alpha() {}\nfn use_a() {\n    alpha()\n}\nfn shared() {}\n"
+        let mut doc_a = Document::new();
+        doc_a.relative_path = "src/a.rs".to_owned();
+        doc_a.occurrences = vec![
+            occurrence(&[0, 3, 0, 8], "local 0", DEFINITION_ROLE), // alpha
+            occurrence(&[2, 4, 2, 9], "local 0", 8),               // alpha() in use_a
+            occurrence(&[4, 3, 4, 9], "shared . shared().", DEFINITION_ROLE),
+        ];
+        let mut info_a = SymbolInformation::new();
+        info_a.symbol = "local 0".to_owned();
+        let mut rel_a = Relationship::new();
+        rel_a.symbol = "shared . shared().".to_owned();
+        rel_a.is_reference = true;
+        info_a.relationships = vec![rel_a];
+        doc_a.symbols = vec![info_a];
+
+        // src/b.rs: "fn beta() {}\nfn use_b() {\n    beta()\n    shared()\n}\n"
+        let mut doc_b = Document::new();
+        doc_b.relative_path = "src/b.rs".to_owned();
+        doc_b.occurrences = vec![
+            occurrence(&[0, 3, 0, 7], "local 0", DEFINITION_ROLE), // beta
+            occurrence(&[2, 4, 2, 8], "local 0", 8),               // beta() in use_b
+            occurrence(&[3, 4, 3, 10], "shared . shared().", 8),   // shared() in use_b
+        ];
+        let mut info_b = SymbolInformation::new();
+        info_b.symbol = "local 0".to_owned();
+        let mut rel_b = Relationship::new();
+        rel_b.symbol = "shared . shared().".to_owned();
+        rel_b.is_reference = true;
+        info_b.relationships = vec![rel_b];
+        doc_b.symbols = vec![info_b];
+
+        index.documents = vec![doc_a, doc_b];
+        let bytes = index.write_to_bytes().expect("serialize fixture index");
+
+        let text_a = "fn alpha() {}\nfn use_a() {\n    alpha()\n}\nfn shared() {}\n";
+        let text_b = "fn beta() {}\nfn use_b() {\n    beta()\n    shared()\n}\n";
+        let texts = HashMap::from([
+            ("src/a.rs".to_owned(), text_a.to_owned()),
+            ("src/b.rs".to_owned(), text_b.to_owned()),
+        ]);
+        let ranges = HashMap::from([
+            (
+                "src/a.rs".to_owned(),
+                vec![
+                    (0, 13, "e-alpha".to_owned()),
+                    (14, 38, "e-use-a".to_owned()),
+                    (39, 52, "e-shared".to_owned()),
+                    (0, text_a.len(), "e-file-a".to_owned()),
+                ],
+            ),
+            (
+                "src/b.rs".to_owned(),
+                vec![
+                    (0, 12, "e-beta".to_owned()),
+                    (13, 47, "e-use-b".to_owned()),
+                    (0, text_b.len(), "e-file-b".to_owned()),
+                ],
+            ),
+        ]);
+        let context = fixture_context(&ranges, &texts);
+        let outcome = ingest(&bytes, &context).expect("ingest");
+
+        let edges: Vec<(String, String)> = outcome
+            .relations
+            .iter()
+            .map(|r| (r.source_entity_id.clone(), r.target_entity_id.clone()))
+            .collect();
+        // Local refs land on the same document's entity — never phantom
+        // cross-file edges at scip confidence 1.0.
+        assert!(edges.contains(&("e-use-a".to_owned(), "e-alpha".to_owned())));
+        assert!(edges.contains(&("e-use-b".to_owned(), "e-beta".to_owned())));
+        assert!(!edges.contains(&("e-use-b".to_owned(), "e-alpha".to_owned())));
+        assert!(!edges.contains(&("e-use-a".to_owned(), "e-beta".to_owned())));
+        // Globals still resolve across documents.
+        assert!(edges.contains(&("e-use-b".to_owned(), "e-shared".to_owned())));
+        // Relationships scope both sides to their owning document: doc a's
+        // local 0 is alpha, doc b's is beta.
+        assert!(edges.contains(&("e-alpha".to_owned(), "e-shared".to_owned())));
+        assert!(edges.contains(&("e-beta".to_owned(), "e-shared".to_owned())));
+        assert_eq!(outcome.definitions, 3);
+        assert_eq!(outcome.external_symbols, 0);
+    }
+
+    /// A local symbol with no definition in its own document is external —
+    /// it must not borrow another document's `local 0` just because the
+    /// spelling matches.
+    #[test]
+    fn undefined_local_stays_external() {
+        let mut index = Index::new();
+        let mut defined = Document::new();
+        defined.relative_path = "src/has_def.rs".to_owned();
+        let mut definition = Occurrence::new();
+        definition.range = vec![0, 3, 0, 8];
+        definition.symbol = "local 0".to_owned();
+        definition.symbol_roles = DEFINITION_ROLE;
+        defined.occurrences = vec![definition];
+        let mut bare = Document::new();
+        bare.relative_path = "src/only_ref.rs".to_owned();
+        let mut reference = Occurrence::new();
+        reference.range = vec![1, 4, 1, 8];
+        reference.symbol = "local 0".to_owned();
+        reference.symbol_roles = 8;
+        bare.occurrences = vec![reference];
+        index.documents = vec![defined, bare];
+        let bytes = index.write_to_bytes().expect("serialize");
+
+        let text_def = "fn alpha() {}\n";
+        let text_ref = "fn f() {\n    beta()\n}\n";
+        let texts = HashMap::from([
+            ("src/has_def.rs".to_owned(), text_def.to_owned()),
+            ("src/only_ref.rs".to_owned(), text_ref.to_owned()),
+        ]);
+        let ranges = HashMap::from([
+            (
+                "src/has_def.rs".to_owned(),
+                vec![
+                    (0, 13, "e-alpha".to_owned()),
+                    (0, text_def.len(), "e-file-def".to_owned()),
+                ],
+            ),
+            (
+                "src/only_ref.rs".to_owned(),
+                vec![
+                    (0, 9, "e-f".to_owned()),
+                    (0, text_ref.len(), "e-file-ref".to_owned()),
+                ],
+            ),
+        ]);
+        let context = fixture_context(&ranges, &texts);
+        let outcome = ingest(&bytes, &context).expect("ingest");
+        assert_eq!(outcome.definitions, 1);
+        assert_eq!(outcome.external_symbols, 1);
+        assert!(outcome.relations.is_empty());
     }
 
     #[test]

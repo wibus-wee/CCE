@@ -310,6 +310,9 @@ fn call_relations(context: &RelationContext<'_>) -> Vec<Relation> {
         let Some(file_id) = context.file_entities.get(&file.relative_path) else {
             continue;
         };
+        // Dedup on the edge identity — (caller, callee) — not on the
+        // callee alone: two different callers invoking one helper are two
+        // real edges, while a repeated call from the same caller is one.
         let mut emitted = HashSet::new();
         for call in &parsed.calls {
             let caller_id = call
@@ -319,7 +322,9 @@ fn call_relations(context: &RelationContext<'_>) -> Vec<Relation> {
             let Some(callee) = resolve_callee(&call.name, &file.relative_path, context) else {
                 continue;
             };
-            if callee.entity_id == *caller_id || !emitted.insert(callee.entity_id.clone()) {
+            if callee.entity_id == *caller_id
+                || !emitted.insert((caller_id.clone(), callee.entity_id.clone()))
+            {
                 continue;
             }
             let evidence = call_site_address(context, file, text, call.start_byte, call.end_byte);
@@ -332,7 +337,7 @@ fn call_relations(context: &RelationContext<'_>) -> Vec<Relation> {
                 confidence: 0.6,
                 snapshot_id: context.snapshot_id.to_owned(),
                 extractor: format!(
-                    "cce-call-extract-v1:{}",
+                    "cce-call-extract-v2:{}",
                     parsed.parser.as_deref().unwrap_or("unknown")
                 ),
                 evidence: evidence.into_iter().collect(),
@@ -414,6 +419,9 @@ fn type_reference_relations(context: &RelationContext<'_>) -> Vec<Relation> {
         let Some(file_id) = context.file_entities.get(&file.relative_path) else {
             continue;
         };
+        // Same edge-identity rule as call_relations: (source, target).
+        // Two units referencing one type are two edges; a unit spelling the
+        // type twice is one.
         let mut emitted = HashSet::new();
         for (index, unit) in parsed.units.iter().enumerate() {
             let source_id = unit_ids.get(index).unwrap_or(file_id);
@@ -422,7 +430,9 @@ fn type_reference_relations(context: &RelationContext<'_>) -> Vec<Relation> {
                 else {
                     continue;
                 };
-                if target.entity_id == *source_id || !emitted.insert(target.entity_id.clone()) {
+                if target.entity_id == *source_id
+                    || !emitted.insert((source_id.clone(), target.entity_id.clone()))
+                {
                     continue;
                 }
                 let evidence = SourceAddress::new(
@@ -442,7 +452,7 @@ fn type_reference_relations(context: &RelationContext<'_>) -> Vec<Relation> {
                     confidence: 0.55,
                     snapshot_id: context.snapshot_id.to_owned(),
                     extractor: format!(
-                        "cce-type-ref-v1:{}",
+                        "cce-type-ref-v2:{}",
                         parsed.parser.as_deref().unwrap_or("unknown")
                     ),
                     evidence: evidence.into_iter().collect(),

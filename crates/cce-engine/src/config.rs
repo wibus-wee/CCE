@@ -179,15 +179,22 @@ impl EngineConfig {
         // extractor changes shape.
         options.insert("history_diff".to_owned(), "v1".to_owned());
         // Provider output changes the snapshot; toggling or upgrading the
-        // ingest must produce a fresh profile hash.
+        // ingest must produce a fresh profile hash. v2 scopes `local`
+        // symbols to their owning document.
         options.insert(
             "scip_ingest".to_owned(),
             if self.providers.enabled {
-                "v1".to_owned()
+                "v2".to_owned()
             } else {
                 "off".to_owned()
             },
         );
+        // Call-edge materialization versioning, independent of SCIP:
+        // v2 dedups on (caller, callee) so distinct callers to one callee
+        // all survive. Snapshots built under v1 silently dropped edges.
+        options.insert("call_edges".to_owned(), "v2".to_owned());
+        // Same rule for type references: v2 dedups on (source, target).
+        options.insert("type_refs".to_owned(), "v2".to_owned());
         IndexProfile {
             schema_version: DATA_FORMAT_VERSION,
             engine_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -197,5 +204,70 @@ impl EngineConfig {
             embedding_revision: None,
             options,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile_hash(profile: &IndexProfile) -> String {
+        blake3::hash(&serde_json::to_vec(profile).expect("profile json"))
+            .to_hex()
+            .to_string()
+    }
+
+    /// Graph materialization versions ride the profile: a snapshot built
+    /// under v1 keying/dedup rules must not hash-match the corrected v2
+    /// profile, or its wrong edges would silently satisfy new queries.
+    #[test]
+    fn graph_materialization_versions_are_profiled() {
+        let config = EngineConfig::for_repository("/tmp/repo");
+        let profile = config.profile();
+        assert_eq!(
+            profile.options.get("scip_ingest").map(String::as_str),
+            Some("v2")
+        );
+        assert_eq!(
+            profile.options.get("call_edges").map(String::as_str),
+            Some("v2")
+        );
+        assert_eq!(
+            profile.options.get("type_refs").map(String::as_str),
+            Some("v2")
+        );
+
+        let mut legacy = profile.clone();
+        legacy
+            .options
+            .insert("scip_ingest".to_owned(), "v1".to_owned());
+        legacy
+            .options
+            .insert("call_edges".to_owned(), "v1".to_owned());
+        legacy
+            .options
+            .insert("type_refs".to_owned(), "v1".to_owned());
+        assert_ne!(
+            profile_hash(&profile),
+            profile_hash(&legacy),
+            "v1 graph materializations must not hash-match the v2 profile"
+        );
+    }
+
+    #[test]
+    fn disabled_providers_profile_as_off() {
+        let mut config = EngineConfig::for_repository("/tmp/repo");
+        config.providers.enabled = false;
+        let profile = config.profile();
+        assert_eq!(
+            profile.options.get("scip_ingest").map(String::as_str),
+            Some("off")
+        );
+        // Call-edge extraction is tree-sitter based — unaffected by the
+        // provider switch.
+        assert_eq!(
+            profile.options.get("call_edges").map(String::as_str),
+            Some("v2")
+        );
     }
 }

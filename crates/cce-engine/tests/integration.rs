@@ -291,6 +291,127 @@ async fn typed_relations_carry_provenance_and_confidence() {
     );
 }
 
+/// Call edges dedup on (caller, callee), not callee alone: two callers in
+/// the same file invoking one helper are two edges, while a repeated call
+/// from the same caller is still one.
+#[tokio::test]
+async fn graph_distinct_callers_survive_dedup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        dir.path(),
+        "src/helper.rs",
+        "pub fn helper() -> u32 {\n    1\n}\n",
+    );
+    write(
+        dir.path(),
+        "src/callers.rs",
+        "pub fn a() -> u32 {\n    helper() + helper()\n}\n\npub fn b() -> u32 {\n    helper()\n}\n",
+    );
+    let engine = engine(dir.path());
+    let report = engine.index().await.expect("index");
+
+    let calls = engine
+        .store()
+        .relations_by_kind(&report.snapshot.id, &cce_core::RelationKind::Calls, 64)
+        .expect("calls relations");
+    let to_helper: Vec<_> = calls
+        .iter()
+        .filter(|relation| {
+            relation
+                .attributes
+                .get("calleeName")
+                .and_then(|value| value.as_str())
+                == Some("helper")
+        })
+        .collect();
+    let sources: std::collections::BTreeSet<_> = to_helper
+        .iter()
+        .map(|r| r.source_entity_id.clone())
+        .collect();
+    assert_eq!(
+        sources.len(),
+        2,
+        "a→helper and b→helper are two edges; repeated a→helper stays one: {:?}",
+        calls
+            .iter()
+            .map(|relation| (
+                relation.source_entity_id.clone(),
+                relation.target_entity_id.clone()
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    // Both callers surface through impact analysis.
+    let impact = engine.impact_analysis("helper").expect("impact on helper");
+    for caller in ["a", "b"] {
+        assert!(
+            impact
+                .impacted
+                .iter()
+                .any(|entity| entity.name == caller && entity.via == "Calls" && entity.hops == 1),
+            "expected {caller} among helper's callers: {:?}",
+            impact
+                .impacted
+                .iter()
+                .map(|entity| (entity.name.clone(), entity.via.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Type-reference edges follow the same (source, target) identity: two
+/// units in one file naming the same type produce two edges, not one.
+#[tokio::test]
+async fn type_reference_edges_dedup_per_source_target_pair() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        dir.path(),
+        "src/types.rs",
+        "pub struct Token {\n    pub id: u32,\n}\n",
+    );
+    write(
+        dir.path(),
+        "src/users.rs",
+        "pub fn make() -> Token {\n    Token { id: 1 }\n}\n\npub fn check(t: &Token) -> bool {\n    t.id > 0\n}\n",
+    );
+    let engine = engine(dir.path());
+    let report = engine.index().await.expect("index");
+
+    let references = engine
+        .store()
+        .relations_by_kind(&report.snapshot.id, &cce_core::RelationKind::References, 64)
+        .expect("references relations");
+    let to_token: Vec<_> = references
+        .iter()
+        .filter(|relation| {
+            relation
+                .attributes
+                .get("typeName")
+                .and_then(|value| value.as_str())
+                == Some("Token")
+                && relation.origin == cce_core::RelationOrigin::TreeSitter
+        })
+        .collect();
+    let sources: std::collections::BTreeSet<_> = to_token
+        .iter()
+        .map(|r| r.source_entity_id.clone())
+        .collect();
+    assert_eq!(
+        sources.len(),
+        2,
+        "make→Token and check→Token are two edges: {:?}",
+        references
+            .iter()
+            .map(|relation| {
+                (
+                    relation.source_entity_id.clone(),
+                    relation.target_entity_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn package_graph_comes_from_build_manifests() {
     let repo = workspace_fixture();
