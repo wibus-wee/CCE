@@ -1,11 +1,11 @@
 use std::{collections::HashMap, time::Instant};
 
 use cce_core::{
-    BoundArtifact, ClaimFrame, ClaimPredicate, CodeEntity, DefinedWitness, DocumentClass,
-    EntityKind, EvidenceTiers, QueryIntent, RelationKind, RelationOrigin, RelationWitness, Result,
-    RetrievalRepresentation, SearchHit, SearchRequest, SearchRoute, SearchVerdict, TermWitness,
-    VerdictState, ViewKind, ViewManifest, ViewState, WitnessReport, WitnessRequirement,
-    document_class, folded_identifier, has_cjk,
+    BindingScope, BoundArtifact, ClaimFrame, ClaimPredicate, CodeEntity, DefinedWitness,
+    DocumentClass, DrillDown, EntityKind, EvidenceTiers, QueryIntent, RelationKind, RelationOrigin,
+    RelationWitness, Result, RetrievalRepresentation, SearchHit, SearchRequest, SearchRoute,
+    SearchVerdict, TermWitness, VerdictState, ViewKind, ViewManifest, ViewState, WitnessReport,
+    WitnessRequirement, document_class, folded_identifier, has_cjk,
 };
 use cce_store::{MetadataStore, RelationDirection};
 use serde::{Deserialize, Serialize};
@@ -737,7 +737,7 @@ impl CceEngine {
             // the frontier.
             let (direction, edge_kinds) = expansion_policy(plan.graph_policy);
             let mut visited = std::collections::HashSet::new();
-            let mut frontier = ranked_candidates(&candidates)
+            let mut frontier = ranked_candidates(&candidates, &HashMap::new())
                 .into_iter()
                 .take(5)
                 .map(|candidate| (candidate.hit.entity_id.clone(), candidate.fused_score))
@@ -880,7 +880,15 @@ impl CceEngine {
             );
         }
 
-        let mut hits = self.select_hits(&request, &candidates)?;
+        // The claim's distinguishing vocabulary must exist before
+        // selection: coverage-aware selection surfaces documents
+        // carrying it that pure fusion rank would leave out.
+        frame.distinguishing_terms = resolve_distinguishing(
+            self.store(),
+            &request.snapshot_id,
+            &content_terms(&request.query),
+        )?;
+        let mut hits = self.select_hits(&request, &candidates, &frame)?;
 
         // Cross-encoder rerank: the fused order is a coarse prior from
         // route-level rank fusion. A pairwise reranker re-scores the head
@@ -978,11 +986,6 @@ impl CceEngine {
         // this result: what the evidence tiers look like, what the claim
         // required, and where the evidence fails witness typing. The
         // kernel reports; an external verifier judges.
-        frame.distinguishing_terms = resolve_distinguishing(
-            self.store(),
-            &request.snapshot_id,
-            &content_terms(&request.query),
-        )?;
         let witness = build_witness_report(self.store(), &request.snapshot_id, &frame, &hits)?;
         let evidence_tiers = EvidenceTiers {
             strict: candidates.values().filter(|c| c.strict).count(),
@@ -1010,12 +1013,14 @@ impl CceEngine {
                 reasons.push("no evidence survived the retrieval and filter gates".to_owned());
             }
         }
+        let drill_downs = build_drill_downs(&frame, &witness);
         let verdict = SearchVerdict {
             state,
             reasons,
             claim: frame,
             witness,
             evidence_tiers,
+            drill_downs,
         };
         Ok(SearchResult {
             request,
@@ -1044,12 +1049,36 @@ impl CceEngine {
         &self,
         request: &SearchRequest,
         candidates: &HashMap<String, Candidate>,
+        frame: &ClaimFrame,
     ) -> Result<Vec<SearchHit>> {
+        // Claim coverage: documents carrying distinguishing terms get a
+        // selection bonus — the claim vocabulary a hit carries is
+        // evidence, not an afterthought. One batch query per term keeps
+        // the probe bounded; `entity:` pseudo-documents are not in FTS
+        // and cannot carry terms.
+        let candidate_docs: Vec<String> = candidates
+            .values()
+            .map(|candidate| candidate.hit.document_id.clone())
+            .filter(|id| !id.starts_with("entity:"))
+            .collect();
+        let mut claim_bonus = HashMap::<String, f64>::new();
+        if !candidate_docs.is_empty() {
+            for term in &frame.distinguishing_terms {
+                for chunk in candidate_docs.chunks(500) {
+                    for document_id in
+                        self.store()
+                            .documents_matching_term(&request.snapshot_id, term, chunk)?
+                    {
+                        *claim_bonus.entry(document_id).or_default() += CLAIM_TERM_BONUS / RRF_K;
+                    }
+                }
+            }
+        }
         let mut hits: Vec<SearchHit> = Vec::new();
         let mut per_file = HashMap::<String, usize>::new();
         let mut seen_regions = HashMap::<String, usize>::new();
         let mut language_cache = HashMap::<String, Option<String>>::new();
-        for candidate in ranked_candidates(candidates) {
+        for candidate in ranked_candidates(candidates, &claim_bonus) {
             let mut hit = candidate.hit.clone();
             if !self.hit_matches_filters(
                 &hit,
@@ -1059,7 +1088,19 @@ impl CceEngine {
             )? {
                 continue;
             }
-            hit.score = candidate.fused_score;
+            hit.score = candidate.fused_score
+                + claim_bonus
+                    .get(&candidate.hit.document_id)
+                    .copied()
+                    .unwrap_or(0.0);
+            if let Some(coverage) = claim_bonus.get(&candidate.hit.document_id) {
+                if *coverage > 0.0 {
+                    hit.explanation.push(format!(
+                        "claim-term coverage: {} distinguishing term(s)",
+                        (*coverage * RRF_K / CLAIM_TERM_BONUS).round() as usize
+                    ));
+                }
+            }
             let region_key = hit.region_id.clone().unwrap_or_else(|| {
                 hit.address.as_ref().map_or_else(
                     || hit.document_id.clone(),
@@ -1335,7 +1376,7 @@ impl CceEngine {
         if plan.intent == QueryIntent::ExactEntity || !plan.routes.contains(&SearchRoute::Lexical) {
             return Ok(());
         }
-        let seeds: Vec<&Candidate> = ranked_candidates(candidates)
+        let seeds: Vec<&Candidate> = ranked_candidates(candidates, &HashMap::new())
             .into_iter()
             .filter(|candidate| {
                 candidate
@@ -1528,17 +1569,18 @@ fn apply_structural_features(
         .filter(|word| word.len() >= 3)
         .map(str::to_ascii_lowercase)
         .collect();
-    let top_paths: std::collections::HashSet<String> = ranked_candidates(candidates)
-        .into_iter()
-        .take(3)
-        .filter_map(|candidate| {
-            candidate
-                .hit
-                .address
-                .as_ref()
-                .map(|address| address.path.clone())
-        })
-        .collect();
+    let top_paths: std::collections::HashSet<String> =
+        ranked_candidates(candidates, &HashMap::new())
+            .into_iter()
+            .take(3)
+            .filter_map(|candidate| {
+                candidate
+                    .hit
+                    .address
+                    .as_ref()
+                    .map(|address| address.path.clone())
+            })
+            .collect();
     // Workspace packages as (rootDir, name); the task package set is the
     // owners of the top-3 files, mirroring the top_paths aggregation.
     let packages = store
@@ -1653,6 +1695,11 @@ const FLOW_SEED_DEGREE: usize = 64;
 const FLOW_HOPS: usize = 2;
 const FLOW_HOP_DECAY: f64 = 0.5;
 const FLOW_BONUS: f64 = 0.25;
+/// Selection bonus per distinguishing term a document carries — same
+/// magnitude as `FLOW_BONUS`/`PACKAGE_BONUS`, scaled by `/ RRF_K` at the
+/// application site. A document carrying all four terms earns four
+/// bonuses: carrying the claim's whole vocabulary is real evidence.
+const CLAIM_TERM_BONUS: f64 = 0.2;
 const FLOW_EMIT_MAX: usize = 12;
 const FLOW_FRONTIER: usize = 16;
 /// `Contains` forward conductance for FILE-KIND SEED nodes only.
@@ -2296,12 +2343,21 @@ fn add_candidate(
         });
 }
 
-fn ranked_candidates(candidates: &HashMap<String, Candidate>) -> Vec<&Candidate> {
+fn ranked_candidates<'a>(
+    candidates: &'a HashMap<String, Candidate>,
+    claim_bonus: &HashMap<String, f64>,
+) -> Vec<&'a Candidate> {
+    let effective = |candidate: &Candidate| {
+        candidate.fused_score
+            + claim_bonus
+                .get(&candidate.hit.document_id)
+                .copied()
+                .unwrap_or(0.0)
+    };
     let mut ranked = candidates.values().collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
-        right
-            .fused_score
-            .total_cmp(&left.fused_score)
+        effective(right)
+            .total_cmp(&effective(left))
             .then_with(|| left.hit.document_id.cmp(&right.hit.document_id))
     });
     ranked
@@ -2818,6 +2874,16 @@ fn relation_witness(
             64,
         )? {
             witness.edges += 1;
+            match edge.origin {
+                RelationOrigin::Compiler | RelationOrigin::Scip | RelationOrigin::Lsp => {
+                    witness.provenance.precise += 1;
+                }
+                RelationOrigin::TreeSitter => witness.provenance.syntactic += 1,
+                RelationOrigin::BuildSystem | RelationOrigin::FrameworkRule => {
+                    witness.provenance.derived += 1;
+                }
+                RelationOrigin::ModelInference => witness.provenance.inferred += 1,
+            }
             if !witness.kinds.contains(&edge.kind) {
                 witness.kinds.push(edge.kind);
             }
@@ -2888,14 +2954,39 @@ fn build_witness_report(
         )?);
     }
     let binding_artifacts = if frame.distinguishing_terms.len() >= 2 {
-        store
-            .terms_binding_paths(snapshot_id, &frame.distinguishing_terms, 10)?
-            .into_iter()
-            .map(|path| BoundArtifact {
-                class: document_class(&path),
-                path,
-            })
-            .collect()
+        let mut by_path: std::collections::BTreeMap<String, BoundArtifact> =
+            std::collections::BTreeMap::new();
+        for binding in store.terms_binding_scopes(snapshot_id, &frame.distinguishing_terms, 10)? {
+            let scope = binding
+                .entity_kind
+                .as_ref()
+                .map_or(BindingScope::File, |kind| {
+                    if code_scope_entity(kind) {
+                        BindingScope::Entity
+                    } else {
+                        BindingScope::File
+                    }
+                });
+            by_path
+                .entry(binding.path.clone())
+                .and_modify(|artifact| {
+                    if scope == BindingScope::Entity && artifact.scope == BindingScope::File {
+                        artifact.scope = BindingScope::Entity;
+                        artifact.entity.clone_from(&binding.entity_name);
+                    }
+                })
+                .or_insert_with(|| BoundArtifact {
+                    class: document_class(&binding.path),
+                    path: binding.path,
+                    scope,
+                    entity: if scope == BindingScope::Entity {
+                        binding.entity_name
+                    } else {
+                        None
+                    },
+                });
+        }
+        by_path.into_values().collect()
     } else {
         Vec::new()
     };
@@ -2922,6 +3013,31 @@ fn build_witness_report(
     })
 }
 
+/// Whether an entity kind marks one coherent code span — the
+/// entity-level binding scope. Containers (file/directory/package),
+/// historical entities (commit), documentation concepts, and
+/// unclassified entities all attest file-level scope at best.
+const fn code_scope_entity(kind: &EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Module
+            | EntityKind::Namespace
+            | EntityKind::Class
+            | EntityKind::Interface
+            | EntityKind::Trait
+            | EntityKind::Struct
+            | EntityKind::Enum
+            | EntityKind::Function
+            | EntityKind::Method
+            | EntityKind::Field
+            | EntityKind::Constant
+            | EntityKind::Route
+            | EntityKind::Schema
+            | EntityKind::Test
+            | EntityKind::Configuration
+    )
+}
+
 /// Witness gaps worth flagging on an otherwise-answered verdict. These
 /// are reports, not verdicts — a consuming verifier reads them to
 /// decide whether the hits can constitute an answer.
@@ -2942,29 +3058,40 @@ fn weak_witness_reasons(frame: &ClaimFrame, report: &WitnessReport) -> Vec<Strin
             ));
         }
     }
-    if frame.distinguishing_terms.len() >= 2
-        && !report
-            .binding_artifacts
-            .iter()
-            .any(|artifact| artifact.class == DocumentClass::Code)
-    {
-        if report.binding_artifacts.is_empty() {
-            reasons.push(format!(
-                "weak_witness: no artifact binds the claim's distinguishing terms {}",
-                quoted(&frame.distinguishing_terms)
-            ));
-        } else {
-            let paths = report
-                .binding_artifacts
-                .iter()
-                .take(3)
-                .map(|artifact| artifact.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            reasons.push(format!(
-                "weak_witness: distinguishing terms {} co-bind only in prose: {paths}",
-                quoted(&frame.distinguishing_terms)
-            ));
+    if frame.distinguishing_terms.len() >= 2 {
+        let entity_bound = report.binding_artifacts.iter().any(|artifact| {
+            artifact.class == DocumentClass::Code && artifact.scope == BindingScope::Entity
+        });
+        if !entity_bound {
+            if report.binding_artifacts.is_empty() {
+                reasons.push(format!(
+                    "weak_witness: no artifact binds the claim's distinguishing terms {}",
+                    quoted(&frame.distinguishing_terms)
+                ));
+            } else {
+                let code_bound = report
+                    .binding_artifacts
+                    .iter()
+                    .any(|artifact| artifact.class == DocumentClass::Code);
+                let paths = report
+                    .binding_artifacts
+                    .iter()
+                    .take(3)
+                    .map(|artifact| artifact.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if code_bound {
+                    reasons.push(format!(
+                        "weak_witness: distinguishing terms {} co-bind only at file scope — no single entity carries them: {paths}",
+                        quoted(&frame.distinguishing_terms)
+                    ));
+                } else {
+                    reasons.push(format!(
+                        "weak_witness: distinguishing terms {} co-bind only in prose: {paths}",
+                        quoted(&frame.distinguishing_terms)
+                    ));
+                }
+            }
         }
     }
     if !frame.distinguishing_terms.is_empty()
@@ -3029,6 +3156,97 @@ struct AbstainContext {
 /// Early-abstain assembly shared by the pre-retrieval witness gates:
 /// resolve the claim's distinguishing vocabulary for the report, then
 /// return the abstained verdict with empty hits.
+/// Deterministic follow-up queries derived from witness gaps — every
+/// suggestion runs in the query language's own filters, no model
+/// judgment. Order is fixed (history, mention, scope, relation,
+/// binding) and the list caps at six so the surface stays readable.
+fn build_drill_downs(frame: &ClaimFrame, report: &WitnessReport) -> Vec<DrillDown> {
+    let parent_dir = |path: &str| path.rsplit_once('/').map(|(dir, _)| dir.to_owned());
+    let mut drills = Vec::new();
+    // A history claim whose subjects never reach commit-class
+    // documents: query the recorded history surfaces directly.
+    if frame.required_witness == WitnessRequirement::History {
+        for witness in &report.terms {
+            if frame.subjects.contains(&witness.term) && witness.history_documents.is_empty() {
+                drills.push(DrillDown {
+                    query: format!("type:commit {}", witness.term),
+                    reason: format!("`{}` has no commit-class witness", witness.term),
+                });
+                drills.push(DrillDown {
+                    query: format!("type:diff {}", witness.term),
+                    reason: format!("`{}` may live only in raw patches", witness.term),
+                });
+            }
+        }
+    }
+    // A mention-only subject: drill into the directory that mentions
+    // it — the subject may live under a name the claim did not use.
+    for witness in &report.terms {
+        if frame.subjects.contains(&witness.term) && witness.defined.is_empty() {
+            if let Some(dir) = witness
+                .mention_paths
+                .first()
+                .and_then(|path| parent_dir(path))
+            {
+                drills.push(DrillDown {
+                    query: format!("path:{dir} {}", witness.term),
+                    reason: format!(
+                        "`{}` is mention-only; `{dir}` is where it is mentioned",
+                        witness.term
+                    ),
+                });
+            }
+        }
+    }
+    // A distinguishing term absent from every returned hit: look it up
+    // where it actually lives (mention path) or by itself.
+    for term in &report.scope_gaps {
+        let mention = report.terms.iter().find(|witness| &witness.term == term);
+        let query = mention
+            .and_then(|witness| witness.mention_paths.first())
+            .and_then(|path| parent_dir(path))
+            .map_or_else(|| term.clone(), |dir| format!("path:{dir} {term}"));
+        drills.push(DrillDown {
+            query,
+            reason: format!("`{term}` is absent from every returned hit"),
+        });
+    }
+    // A relation claim whose defined subject is edgeless: the graph
+    // records nothing, so textual reference lookup is the fallback.
+    if frame.required_witness == WitnessRequirement::Relation {
+        for witness in &report.terms {
+            if frame.subjects.contains(&witness.term)
+                && witness.relations.edges == 0
+                && !witness.defined.is_empty()
+            {
+                drills.push(DrillDown {
+                    query: witness.term.clone(),
+                    reason: format!(
+                        "`{}` has no typed edges; find textual references",
+                        witness.term
+                    ),
+                });
+            }
+        }
+    }
+    // Terms co-binding only at file scope: narrow into the bound file
+    // to find which span — if any — carries them together.
+    for artifact in &report.binding_artifacts {
+        if artifact.class == DocumentClass::Code && artifact.scope == BindingScope::File {
+            if let Some(term) = frame.distinguishing_terms.first() {
+                drills.push(DrillDown {
+                    query: format!("path:{} {term}", artifact.path),
+                    reason: format!("terms co-bind only at file scope in `{}`", artifact.path),
+                });
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    drills.retain(|drill| seen.insert(drill.query.clone()));
+    drills.truncate(6);
+    drills
+}
+
 fn abstain_result(
     store: &MetadataStore,
     mut context: AbstainContext,
@@ -3040,12 +3258,15 @@ fn abstain_result(
         &context.request.snapshot_id,
         &content_terms(&context.request.query),
     )?;
+    let witness = build_witness_report(store, &context.request.snapshot_id, &context.frame, &[])?;
+    let drill_downs = build_drill_downs(&context.frame, &witness);
     let verdict = SearchVerdict {
         state: VerdictState::Abstained,
         reasons: vec![reason],
-        witness: build_witness_report(store, &context.request.snapshot_id, &context.frame, &[])?,
+        witness,
         claim: context.frame,
         evidence_tiers: EvidenceTiers::default(),
+        drill_downs,
     };
     Ok(SearchResult {
         request: context.request,
@@ -3241,7 +3462,9 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cce_core::{RelationKind, RelationOrigin, SnapshotIdentity, SourceAddress};
+    use cce_core::{
+        RelationKind, RelationOrigin, RelationProvenance, SnapshotIdentity, SourceAddress,
+    };
     use cce_store::SnapshotRecords;
 
     // Test fixtures panic freely: an unmet precondition is a test bug.
@@ -3466,6 +3689,7 @@ mod tests {
                 },
                 witness: WitnessReport::default(),
                 evidence_tiers: EvidenceTiers::default(),
+                drill_downs: Vec::new(),
             },
             latency_ms: 0,
         }
@@ -3689,7 +3913,11 @@ mod tests {
         }
 
         let hits = engine
-            .select_hits(&request("query", 5), &candidates)
+            .select_hits(
+                &request("query", 5),
+                &candidates,
+                &claim_frame(QueryIntent::Unknown, Vec::new()),
+            )
             .expect("select hits");
         assert_eq!(hits.len(), 5);
         let paths = hits
@@ -3731,7 +3959,11 @@ mod tests {
         // Only two files carry hits: the top-5 window caps each at one and
         // the starved head is accepted — the list fills with what remains.
         let starved = engine
-            .select_hits(&request("query", 5), &candidates)
+            .select_hits(
+                &request("query", 5),
+                &candidates,
+                &claim_frame(QueryIntent::Unknown, Vec::new()),
+            )
             .expect("select hits");
         assert_eq!(starved.len(), 2);
 
@@ -3743,7 +3975,11 @@ mod tests {
             candidates.insert(id.clone(), candidate_pathless(&id, score));
         }
         let filled = engine
-            .select_hits(&request("query", 6), &candidates)
+            .select_hits(
+                &request("query", 6),
+                &candidates,
+                &claim_frame(QueryIntent::Unknown, Vec::new()),
+            )
             .expect("select hits");
         assert_eq!(filled.len(), 6);
         let count_of = |path: &str| {
@@ -4405,6 +4641,96 @@ mod tests {
         assert_eq!(frame.required_witness, WitnessRequirement::Any);
     }
 
+    /// Every drill-down suggestion is a verbatim query in the query
+    /// language itself, derived only from reported witness gaps.
+    #[test]
+    fn drill_downs_derive_from_witness_gaps() {
+        // History claim, subject absent from commit-class docs →
+        // type:commit and type:diff.
+        let frame = ClaimFrame {
+            intent: QueryIntent::History,
+            predicate: ClaimPredicate::History,
+            required_witness: WitnessRequirement::History,
+            subjects: vec!["gateway".to_owned()],
+            distinguishing_terms: vec!["gateway".to_owned()],
+        };
+        let report = WitnessReport {
+            terms: vec![TermWitness {
+                term: "gateway".to_owned(),
+                defined: Vec::new(),
+                mentions: 3,
+                mention_paths: vec!["src/net/gateway.rs".to_owned()],
+                relations: RelationWitness::default(),
+                history_documents: Vec::new(),
+            }],
+            binding_artifacts: Vec::new(),
+            scope_gaps: vec!["gateway".to_owned()],
+        };
+        let drills = build_drill_downs(&frame, &report);
+        let queries: Vec<&str> = drills.iter().map(|drill| drill.query.as_str()).collect();
+        assert!(queries.contains(&"type:commit gateway"), "{queries:?}");
+        assert!(queries.contains(&"type:diff gateway"), "{queries:?}");
+        // Mention-only + scope gap both point at the directory that
+        // mentions the term — deduped to one suggestion.
+        assert!(
+            queries.contains(&"path:src/net gateway"),
+            "mention path becomes a path-constrained query: {queries:?}"
+        );
+
+        // Relation claim, defined-but-edgeless subject → textual
+        // reference lookup on the subject name.
+        let frame = ClaimFrame {
+            intent: QueryIntent::Impact,
+            predicate: ClaimPredicate::Relation,
+            required_witness: WitnessRequirement::Relation,
+            subjects: vec!["connect".to_owned()],
+            distinguishing_terms: Vec::new(),
+        };
+        let report = WitnessReport {
+            terms: vec![TermWitness {
+                term: "connect".to_owned(),
+                defined: vec![DefinedWitness {
+                    entity_id: "symbol:connect".to_owned(),
+                    name: "connect".to_owned(),
+                    path: Some("src/ws.rs".to_owned()),
+                    kind: EntityKind::Function,
+                }],
+                mentions: 1,
+                mention_paths: Vec::new(),
+                relations: RelationWitness::default(),
+                history_documents: Vec::new(),
+            }],
+            binding_artifacts: Vec::new(),
+            scope_gaps: Vec::new(),
+        };
+        let drills = build_drill_downs(&frame, &report);
+        assert_eq!(drills.len(), 1);
+        assert_eq!(drills[0].query, "connect");
+
+        // File-scope binding → path-narrowed follow-up on the bound
+        // file.
+        let frame = ClaimFrame {
+            intent: QueryIntent::NaturalLanguageBehavior,
+            predicate: ClaimPredicate::Implementation,
+            required_witness: WitnessRequirement::CodeBinding,
+            subjects: Vec::new(),
+            distinguishing_terms: vec!["bearer".to_owned(), "validation".to_owned()],
+        };
+        let report = WitnessReport {
+            terms: Vec::new(),
+            binding_artifacts: vec![BoundArtifact {
+                path: "src/mixed.rs".to_owned(),
+                class: DocumentClass::Code,
+                scope: BindingScope::File,
+                entity: None,
+            }],
+            scope_gaps: Vec::new(),
+        };
+        let drills = build_drill_downs(&frame, &report);
+        assert_eq!(drills.len(), 1);
+        assert_eq!(drills[0].query, "path:src/mixed.rs bearer");
+    }
+
     #[test]
     fn weak_witness_reasons_cover_each_gap_kind() {
         let frame = ClaimFrame {
@@ -4427,6 +4753,8 @@ mod tests {
             binding_artifacts: vec![BoundArtifact {
                 path: "plans/009.md".to_owned(),
                 class: DocumentClass::Prose,
+                scope: BindingScope::File,
+                entity: None,
             }],
             scope_gaps: vec!["bearer".to_owned(), "validation".to_owned()],
         };
@@ -4435,14 +4763,30 @@ mod tests {
         assert!(reasons[0].contains("no definition-tier witness"));
         assert!(reasons[1].contains("only in prose"));
         assert!(reasons[2].contains("no returned hit carries"));
-        // A code binding silences the binding reason; partial coverage
-        // silences the scope reason.
+        // A file-scope code binding reports the looser tier — proximity
+        // in one file is not one coherent entity.
         let report = WitnessReport {
             binding_artifacts: vec![BoundArtifact {
                 path: "src/gateway.rs".to_owned(),
                 class: DocumentClass::Code,
+                scope: BindingScope::File,
+                entity: None,
             }],
             scope_gaps: vec!["bearer".to_owned()],
+            ..report
+        };
+        let reasons = weak_witness_reasons(&frame, &report);
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons[0].contains("no definition-tier witness"));
+        assert!(reasons[1].contains("only at file scope"));
+        // An entity-scope binding silences the binding reason entirely.
+        let report = WitnessReport {
+            binding_artifacts: vec![BoundArtifact {
+                path: "src/gateway.rs".to_owned(),
+                class: DocumentClass::Code,
+                scope: BindingScope::Entity,
+                entity: Some("validate".to_owned()),
+            }],
             ..report
         };
         let reasons = weak_witness_reasons(&frame, &report);
@@ -5050,6 +5394,49 @@ mod tests {
             .expect("commit records");
     }
 
+    /// Documents bound to an explicit entity — symbol-level docs seed
+    /// entity-scope bindings, file-level docs seed file scope.
+    fn binding_fixture(
+        engine: &CceEngine,
+        snapshot_id: &str,
+        documents: &[(&str, &str, &str, &str, &str)],
+        entities: &[CodeEntity],
+    ) {
+        let anchor = RepositoryScanner::new(engine.config().clone())
+            .identify()
+            .expect("anchor");
+        engine
+            .store()
+            .register_repository(&anchor.identity)
+            .expect("register repository");
+        let snapshot = SnapshotIdentity {
+            id: snapshot_id.to_owned(),
+            repository_id: anchor.identity.id,
+            base_revision: None,
+            workspace_overlay_hash: String::new(),
+            index_profile_hash: String::new(),
+            created_at: chrono::Utc::now(),
+            file_count: documents.len() as u64,
+            source_bytes: 0,
+        };
+        engine
+            .store()
+            .begin_snapshot(&snapshot)
+            .expect("begin snapshot");
+        let mut records = SnapshotRecords::default();
+        for (document_id, entity_id, path, name, body) in documents {
+            let (document, artifact) =
+                indexed_document(engine.store(), document_id, entity_id, path, name, body);
+            records.artifacts.push(artifact);
+            records.documents.push(document);
+        }
+        records.entities.extend(entities.iter().cloned());
+        engine
+            .store()
+            .commit_snapshot(&snapshot, &records)
+            .expect("commit records");
+    }
+
     fn edge(
         source: &str,
         target: &str,
@@ -5340,6 +5727,15 @@ mod tests {
                 .origins
                 .contains(&RelationOrigin::TreeSitter)
         );
+        assert_eq!(
+            witness.relations.provenance.syntactic, 1,
+            "the tree-sitter edge counts in the syntactic tier"
+        );
+        assert_eq!(
+            witness.relations.provenance.inferred, 1,
+            "the model-inferred edge counts separately"
+        );
+        assert_eq!(witness.relations.provenance.precise, 0);
     }
 
     #[tokio::test]
@@ -5481,6 +5877,10 @@ mod tests {
             edges: 2,
             kinds: vec![RelationKind::Calls],
             origins: vec![RelationOrigin::ModelInference],
+            provenance: RelationProvenance {
+                inferred: 2,
+                ..RelationProvenance::default()
+            },
         };
         let reasons = weak_witness_reasons(&frame, &report(vec![term(inferred, Vec::new())]));
         assert!(
@@ -5577,5 +5977,181 @@ mod tests {
             .await
             .expect("pinned search");
         assert!(pinned.hits.is_empty());
+    }
+    /// Terms inside one symbol's span bind at entity scope; terms split
+    /// across two functions of the same file bind only at file scope —
+    /// the granularity difference the verdict must report.
+    #[tokio::test]
+    async fn binding_scope_distinguishes_entity_from_file_cooccurrence() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        binding_fixture(
+            &engine,
+            "snap_test",
+            &[
+                (
+                    "doc:connect",
+                    "symbol:connect",
+                    "src/ws.rs",
+                    "connect",
+                    "fn connect() { reconnect with exponential backoff }",
+                ),
+                // Two functions in one file: neither symbol doc carries
+                // both terms, the file doc does.
+                (
+                    "doc:check",
+                    "symbol:bearer_check",
+                    "src/mixed.rs",
+                    "bearer_check",
+                    "fn bearer_check() { bearer }",
+                ),
+                (
+                    "doc:validate",
+                    "symbol:run_validation",
+                    "src/mixed.rs",
+                    "run_validation",
+                    "fn run_validation() { validation }",
+                ),
+                (
+                    "doc:mixed",
+                    "file:src/mixed.rs",
+                    "src/mixed.rs",
+                    "mixed",
+                    "fn bearer_check() { bearer } fn run_validation() { validation }",
+                ),
+            ],
+            &[
+                file("src/ws.rs"),
+                symbol("connect", "src/ws.rs"),
+                file("src/mixed.rs"),
+                symbol("bearer_check", "src/mixed.rs"),
+                symbol("run_validation", "src/mixed.rs"),
+            ],
+        );
+
+        // Entity scope: `connect` carries both terms in one span.
+        let result = engine
+            .search(request("reconnect backoff", 10))
+            .await
+            .expect("entity search");
+        let artifact = result
+            .verdict
+            .witness
+            .binding_artifacts
+            .iter()
+            .find(|artifact| artifact.path == "src/ws.rs")
+            .expect("binding artifact");
+        assert_eq!(artifact.scope, BindingScope::Entity);
+        assert_eq!(artifact.entity.as_deref(), Some("connect"));
+        assert!(
+            !result
+                .verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("file scope")),
+            "entity-bound terms report no scope weakness: {:?}",
+            result.verdict.reasons
+        );
+
+        // File scope: the conjunction holds only at file granularity —
+        // two unrelated spans share a path, which is proximity, not
+        // coherence.
+        let result = engine
+            .search(request("bearer validation", 10))
+            .await
+            .expect("file search");
+        let artifact = result
+            .verdict
+            .witness
+            .binding_artifacts
+            .iter()
+            .find(|artifact| artifact.path == "src/mixed.rs")
+            .expect("binding artifact");
+        assert_eq!(artifact.scope, BindingScope::File);
+        assert_eq!(artifact.entity, None);
+        assert_eq!(result.verdict.state, VerdictState::WeakWitness);
+        assert!(
+            result
+                .verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("only at file scope")),
+            "file-scope binding is flagged: {:?}",
+            result.verdict.reasons
+        );
+    }
+
+    /// Selection is claim-aware: a document carrying the claim's
+    /// distinguishing vocabulary outranks a slightly stronger candidate
+    /// that carries none of it.
+    #[tokio::test]
+    async fn select_hits_prefers_claim_term_carriers() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        binding_fixture(
+            &engine,
+            "snap_test",
+            &[
+                (
+                    "doc:carrier",
+                    "file:src/carrier.rs",
+                    "src/carrier.rs",
+                    "carrier",
+                    "fn carrier() { bearer validation }",
+                ),
+                (
+                    "doc:plain",
+                    "file:src/plain.rs",
+                    "src/plain.rs",
+                    "plain",
+                    "fn plain() { filler words }",
+                ),
+            ],
+            &[file("src/carrier.rs"), file("src/plain.rs")],
+        );
+
+        let mut candidates = HashMap::new();
+        candidates.insert(
+            "doc:carrier".to_owned(),
+            candidate_at("doc:carrier", "src/carrier.rs", 0, 0.594),
+        );
+        candidates.insert(
+            "doc:plain".to_owned(),
+            candidate_at("doc:plain", "src/plain.rs", 0, 0.6),
+        );
+        let mut request = request("bearer validation", 5);
+        request.snapshot_id = "snap_test".to_owned();
+        let frame = ClaimFrame {
+            intent: QueryIntent::NaturalLanguageBehavior,
+            predicate: ClaimPredicate::Implementation,
+            required_witness: WitnessRequirement::CodeBinding,
+            subjects: Vec::new(),
+            distinguishing_terms: vec!["bearer".to_owned(), "validation".to_owned()],
+        };
+
+        let hits = engine
+            .select_hits(&request, &candidates, &frame)
+            .expect("select hits");
+        assert_eq!(
+            hits.first().map(|hit| hit.document_id.as_str()),
+            Some("doc:carrier"),
+            "the claim-term carrier outranks the bare candidate: {:?}",
+            hits.iter()
+                .map(|hit| (hit.document_id.as_str(), hit.score))
+                .collect::<Vec<_>>()
+        );
+        let carrier = hits.first().expect("carrier hit");
+        assert!(
+            carrier
+                .explanation
+                .iter()
+                .any(|line| line.contains("claim-term coverage")),
+            "coverage is reported in the hit explanation: {:?}",
+            carrier.explanation
+        );
+        assert!(
+            carrier.score > 0.594,
+            "the coverage bonus lands in the reported score"
+        );
     }
 }

@@ -395,6 +395,26 @@ pub struct DefinedWitness {
     pub path: Option<String>,
 }
 
+/// Edge counts grouped by provenance tier.
+///
+/// The engineering contract's three-way split (deterministic facts,
+/// framework-derived relations, model inference) plus the precision
+/// gradient inside "deterministic".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationProvenance {
+    /// Compiler-grade edges: `Compiler`, `Scip`, `Lsp` origins — the
+    /// strongest relation evidence.
+    pub precise: usize,
+    /// Syntax-level edges: `TreeSitter` — structural, not name-matched.
+    pub syntactic: usize,
+    /// Framework/build-derived edges: `BuildSystem`, `FrameworkRule` —
+    /// deterministic but rule-derived, not compiler-attested.
+    pub derived: usize,
+    /// Model-inferred edges — never source truth, only corroboration.
+    pub inferred: usize,
+}
+
 /// Typed-edge summary across a term's definition entities — a relation
 /// claim's witness is the edge set itself.
 ///
@@ -412,6 +432,10 @@ pub struct RelationWitness {
     /// split, so inference-only structure is never passed as source truth.
     #[serde(default)]
     pub origins: Vec<RelationOrigin>,
+    /// Edges grouped by provenance tier — evidence quality at a glance
+    /// without re-classifying the origin list.
+    #[serde(default)]
+    pub provenance: RelationProvenance,
 }
 
 /// Per-term witness data: defined (entities/files) vs mentioned
@@ -442,6 +466,24 @@ pub struct TermWitness {
     pub history_documents: Vec<String>,
 }
 
+/// How tightly a binding was attested — the granularity of the coherent
+/// scope carrying every distinguishing term.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingScope {
+    /// The terms co-occur inside one code entity's source span — the
+    /// tightest witness: a single function/type/module carries the
+    /// whole claim vocabulary.
+    Entity,
+    /// The terms co-occur in the same file but inside no single entity
+    /// — proximity, not coherence. `File` is also the zero value: an
+    /// unmarked binding asserts the weaker claim.
+    #[default]
+    File,
+}
+
 /// An artifact binding every distinguishing term in one coherent scope —
 /// the only evidence shape that can witness a multi-term claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
@@ -451,6 +493,13 @@ pub struct BoundArtifact {
     pub path: String,
     /// Document class of the artifact.
     pub class: DocumentClass,
+    /// Granularity of the coherent scope attesting the conjunction.
+    #[serde(default)]
+    pub scope: BindingScope,
+    /// The binding entity's name when the scope is `entity` — the
+    /// drill-down anchor a verifier wants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<String>,
 }
 
 /// What the evidence actually contains relative to the claim: per-term
@@ -471,6 +520,19 @@ pub struct WitnessReport {
     /// the hits do not carry the claim's specific vocabulary.
     #[serde(default)]
     pub scope_gaps: Vec<String>,
+}
+
+/// One deterministic follow-up retrieval derived from a witness gap —
+/// a verbatim-runnable query plus the gap it closes. The kernel
+/// suggests; the consumer decides whether to run it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DrillDown {
+    /// The suggested query, ready to pass back to `search` — uses only
+    /// the query language's own filters (`type:`, `path:`).
+    pub query: String,
+    /// The witness gap this query addresses.
+    pub reason: String,
 }
 
 /// Counts of final candidates by evidence tier.
@@ -502,6 +564,10 @@ pub struct SearchVerdict {
     pub witness: WitnessReport,
     /// Evidence-tier composition of the candidate set.
     pub evidence_tiers: EvidenceTiers,
+    /// Deterministic follow-up queries derived from witness gaps — the
+    /// drill-down surface. Empty when no gap suggests a next step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drill_downs: Vec<DrillDown>,
 }
 
 #[cfg(test)]
@@ -533,19 +599,39 @@ mod tests {
                         edges: 3,
                         kinds: vec![RelationKind::Calls],
                         origins: vec![RelationOrigin::ModelInference],
+                        provenance: RelationProvenance {
+                            precise: 0,
+                            syntactic: 0,
+                            derived: 0,
+                            inferred: 3,
+                        },
                     },
                     history_documents: vec!["commit:abc123".to_owned()],
                 }],
-                binding_artifacts: vec![BoundArtifact {
-                    path: "docs/rfc.md".to_owned(),
-                    class: DocumentClass::Prose,
-                }],
+                binding_artifacts: vec![
+                    BoundArtifact {
+                        path: "docs/rfc.md".to_owned(),
+                        class: DocumentClass::Prose,
+                        scope: BindingScope::File,
+                        entity: None,
+                    },
+                    BoundArtifact {
+                        path: "src/gateway.rs".to_owned(),
+                        class: DocumentClass::Code,
+                        scope: BindingScope::Entity,
+                        entity: Some("validate".to_owned()),
+                    },
+                ],
                 scope_gaps: vec!["reconnect".to_owned()],
             },
             evidence_tiers: EvidenceTiers {
                 strict: 2,
                 weak: 33,
             },
+            drill_downs: vec![DrillDown {
+                query: "type:commit WebSocket".to_owned(),
+                reason: "`WebSocket` has no commit-class witness".to_owned(),
+            }],
         };
         let json = serde_json::to_value(&verdict).expect("serialize");
         assert_eq!(json["state"], "weak_witness");
@@ -557,6 +643,14 @@ mod tests {
             "plans/009.md"
         );
         assert_eq!(json["witness"]["bindingArtifacts"][0]["class"], "prose");
+        assert_eq!(json["witness"]["bindingArtifacts"][0]["scope"], "file");
+        assert!(
+            json["witness"]["bindingArtifacts"][0]
+                .get("entity")
+                .is_none()
+        );
+        assert_eq!(json["witness"]["bindingArtifacts"][1]["scope"], "entity");
+        assert_eq!(json["witness"]["bindingArtifacts"][1]["entity"], "validate");
         assert_eq!(json["witness"]["scopeGaps"][0], "reconnect");
         assert_eq!(json["witness"]["terms"][0]["relations"]["edges"], 3);
         assert_eq!(
@@ -568,10 +662,15 @@ mod tests {
             "model_inference"
         );
         assert_eq!(
+            json["witness"]["terms"][0]["relations"]["provenance"]["inferred"],
+            3
+        );
+        assert_eq!(
             json["witness"]["terms"][0]["historyDocuments"][0],
             "commit:abc123"
         );
         assert_eq!(json["evidenceTiers"]["strict"], 2);
+        assert_eq!(json["drillDowns"][0]["query"], "type:commit WebSocket");
         let roundtrip: SearchVerdict = serde_json::from_value(json).expect("deserialize");
         assert_eq!(roundtrip, verdict);
     }

@@ -254,6 +254,20 @@ impl ConnectionPool {
     }
 }
 
+/// One conjunction-binding row: the artifact path plus the entity
+/// carrying the matched document, when it resolves. The caller
+/// classifies the binding's scope from `entity_kind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermBinding {
+    /// Repository-relative path of the binding artifact.
+    pub path: String,
+    /// Name of the entity whose document carries every term.
+    pub entity_name: Option<String>,
+    /// Kind of that entity — `None` when the document's entity does
+    /// not resolve (treated as file-level binding).
+    pub entity_kind: Option<cce_core::EntityKind>,
+}
+
 /// The canonical metadata store: one `SQLite` database (entities, relations,
 /// FTS, view status) plus the content-addressed artifact store.
 #[derive(Clone)]
@@ -298,10 +312,10 @@ impl MetadataStore {
             .lock()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(storage_error)?;
-        if version > 4 {
+        if version > 5 {
             return Err(CceError::UnsupportedFormat {
                 found: version,
-                supported: 4,
+                supported: 5,
             });
         }
         if version == 0 {
@@ -323,6 +337,11 @@ impl MetadataStore {
             pool.lock()
                 .execute_batch(include_str!("migrations/0004_regions.sql"))
                 .map_err(|error| CceError::Storage(format!("migration 4 failed: {error}")))?;
+        }
+        if version < 5 {
+            pool.lock()
+                .execute_batch(include_str!("migrations/0005_entity_name_trigrams.sql"))
+                .map_err(|error| CceError::Storage(format!("migration 5 failed: {error}")))?;
         }
         let artifacts = ArtifactStore::open(data_root)?;
         Ok(Self {
@@ -485,6 +504,12 @@ impl MetadataStore {
             .execute("DELETE FROM entities WHERE snapshot_id=?1", [&snapshot.id])
             .map_err(storage_error)?;
         transaction
+            .execute(
+                "DELETE FROM entity_name_trigrams WHERE snapshot_id=?1",
+                [&snapshot.id],
+            )
+            .map_err(storage_error)?;
+        transaction
             .execute("DELETE FROM regions WHERE snapshot_id=?1", [&snapshot.id])
             .map_err(storage_error)?;
         transaction
@@ -545,6 +570,12 @@ impl MetadataStore {
                 .map_err(storage_error)?;
         }
 
+        let mut trigram_insert = transaction
+            .prepare(
+                "INSERT INTO entity_name_trigrams(snapshot_id, trigram, entity_id)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(storage_error)?;
         for entity in &records.entities {
             transaction
                 .execute(
@@ -566,7 +597,19 @@ impl MetadataStore {
                     ],
                 )
                 .map_err(storage_error)?;
+            let mut trigrams = name_trigrams(&entity.name);
+            if let Some(qualified) = &entity.qualified_name {
+                trigrams.extend(name_trigrams(qualified));
+            }
+            trigrams.sort();
+            trigrams.dedup();
+            for trigram in &trigrams {
+                trigram_insert
+                    .execute(params![snapshot.id, trigram, entity.id])
+                    .map_err(storage_error)?;
+            }
         }
+        drop(trigram_insert);
 
         for relation in &records.relations {
             transaction
@@ -1302,6 +1345,63 @@ impl MetadataStore {
             .map_err(storage_error)
     }
 
+    /// Conjunction bindings with entity granularity: same match as
+    /// [`terms_binding_paths`](Self::terms_binding_paths) but each row
+    /// names the entity owning the matched document, so callers can tell
+    /// "all terms inside one symbol" from "same file, unrelated spans".
+    ///
+    /// # Errors
+    /// Storage error on query failure, or when `terms` is empty.
+    pub fn terms_binding_scopes(
+        &self,
+        snapshot_id: &str,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<TermBinding>> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let matcher = terms
+            .iter()
+            .map(|term| format!("\"{term}\""))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let connection = self.connection.read();
+        let mut statement = connection
+            .prepare(
+                "SELECT f.path, e.name, e.kind FROM documents_fts f
+                 LEFT JOIN entities e
+                   ON e.id = f.entity_id AND e.snapshot_id = f.snapshot_id
+                 WHERE documents_fts MATCH ?1 AND f.snapshot_id=?2 LIMIT ?3",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![matcher, snapshot_id, usize_to_i64(limit)?],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .map_err(storage_error)?;
+        rows.map(|row| {
+            let (path, entity_name, kind_json) = row.map_err(storage_error)?;
+            let entity_kind = kind_json
+                .as_deref()
+                .map(serde_json::from_str::<cce_core::EntityKind>)
+                .transpose()?;
+            Ok(TermBinding {
+                path,
+                entity_name,
+                entity_kind,
+            })
+        })
+        .collect()
+    }
+
     /// Which of `document_ids` contain `term` — per-hit coverage checks
     /// for claim vocabulary.
     ///
@@ -1403,6 +1503,98 @@ impl MetadataStore {
         let escaped = folded.replace('\\', "\\\\").replace('%', "\\%");
         let pattern = format!("%{escaped}%");
         let connection = self.connection.read();
+
+        // The trigram index narrows the verification set: an entity
+        // matching the folded pattern must carry EVERY trigram of the
+        // term. Snapshots committed before the index existed (and terms
+        // shorter than a trigram) have nothing to intersect — those
+        // fall back to the folded-LIKE scan below.
+        let trigrams = name_trigrams(term);
+        let index_rows: i64 = if trigrams.is_empty() {
+            0
+        } else {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM entity_name_trigrams WHERE snapshot_id=?1",
+                    params![snapshot_id],
+                    |row| row.get(0),
+                )
+                .map_err(storage_error)?
+        };
+        if index_rows > 0 {
+            let placeholders = trigrams.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT entity_id FROM entity_name_trigrams
+                 WHERE snapshot_id=? AND trigram IN ({placeholders})
+                 GROUP BY entity_id
+                 HAVING COUNT(DISTINCT trigram)=? LIMIT ?"
+            );
+            let mut parameters: Vec<rusqlite::types::Value> =
+                Vec::with_capacity(trigrams.len() + 3);
+            parameters.push(snapshot_id.to_owned().into());
+            parameters.extend(
+                trigrams
+                    .iter()
+                    .map(|trigram| rusqlite::types::Value::Text(trigram.clone())),
+            );
+            parameters.push(usize_to_i64(trigrams.len())?.into());
+            parameters.push(usize_to_i64(limit.saturating_mul(4).max(64))?.into());
+            let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+            let candidates = statement
+                .query_map(rusqlite::params_from_iter(parameters), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(storage_error)?
+                .collect::<std::result::Result<Vec<String>, _>>()
+                .map_err(storage_error)?;
+            drop(statement);
+            if !candidates.is_empty() {
+                let id_placeholders = candidates.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let verify_sql = format!(
+                    "SELECT id, kind, name, qualified_name, signature, language, region_id,
+                     address_json, capabilities_json, attributes_json FROM entities
+                     WHERE snapshot_id=? AND id IN ({id_placeholders}) AND (
+                       REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(name,'_',''),'-',''),'.',''),'/',''),':','') LIKE ? ESCAPE '\\'
+                       OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(qualified_name,'_',''),'-',''),'.',''),'/',''),':','') LIKE ? ESCAPE '\\'
+                     ) LIMIT ?"
+                );
+                let mut parameters: Vec<rusqlite::types::Value> =
+                    Vec::with_capacity(candidates.len() + 4);
+                parameters.push(snapshot_id.to_owned().into());
+                parameters.extend(
+                    candidates
+                        .iter()
+                        .map(|id| rusqlite::types::Value::Text(id.clone())),
+                );
+                parameters.push(pattern.clone().into());
+                parameters.push(pattern.into());
+                parameters.push(usize_to_i64(limit)?.into());
+                let mut statement = connection.prepare(&verify_sql).map_err(storage_error)?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(parameters), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, String>(9)?,
+                        ))
+                    })
+                    .map_err(storage_error)?;
+                return rows
+                    .map(|row| entity_from_cols(row.map_err(storage_error)?))
+                    .collect();
+            }
+            // The index carries every entity of this snapshot; an empty
+            // intersection is a true miss, not an unindexed snapshot.
+            return Ok(Vec::new());
+        }
+
         let mut statement = connection
             .prepare(
                 "SELECT id, kind, name, qualified_name, signature, language, region_id,
@@ -1966,6 +2158,23 @@ impl MetadataStore {
             )
             .collect()
     }
+}
+
+/// Folded alphanumeric trigrams over a name — the index units of the
+/// entity-name inverted index. `view_status`, `ViewStatus`, and
+/// `a::view::Status` all fold to the same lowercase stream before
+/// windowing, matching `entity_name_candidates`' fold semantics.
+fn name_trigrams(name: &str) -> Vec<String> {
+    let folded: Vec<char> = name
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let mut trigrams = std::collections::BTreeSet::new();
+    for window in folded.windows(3) {
+        trigrams.insert(window.iter().collect::<String>());
+    }
+    trigrams.into_iter().collect()
 }
 
 fn insert_artifact(transaction: &Transaction<'_>, artifact: &ArtifactRecord) -> Result<()> {
@@ -2852,6 +3061,15 @@ mod tests {
                 .is_empty(),
             "a never-defined term finds no candidates"
         );
+        // Terms shorter than a trigram bypass the index and take the
+        // folded-LIKE scan — `lo` still reaches `lock` entities.
+        let short = store
+            .entity_name_candidates("snap_t", "lo", 8)
+            .expect("short candidates");
+        assert!(
+            short.iter().any(|entity| entity.id == "ent:locks"),
+            "short terms still match through the LIKE fallback: {short:?}"
+        );
 
         // Mentions report every document carrying the term; binding
         // reports only artifacts carrying ALL of them.
@@ -2871,6 +3089,35 @@ mod tests {
             .terms_binding_paths("snap_t", &["gateway".to_owned(), "token".to_owned()], 8)
             .expect("bound");
         assert_eq!(bound, ["src/gateway.rs"]);
+
+        // Scope-aware bindings resolve the entity behind each match.
+        let bindings = store
+            .terms_binding_scopes("snap_t", &["gateway".to_owned(), "token".to_owned()], 8)
+            .expect("bindings");
+        assert_eq!(bindings.len(), 1, "{bindings:?}");
+        assert_eq!(bindings[0].path, "src/gateway.rs");
+        assert_eq!(bindings[0].entity_kind, Some(cce_core::EntityKind::File));
+        let bindings = store
+            .terms_binding_scopes(
+                "snap_t",
+                &["viewstatus".to_owned(), "staleness".to_owned()],
+                8,
+            )
+            .expect("bindings");
+        assert_eq!(bindings.len(), 1, "{bindings:?}");
+        assert_eq!(
+            bindings[0].entity_kind,
+            Some(cce_core::EntityKind::Struct),
+            "a symbol entity attests entity scope"
+        );
+        assert_eq!(bindings[0].entity_name.as_deref(), Some("ViewStatus"));
+        // A document whose entity never resolves still reports the
+        // path — the caller treats it as file-level binding.
+        let bindings = store
+            .terms_binding_scopes("snap_t", &["distributed".to_owned(), "lock".to_owned()], 8)
+            .expect("bindings");
+        assert_eq!(bindings[0].path, "plans/009.md");
+        assert_eq!(bindings[0].entity_kind, None);
 
         // Per-hit coverage: `distributed` lives in no returned hit,
         // `lock` lives in one of them.
