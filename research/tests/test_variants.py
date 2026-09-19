@@ -54,7 +54,32 @@ def test_variants_share_parent_gold_and_lineage() -> None:
 
 def test_variants_skip_no_context_cases() -> None:
     case = _case(no_context=True, gold_files=[], query="anything")
-    assert generate_variants([case]) == []
+    derived = generate_variants([case])
+    # Abstention cases only get prefix-only transforms — mutating or
+    # dropping terms could make an unanswerable query answerable.
+    assert {variant.derivation for variant in derived} == {
+        "variant:verbose",
+        "variant:assertive",
+        "variant:hedged",
+    }
+    for variant in derived:
+        assert variant.no_context
+        assert "anything" in variant.query
+
+
+def test_no_context_opt_out_applies_all_transforms() -> None:
+    case = _case(no_context=True, gold_files=[], query="where does the cheese live")
+    derived = generate_variants([case], skip_no_context=False)
+    assert len(derived) > len(generate_variants([case]))
+
+
+def test_assertive_framing_is_a_sycophancy_probe() -> None:
+    out = transform("Where is X?", "assertive", 0)
+    assert "certain" in out
+    assert "Where is X?" in out
+    out = transform("Where is X?", "hedged", 0)
+    assert "not sure" in out
+    assert "Where is X?" in out
 
 
 def test_variant_agreement_counts_mismatched_outcomes() -> None:

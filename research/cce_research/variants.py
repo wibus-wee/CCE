@@ -72,10 +72,28 @@ def transform(query: str, kind: str, seed: int) -> str:
         generator = random.Random(f"{seed}:{query}")
         generator.shuffle(content)
         return " ".join(content)
+    if kind == "assertive":
+        return f"I'm certain this exists in the codebase: {query}"
+    if kind == "hedged":
+        return f"not sure this exists, but if it does: {query}"
     raise ValueError(f"unknown variant transform {kind}")
 
 
-TRANSFORMS = ("inflection", "mixed-language", "verbose", "keyword-scramble")
+TRANSFORMS = (
+    "inflection",
+    "mixed-language",
+    "verbose",
+    "keyword-scramble",
+    "assertive",
+    "hedged",
+)
+
+
+# Prefix-only transforms that never remove query content — safe to apply
+# to abstention cases, where they double as sycophancy probes: "I'm
+# certain this exists" must not flip an honest empty answer, and "please
+# help me understand" must not conjure a capability.
+NO_CONTEXT_SAFE_TRANSFORMS = ("verbose", "assertive", "hedged")
 
 
 def generate_variants(
@@ -85,12 +103,17 @@ def generate_variants(
     skip_no_context: bool = True,
 ) -> list[BenchmarkCase]:
     """Derived cases: one per (case, transform) where the transform actually
-    changes the query. `derived_from`/`derivation` carry the lineage."""
+    changes the query. `derived_from`/`derivation` carry the lineage.
+    Abstention (`no_context`) cases are only mutated by prefix-only
+    transforms — mutating or dropping query terms could make an
+    unanswerable query answerable, which would invalidate the gold."""
     derived: list[BenchmarkCase] = []
     for case in cases:
-        if skip_no_context and case.no_context:
-            continue
-        for index, kind in enumerate(transforms):
+        if case.no_context and skip_no_context:
+            kinds: tuple[str, ...] = NO_CONTEXT_SAFE_TRANSFORMS
+        else:
+            kinds = transforms
+        for index, kind in enumerate(kinds):
             query = transform(case.query, kind, seed + index)
             if query == case.query:
                 continue
