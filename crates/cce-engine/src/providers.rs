@@ -132,8 +132,9 @@ pub(crate) fn registry() -> Vec<Box<dyn Provider>> {
 }
 
 /// Detect every provider against a repository without running anything.
-/// Powers `cce providers` and `GET /v1/providers`.
-pub(crate) fn detect_all(repo_root: &Path) -> Vec<ProviderReport> {
+/// `data_root` locates the managed tool cache. Powers `cce providers`
+/// and `GET /v1/providers`.
+pub(crate) fn detect_all(repo_root: &Path, data_root: &Path) -> Vec<ProviderReport> {
     let mut reports: Vec<ProviderReport> = registry()
         .iter()
         .map(|provider| {
@@ -158,7 +159,7 @@ pub(crate) fn detect_all(repo_root: &Path) -> Vec<ProviderReport> {
         .collect();
     // Zoekt lives outside the SCIP registry — it produces no artifact —
     // but its toolchain presence is still provider-surface information.
-    reports.push(crate::zoekt::detect_report());
+    reports.push(crate::zoekt::detect_report(data_root));
     reports
 }
 

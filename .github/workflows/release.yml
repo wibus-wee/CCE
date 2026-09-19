@@ -38,3 +38,39 @@ jobs:
           draft: true
           generate_release_notes: true
           files: cce-${{ matrix.target }}.*
+
+  # Zoekt toolchain assets for `cce providers --provision`. Upstream
+  # ships no binaries; Go cross-compiles from one runner, so a single
+  # linux job produces every target triple the runtime maps.
+  zoekt:
+    runs-on: ubuntu-latest
+    env:
+      ZOEKT_REF: 153817f643cde8b229ee388c1dddbcf07f4798af
+    steps:
+      - uses: actions/setup-go@4b36064e14cc4218676b4dc67d09398f8b6ed659 # v5
+        with:
+          go-version: stable
+      - name: Cross-build zoekt tools
+        run: |
+          set -euo pipefail
+          mkdir -p zoekt-bin
+          for spec in \
+            "x86_64-unknown-linux-gnu linux amd64" \
+            "aarch64-unknown-linux-gnu linux arm64" \
+            "x86_64-apple-darwin darwin amd64" \
+            "aarch64-apple-darwin darwin arm64" \
+            "x86_64-pc-windows-msvc windows amd64"; do
+            read -r triple goos goarch <<< "$spec"
+            suffix=""
+            [ "$goos" = windows ] && suffix=".exe"
+            for tool in zoekt zoekt-index; do
+              GOBIN="$PWD/zoekt-bin" GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
+                go install "github.com/sourcegraph/zoekt/cmd/${tool}@${ZOEKT_REF}"
+              mv "zoekt-bin/${tool}${suffix}" "zoekt-bin/${tool}-${triple}${suffix}"
+            done
+          done
+          cd zoekt-bin && sha256sum zoekt-* > zoekt-SHA256SUMS.txt
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          draft: true
+          files: zoekt-bin/*

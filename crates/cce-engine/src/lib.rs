@@ -46,3 +46,4 @@ pub use providers::{ProviderReport, ProviderState};
 pub use repository::{RepositoryScanner, ScannedFile, ScannedRepository};
 pub use rerank::LocalReranker;
 pub use retrieval::SearchResult;
+pub use zoekt::provision as provision_zoekt;

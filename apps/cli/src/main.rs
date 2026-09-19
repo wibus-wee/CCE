@@ -149,6 +149,10 @@ enum Command {
     Providers {
         #[arg(default_value = ".")]
         repository: PathBuf,
+        /// Install provisionable toolchains (zoekt) into the managed
+        /// cache — explicit network opt-in.
+        #[arg(long)]
+        provision: bool,
     },
     /// List local embedding model codes usable with --dense local.
     Models,
@@ -414,9 +418,22 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Providers { repository } => {
-            let engine = engine(&arguments, repository)?;
-            print_value(&engine.providers())?;
+        Command::Providers {
+            repository,
+            provision,
+        } => {
+            if *provision {
+                // Blocking network/subprocess work — keep it off the
+                // async executor and let the blocking client drop on a
+                // blocking thread.
+                let root = data_dir(&arguments, repository);
+                let report =
+                    tokio::task::spawn_blocking(move || cce_engine::provision_zoekt(&root)).await?;
+                print_value(&report)?;
+            } else {
+                let engine = engine(&arguments, repository)?;
+                print_value(&engine.providers())?;
+            }
         }
         Command::Models => {
             println!("# embedding models (--embedding-model)");

@@ -326,7 +326,10 @@ impl CceEngine {
                 ViewKind::Graph,
                 &repaired_graph_status(
                     snapshot,
-                    &crate::providers::detect_all(&self.config.repository_root),
+                    &crate::providers::detect_all(
+                        &self.config.repository_root,
+                        &self.config.data_root,
+                    ),
                     scip_edges,
                 ),
             )?;
@@ -1609,7 +1612,7 @@ impl CceEngine {
     /// Detect-state report for every known provider (no execution).
     #[must_use]
     pub fn providers(&self) -> Vec<crate::providers::ProviderReport> {
-        crate::providers::detect_all(&self.config.repository_root)
+        crate::providers::detect_all(&self.config.repository_root, &self.config.data_root)
     }
 
     /// Worktree regex search honoring ignore/sensitive policy; always

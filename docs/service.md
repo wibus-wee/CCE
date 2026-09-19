@@ -52,17 +52,23 @@ enum DetectState {
 }
 ```
 
-A `Provisionable` state (managed tool cache + opt-in network download)
-arrives with the provisioning layer; v1 reports `Missing` with the exact
-install command instead of silently fetching.
+The `Provisionable` lane exists for `zoekt` today: `cce providers
+--provision` installs the pinned toolchain (pinned upstream commit —
+sourcegraph/zoekt ships no release binaries) into the managed cache
+`<data>/providers/zoekt/bin`, preferring checksum-verified release assets
+built by CCE CI and falling back to `go install` at the same revision.
+Every other provider reports `Missing` with the exact install command
+instead of silently fetching.
 
 Lifecycle inside an index job:
 
-1. **detect** — PATH → `<data_root>/providers/<id>/<version>/` → repo-local
-   artifact (a checked-in `index.scip` counts as `Ready`, always offline).
-2. **provision** — only with `EngineConfig::network == OptIn` plus an
-   explicit `--provision` flag. Pinned version + sha256 manifest in the
-   data root; never at query time, never silently.
+1. **detect** — `CCE_*` env overrides → PATH → the managed cache
+   (`<data_root>/providers/<id>/bin` for zoekt) → repo-local artifact (a
+   checked-in `index.scip` counts as `Ready`, always offline).
+2. **provision** — only behind an explicit `--provision` flag (the flag
+   *is* the network opt-in, same pattern as `--dense local`). Pinned
+   version + sha256-verified install in the data root; never at query
+   time, never silently.
 3. **run** — subprocess with cwd = repo, scrubbed environment, timeout,
    output to the artifact store. Providers never write SQLite.
 4. **ingest** — CCE parses the artifact itself: SCIP occurrences become
@@ -82,6 +88,7 @@ v1 registry:
 | `scip:rust-analyzer` | Dataflow substrate, Graph truth | rustup component / release binary | dogfood target — this repo |
 | `scip:typescript` | same | project `node_modules/.bin` → repo `.bin` → PATH | monorepo-aware: indexes the largest workspace tsconfig when the root is a solution file |
 | `scip:file` | same | none | ingests a checked-in `index.scip`; always offline |
+| `zoekt:index` | lexical file candidates | `cce providers --provision`, PATH, or `CCE_ZOEKT*` env | shard under `<data>/providers/zoekt/index`, snapshot-marker pinned |
 
 SCIP supplies definition/reference/implementation truth and hover docs — it
 does **not** carry taint edges. With SCIP ingested, `ViewKind::Dataflow`

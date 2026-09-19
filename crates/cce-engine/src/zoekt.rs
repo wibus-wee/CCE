@@ -6,9 +6,11 @@
 //! snapshot documents through `LineMatch` line numbers, so provenance
 //! stays in `SQLite` even though candidate generation is external.
 //!
-//! Detection mirrors SCIP providers: binaries must already exist on the
-//! machine (`PATH`, or `CCE_ZOEKT`/`CCE_ZOEKT_INDEX` overrides); nothing
-//! is downloaded.
+//! Detection order: `CCE_ZOEKT`/`CCE_ZOEKT_INDEX` overrides → `PATH` →
+//! the managed cache `<data>/providers/zoekt/bin`. Nothing downloads at
+//! index or query time — `cce providers --provision` is the explicit
+//! opt-in that installs pinned, checksum-verified binaries into the
+//! managed cache (release assets first, `go install` fallback).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -27,16 +29,45 @@ pub(crate) struct ZoektTools {
     pub search: PathBuf,
 }
 
+/// Upstream ref the managed toolchain is pinned to. sourcegraph/zoekt
+/// publishes no release tags, so CI builds assets from this commit and
+/// the `go install` fallback resolves the same revision.
+const ZOEKT_REF: &str = "153817f643cde8b229ee388c1dddbcf07f4798af";
+
+/// Managed tool cache: `<data>/providers/zoekt/bin`, absolute —
+/// `GOBIN` requires an absolute path and `CCE_DATA_DIR` may be relative.
+pub(crate) fn bin_dir(data_root: &Path) -> PathBuf {
+    let dir = data_root.join("providers").join("zoekt").join("bin");
+    std::path::absolute(&dir).unwrap_or(dir)
+}
+
 /// Locate the zoekt toolchain. Env overrides win so a caller can pin a
-/// specific build; otherwise PATH is probed without executing anything.
-pub(crate) fn detect() -> Option<ZoektTools> {
+/// specific build; otherwise PATH is probed, then the managed cache —
+/// none of these execute anything.
+pub(crate) fn detect(data_root: &Path) -> Option<ZoektTools> {
+    let managed = bin_dir(data_root);
     let index = std::env::var_os("CCE_ZOEKT_INDEX")
         .map(PathBuf::from)
-        .or_else(|| on_path("zoekt-index"))?;
+        .or_else(|| on_path("zoekt-index"))
+        .or_else(|| on_disk(&managed, "zoekt-index"))?;
     let search = std::env::var_os("CCE_ZOEKT")
         .map(PathBuf::from)
-        .or_else(|| on_path("zoekt"))?;
+        .or_else(|| on_path("zoekt"))
+        .or_else(|| on_disk(&managed, "zoekt"))?;
     Some(ZoektTools { index, search })
+}
+
+fn on_disk(dir: &Path, name: &str) -> Option<PathBuf> {
+    let path = dir.join(exe_name(name));
+    path.is_file().then_some(path)
+}
+
+fn exe_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    }
 }
 
 /// Shard directory for a data root: `<data>/providers/zoekt/index`,
@@ -69,7 +100,7 @@ pub(crate) fn ensure_report(
     snapshot_id: &str,
     timeout: Duration,
 ) -> ProviderReport {
-    detect().map_or_else(missing_report, |tools| {
+    detect(data_root).map_or_else(missing_report, |tools| {
         ensure_index(&tools, repo_root, data_root, snapshot_id, timeout)
             .unwrap_or_else(|error| failed_report(&error))
     })
@@ -91,8 +122,8 @@ fn report_shell(state: ProviderState, message: Option<String>) -> ProviderReport
 
 /// Detect-state report for the providers surface — probes the toolchain
 /// without executing anything.
-pub(crate) fn detect_report() -> ProviderReport {
-    match detect() {
+pub(crate) fn detect_report(data_root: &Path) -> ProviderReport {
+    match detect(data_root) {
         Some(tools) => ProviderReport {
             tool: Some(format!(
                 "{} + {}",
@@ -109,11 +140,10 @@ fn missing_report() -> ProviderReport {
     report_shell(
         ProviderState::Missing,
         Some(
-            "zoekt/zoekt-index not on PATH; install \
-             github.com/sourcegraph/zoekt (`go install \
-             github.com/sourcegraph/zoekt/cmd/zoekt@latest \
-             github.com/sourcegraph/zoekt/cmd/zoekt-index@latest`) \
-             or set CCE_ZOEKT/CCE_ZOEKT_INDEX"
+            "zoekt/zoekt-index not found; run `cce providers --provision` \
+             to install the pinned toolchain into the managed cache, \
+             install github.com/sourcegraph/zoekt yourself, or set \
+             CCE_ZOEKT/CCE_ZOEKT_INDEX"
                 .to_owned(),
         ),
     )
@@ -501,6 +531,211 @@ pub(crate) fn smallest_regions_for_lines(
         .collect()
 }
 
+/// Install the pinned toolchain into the managed cache — the explicit
+/// network opt-in behind `cce providers --provision`.
+///
+/// Assets built by CCE's release CI are preferred (checksum-verified);
+/// when this build's version has no release assets the fallback installs
+/// the same pinned revision through `go install`. Either way the
+/// binaries land in `bin_dir`, where `detect` picks them up.
+///
+/// Blocking: performs network I/O and subprocesses. Callers on an async
+/// executor must use `spawn_blocking` — the blocking HTTP client's
+/// runtime cannot drop inside async context.
+pub fn provision(data_root: &Path) -> ProviderReport {
+    if let Some(tools) = detect(data_root) {
+        return ProviderReport {
+            tool: Some(format!(
+                "{} + {}",
+                tools.index.display(),
+                tools.search.display()
+            )),
+            ..report_shell(ProviderState::Ready, None)
+        };
+    }
+    let dir = bin_dir(data_root);
+    match provision_into(&dir) {
+        Ok(source) => {
+            write_manifest(&dir, source);
+            match detect(data_root) {
+                Some(tools) => ProviderReport {
+                    tool: Some(format!(
+                        "{} + {}",
+                        tools.index.display(),
+                        tools.search.display()
+                    )),
+                    ..report_shell(
+                        ProviderState::Ready,
+                        Some(format!("provisioned zoekt@{ZOEKT_REF} ({source})")),
+                    )
+                },
+                None => report_shell(
+                    ProviderState::Failed,
+                    Some(format!(
+                        "binaries installed but not found under {}",
+                        dir.display()
+                    )),
+                ),
+            }
+        }
+        Err(error) => report_shell(
+            ProviderState::Missing,
+            Some(format!(
+                "{error}; install github.com/sourcegraph/zoekt manually or set \
+                 CCE_ZOEKT/CCE_ZOEKT_INDEX"
+            )),
+        ),
+    }
+}
+
+fn provision_into(dir: &Path) -> Result<&'static str, String> {
+    download_release(dir).or_else(|release_err| {
+        go_install(dir)
+            .map(|()| "go-install")
+            .map_err(|go_err| format!("release download: {release_err}; go install: {go_err}"))
+    })
+}
+
+/// Download `zoekt`/`zoekt-index` assets for the host triple from the
+/// `v{CARGO_PKG_VERSION}` GitHub release, verifying each against the
+/// release's `zoekt-SHA256SUMS.txt` before atomically renaming into
+/// place.
+fn download_release(dir: &Path) -> Result<&'static str, String> {
+    let triple = host_triple().ok_or_else(|| {
+        format!(
+            "no release asset for host {}-{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        )
+    })?;
+    let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let base = format!("https://github.com/wibus-wee/CCE/releases/download/{tag}");
+    let client = reqwest::blocking::Client::new();
+    let sums = fetch_text(&client, &format!("{base}/zoekt-SHA256SUMS.txt"))
+        .map_err(|e| format!("release {tag} zoekt sums unavailable: {e}"))?;
+    let expected = parse_sha256sums(&sums);
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    for tool in ["zoekt", "zoekt-index"] {
+        let asset = format!("{tool}-{triple}{}", exe_suffix());
+        let want = expected
+            .get(asset.as_str())
+            .ok_or_else(|| format!("{asset} missing from zoekt-SHA256SUMS.txt"))?;
+        let bytes = fetch_bytes(&client, &format!("{base}/{asset}"))?;
+        let got = hex_sha256(&bytes);
+        if got != *want {
+            return Err(format!(
+                "{asset} checksum mismatch: expected {want}, got {got}"
+            ));
+        }
+        install_binary(dir, &exe_name(tool), &bytes)
+            .map_err(|e| format!("install {asset}: {e}"))?;
+    }
+    Ok("release")
+}
+
+/// `go install` both binaries at the pinned revision into a staging dir,
+/// then rename into `dir`. The Go checksum database already attests the
+/// module bytes; the staged rename keeps an interrupted install from
+/// leaving a half-written binary in the detected location.
+fn go_install(dir: &Path) -> Result<(), String> {
+    let go = on_path("go").ok_or_else(|| "go toolchain not on PATH".to_owned())?;
+    let staging = dir.join(".staging");
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+    for tool in ["zoekt", "zoekt-index"] {
+        let output = std::process::Command::new(&go)
+            .env("GOBIN", &staging)
+            .args([
+                "install",
+                &format!("github.com/sourcegraph/zoekt/cmd/{tool}@{ZOEKT_REF}"),
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "go install {tool}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let staged = staging.join(exe_name(tool));
+        std::fs::rename(&staged, dir.join(exe_name(tool))).map_err(|e| e.to_string())?;
+    }
+    let _ = std::fs::remove_dir(&staging);
+    Ok(())
+}
+
+fn fetch_text(client: &reqwest::blocking::Client, url: &str) -> Result<String, String> {
+    let body = fetch_bytes(client, url)?;
+    String::from_utf8(body).map_err(|e| e.to_string())
+}
+
+fn fetch_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>, String> {
+    client
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .and_then(reqwest::blocking::Response::bytes)
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| e.to_string())
+}
+
+/// Parse `<hex>  <name>` / `<hex> *<name>` lines from a sha256sum
+/// manifest (GNU coreutils text/binary marker included).
+fn parse_sha256sums(body: &str) -> std::collections::HashMap<String, String> {
+    body.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let hex = parts.next()?;
+            let name = parts.next()?;
+            Some((name.trim_start_matches('*').to_owned(), hex.to_owned()))
+        })
+        .collect()
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// Write bytes to a temp file in `dir`, mark executable, rename into
+/// place — partial downloads never occupy the detected path.
+fn install_binary(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, dir.join(name))
+}
+
+fn write_manifest(dir: &Path, source: &str) {
+    let manifest = serde_json::json!({
+        "provider": "zoekt",
+        "ref": ZOEKT_REF,
+        "source": source,
+    });
+    let _ = std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    );
+}
+
+fn host_triple() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
+        _ => None,
+    }
+}
+
+const fn exe_suffix() -> &'static str {
+    if cfg!(windows) { ".exe" } else { "" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,6 +771,70 @@ mod tests {
             decode_base64_line(encoded).as_deref(),
             Some("from django.io import x\n")
         );
+    }
+
+    #[test]
+    fn parse_sha256sums_handles_text_and_binary_markers() {
+        let sums = parse_sha256sums(
+            "abc123  zoekt-x86_64-unknown-linux-gnu\n\
+             def456 *zoekt-index-x86_64-pc-windows-msvc.exe\n",
+        );
+        assert_eq!(
+            sums.get("zoekt-x86_64-unknown-linux-gnu")
+                .map(String::as_str),
+            Some("abc123")
+        );
+        assert_eq!(
+            sums.get("zoekt-index-x86_64-pc-windows-msvc.exe")
+                .map(String::as_str),
+            Some("def456")
+        );
+    }
+
+    #[test]
+    fn detect_finds_managed_cache_binaries() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let bin = bin_dir(data.path());
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        for tool in ["zoekt", "zoekt-index"] {
+            std::fs::write(bin.join(exe_name(tool)), b"#!/bin/sh\n").expect("stub");
+        }
+        // PATH/env may already resolve zoekt on a dev machine; the
+        // managed lane must at least be consulted, so probe each lane's
+        // fallback directly rather than the whole chain.
+        let tools = on_disk(&bin, "zoekt").zip(on_disk(&bin, "zoekt-index"));
+        assert!(tools.is_some());
+    }
+
+    #[test]
+    fn detect_reports_missing_without_tools() {
+        // With no env override, no PATH match, and an empty managed cache
+        // the report must surface Missing — never silent coverage.
+        let data = tempfile::tempdir().expect("tempdir");
+        if detect(data.path()).is_none() {
+            assert_eq!(detect_report(data.path()).state, ProviderState::Missing);
+        }
+    }
+
+    #[test]
+    fn install_binary_lands_executable_without_temp_leftover() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        install_binary(dir.path(), "zoekt", b"binary-bytes").expect("install");
+        let installed = dir.path().join("zoekt");
+        assert_eq!(std::fs::read(&installed).expect("read"), b"binary-bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&installed)
+                    .expect("meta")
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0o111
+            );
+        }
+        assert!(!dir.path().join(".zoekt.tmp").exists());
     }
 
     #[test]
