@@ -336,8 +336,30 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// SIGINT (Ctrl-C) or SIGTERM (docker stop, K8s pod termination) both
+/// drain in-flight connections — a hard kill mid-proxy would surface as
+/// truncated responses to callers.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let control_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "failed to install Ctrl-C handler");
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => tracing::error!(%error, "failed to install SIGTERM handler"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = control_c => {},
+        () = terminate => {},
+    }
 }
 
 /// Releases a singleflight leader slot on drop: every proxy exit path
