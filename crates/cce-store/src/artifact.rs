@@ -75,6 +75,9 @@ pub struct ArtifactStore {
     root: PathBuf,
     objects: PathBuf,
     temporary: PathBuf,
+    /// Successful `read` calls (verify + bytes) served by this store —
+    /// diagnostics for batch materialization, not a security boundary.
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ArtifactStore {
@@ -92,7 +95,14 @@ impl ArtifactStore {
             root,
             objects,
             temporary,
+            reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// Successful integrity-verified reads served so far — tests use this
+    /// to prove grouped materialization touches each artifact once.
+    pub fn read_count(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Store `bytes` under its BLAKE3 digest; idempotent and atomic.
@@ -161,6 +171,8 @@ impl ArtifactStore {
         if actual != digest {
             return Err(CceError::ArtifactCorrupt(digest.to_owned()));
         }
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(bytes)
     }
 

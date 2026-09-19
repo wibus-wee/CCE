@@ -378,6 +378,17 @@ impl DenseIndex {
         embedder: &impl Embedder,
         limit: usize,
     ) -> Result<Vec<DenseSearchHit>> {
+        let query = self.embed_query(query, embedder).await?;
+        Ok(self.score(&query, limit))
+    }
+
+    /// The embedding half of `search`, instrumented separately from
+    /// scoring. `embedder` profile must match the index's build profile.
+    ///
+    /// # Errors
+    /// `Configuration` on profile mismatch; `Embedding` on query failure
+    /// or a dimension that does not match the index.
+    pub async fn embed_query(&self, query: &str, embedder: &impl Embedder) -> Result<Vec<f32>> {
         if embedder.profile() != self.profile {
             return Err(CceError::Configuration(format!(
                 "dense index profile {} does not match query profile {}",
@@ -399,18 +410,27 @@ impl DenseIndex {
                 self.dimensions
             )));
         }
+        Ok(query)
+    }
+
+    /// The scoring half of `search`: flat dot product over every vector,
+    /// descending sort, truncate to `limit`. `query` must already be
+    /// dimension-checked against this index (see `embed_query`).
+    #[must_use]
+    pub(crate) fn score(&self, query: &[f32], limit: usize) -> Vec<DenseSearchHit> {
+        debug_assert_eq!(query.len(), self.dimensions);
         let mut hits = self
             .ids
             .iter()
             .zip(self.vectors.chunks_exact(self.dimensions))
             .map(|(id, vector)| DenseSearchHit {
                 document_id: id.clone(),
-                score: dot(&query, vector),
+                score: dot(query, vector),
             })
             .collect::<Vec<_>>();
         hits.sort_by(|left, right| right.score.total_cmp(&left.score));
         hits.truncate(limit);
-        Ok(hits)
+        hits
     }
 
     /// Serialize to the `CCEVEC1` binary format for artifact storage.
@@ -712,5 +732,73 @@ mod tests {
             .await
             .expect("fresh index");
         assert_eq!(next_index, fresh);
+    }
+
+    /// An embedder reporting a different profile than the index's build
+    /// profile must be rejected — never scored against foreign vectors.
+    #[tokio::test]
+    async fn profile_mismatch_is_rejected() {
+        struct Foreign;
+        #[async_trait]
+        impl Embedder for Foreign {
+            fn profile(&self) -> &'static str {
+                "some-other-embedder"
+            }
+            fn production_ready(&self) -> bool {
+                false
+            }
+            async fn embed(&self, inputs: &[String], _role: EmbedRole) -> Result<Vec<Vec<f32>>> {
+                Ok(inputs.iter().map(|_| vec![0.0_f32; 64]).collect())
+            }
+        }
+
+        let embedder = DeterministicEmbedder::new(64).expect("embedder");
+        let index = DenseIndex::build(
+            &[document("a", "resume cursor persistence")],
+            &embedder,
+            8,
+            None,
+        )
+        .await
+        .expect("index");
+        let error = index
+            .embed_query("resume cursor", &Foreign)
+            .await
+            .expect_err("foreign profile must not score");
+        assert!(matches!(error, CceError::Configuration(_)));
+    }
+
+    /// `embed_query` + `score` is the instrumentable form of `search` —
+    /// the split must return identical hits.
+    #[tokio::test]
+    async fn split_search_matches_search() {
+        let embedder = DeterministicEmbedder::new(64).expect("embedder");
+        let documents = vec![
+            document("a", "resume cursor persistence"),
+            document("b", "unrelated CSS styles"),
+            document("c", "cursor resume replay"),
+        ];
+        let index = DenseIndex::build(&documents, &embedder, 8, None)
+            .await
+            .expect("index");
+        let fused = index
+            .search("cursor resume", &embedder, 2)
+            .await
+            .expect("search");
+        let query = index
+            .embed_query("cursor resume", &embedder)
+            .await
+            .expect("embed");
+        let split = index.score(&query, 2);
+        assert_eq!(
+            fused
+                .iter()
+                .map(|hit| (hit.document_id.as_str(), hit.score))
+                .collect::<Vec<_>>(),
+            split
+                .iter()
+                .map(|hit| (hit.document_id.as_str(), hit.score))
+                .collect::<Vec<_>>()
+        );
     }
 }
