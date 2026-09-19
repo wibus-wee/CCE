@@ -2356,7 +2356,7 @@ impl MetadataStore {
             let mut statement = connection
                 .prepare(
                     "SELECT id, entity_id, region_id, representation, address_json,
-                     body_artifact_digest, evidence_json
+                     body_artifact_digest, evidence_json, generated_by
                      FROM retrieval_documents WHERE snapshot_id=?1 ORDER BY id",
                 )
                 .map_err(storage_error)?;
@@ -2370,6 +2370,7 @@ impl MetadataStore {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 })
                 .map_err(storage_error)?
@@ -2386,21 +2387,51 @@ impl MetadataStore {
                     address_json,
                     digest,
                     evidence_json,
+                    generated_by,
                 )| {
                     let address: Option<SourceAddress> =
                         address_json.as_deref().map(parse_json).transpose()?;
-                    let text = if let Some(address) = &address {
-                        self.source_text(address)?
-                    } else {
-                        let bytes = self.artifacts.read(&digest)?;
+                    let artifact_text = |digest: &str| -> Result<String> {
+                        let bytes = self.artifacts.read(digest)?;
                         String::from_utf8(bytes)
-                            .map_err(|_| CceError::ArtifactCorrupt(digest.clone()))?
+                            .map_err(|_| CceError::ArtifactCorrupt(digest.to_owned()))
+                    };
+                    // Body location is a contract keyed on generated_by, not
+                    // on whether an address exists: v2 descriptors carry their
+                    // own artifact while `address` keeps pointing at source
+                    // for provenance. v1 descriptors never persisted their
+                    // body — their artifact IS the source file, so they keep
+                    // the old slice semantics. Anything else follows the
+                    // original rule: address → source slice, else artifact.
+                    let representation: RetrievalRepresentation = parse_json(&representation)?;
+                    let text = match representation {
+                        RetrievalRepresentation::FileDescriptor
+                        | RetrievalRepresentation::SymbolSummary => match generated_by.as_deref() {
+                            Some("cce-file-descriptor-v2" | "cce-symbol-descriptor-v2") => {
+                                artifact_text(&digest)?
+                            }
+                            Some("cce-file-descriptor-v1" | "cce-symbol-descriptor-v1") | None => {
+                                match &address {
+                                    Some(address) => self.source_text(address)?,
+                                    None => artifact_text(&digest)?,
+                                }
+                            }
+                            Some(other) => {
+                                return Err(CceError::ArtifactCorrupt(format!(
+                                    "{document_id}: unknown descriptor version {other}"
+                                )));
+                            }
+                        },
+                        _ => match &address {
+                            Some(address) => self.source_text(address)?,
+                            None => artifact_text(&digest)?,
+                        },
                     };
                     Ok(DocumentContent {
                         document_id,
                         entity_id,
                         region_id,
-                        representation: parse_json(&representation)?,
+                        representation,
                         address,
                         evidence: parse_json(&evidence_json)?,
                         text,
@@ -3824,6 +3855,215 @@ mod tests {
         assert_eq!(
             store.current_snapshot("repo_a").expect("current"),
             Some("snap_b".to_owned())
+        );
+    }
+
+    /// Descriptor bodies live in their own artifacts under -v2 `generated_by`;
+    /// `address` stays provenance-only. v1/missing versions keep the old
+    /// source-slice semantics so historical snapshots still read correctly.
+    #[test]
+    fn descriptor_bodies_restore_by_version() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        store
+            .register_repository(&RepositoryIdentity {
+                id: "repo_t".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            })
+            .expect("repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_t".to_owned(),
+            repository_id: "repo_t".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 1,
+            source_bytes: 24,
+        };
+        store.begin_snapshot(&snapshot).expect("begin");
+
+        let source_bytes = b"fn helper() {}\n// rest of file\n";
+        let source = store
+            .artifacts()
+            .put_bytes(crate::ArtifactKind::Source, source_bytes)
+            .expect("source artifact");
+        let descriptor_text = "function helper in src/lib.rs — fn helper()";
+        let descriptor = store
+            .artifacts()
+            .put_bytes(
+                crate::ArtifactKind::RetrievalText,
+                descriptor_text.as_bytes(),
+            )
+            .expect("descriptor artifact");
+        let unit_address = SourceAddress::new("repo_t", "snap_t", "src/lib.rs", 0..14, 1..=1)
+            .expect("unit address");
+
+        let document = |id: &str,
+                        representation: RetrievalRepresentation,
+                        digest: &str,
+                        address: Option<SourceAddress>,
+                        generated_by: Option<&str>| IndexedDocument {
+            document: RetrievalDocument {
+                id: id.to_owned(),
+                entity_id: "e_helper".to_owned(),
+                region_id: None,
+                snapshot_id: "snap_t".to_owned(),
+                representation,
+                body_artifact_digest: digest.to_owned(),
+                address,
+                embedding_profile: None,
+                generated_by: generated_by.map(str::to_owned),
+                evidence: Vec::new(),
+                terms: Vec::new(),
+            },
+            path: "src/lib.rs".to_owned(),
+            name: "helper".to_owned(),
+            body: String::new(),
+        };
+
+        let records = SnapshotRecords {
+            artifacts: vec![source.clone(), descriptor.clone()],
+            files: vec![SourceFileRecord {
+                path: "src/lib.rs".to_owned(),
+                language: Some("rust".to_owned()),
+                content_hash: "hash".to_owned(),
+                artifact: source.clone(),
+                byte_count: source_bytes.len() as u64,
+                line_count: 2,
+                analysis_artifact_digest: None,
+            }],
+            documents: vec![
+                // v2 symbol summary: descriptor text, address is provenance.
+                document(
+                    "d_v2_summary",
+                    RetrievalRepresentation::SymbolSummary,
+                    &descriptor.digest,
+                    Some(unit_address.clone()),
+                    Some("cce-symbol-descriptor-v2"),
+                ),
+                // v1 symbol summary: body was never persisted — the legacy
+                // slice through `address` is the only faithful restore.
+                document(
+                    "d_v1_summary",
+                    RetrievalRepresentation::SymbolSummary,
+                    &source.digest,
+                    Some(unit_address.clone()),
+                    Some("cce-symbol-descriptor-v1"),
+                ),
+                // Raw code: source slice regardless of version.
+                document(
+                    "d_raw",
+                    RetrievalRepresentation::RawCode,
+                    &source.digest,
+                    Some(unit_address),
+                    None,
+                ),
+                // v2 file descriptor: dedicated artifact, no address.
+                document(
+                    "d_v2_file",
+                    RetrievalRepresentation::FileDescriptor,
+                    &descriptor.digest,
+                    None,
+                    Some("cce-file-descriptor-v2"),
+                ),
+                // v1 file descriptor: artifact was the whole file.
+                document(
+                    "d_v1_file",
+                    RetrievalRepresentation::FileDescriptor,
+                    &source.digest,
+                    None,
+                    Some("cce-file-descriptor-v1"),
+                ),
+            ],
+            ..SnapshotRecords::default()
+        };
+        store.commit_snapshot(&snapshot, &records).expect("commit");
+
+        let contents = store.documents_for_snapshot("snap_t").expect("documents");
+        let text_of = |id: &str| {
+            contents
+                .iter()
+                .find(|doc| doc.document_id == id)
+                .unwrap_or_else(|| panic!("missing document {id}"))
+                .text
+                .as_str()
+        };
+        // v2 reads the descriptor artifact verbatim — not the source slice.
+        assert_eq!(text_of("d_v2_summary"), descriptor_text);
+        assert_eq!(text_of("d_v2_file"), descriptor_text);
+        // v1 keeps source semantics: summary slices the unit range, the file
+        // descriptor restores the whole file artifact.
+        assert_eq!(text_of("d_v1_summary"), "fn helper() {}");
+        assert_eq!(text_of("d_v1_file"), "fn helper() {}\n// rest of file\n");
+        // Raw code slices source as before.
+        assert_eq!(text_of("d_raw"), "fn helper() {}");
+
+        // The descriptor artifact is referenced — artifact GC must keep it.
+        store.gc_artifacts().expect("gc artifacts");
+        assert_eq!(
+            store
+                .artifacts()
+                .read(&descriptor.digest)
+                .expect("descriptor artifact survives gc"),
+            descriptor_text.as_bytes()
+        );
+    }
+
+    #[test]
+    fn unknown_descriptor_version_errors_instead_of_guessing() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        store
+            .register_repository(&RepositoryIdentity {
+                id: "repo_t".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            })
+            .expect("repository");
+        let snapshot = SnapshotIdentity {
+            id: "snap_t".to_owned(),
+            repository_id: "repo_t".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        store.begin_snapshot(&snapshot).expect("begin");
+        let artifact = store
+            .artifacts()
+            .put_bytes(crate::ArtifactKind::RetrievalText, b"body")
+            .expect("artifact");
+        let records = SnapshotRecords {
+            artifacts: vec![artifact.clone()],
+            documents: vec![IndexedDocument {
+                document: RetrievalDocument {
+                    id: "d_unknown".to_owned(),
+                    entity_id: "e".to_owned(),
+                    region_id: None,
+                    snapshot_id: "snap_t".to_owned(),
+                    representation: RetrievalRepresentation::SymbolSummary,
+                    body_artifact_digest: artifact.digest,
+                    address: None,
+                    embedding_profile: None,
+                    generated_by: Some("cce-symbol-descriptor-v9".to_owned()),
+                    evidence: Vec::new(),
+                    terms: Vec::new(),
+                },
+                path: "src/lib.rs".to_owned(),
+                name: "helper".to_owned(),
+                body: String::new(),
+            }],
+            ..SnapshotRecords::default()
+        };
+        store.commit_snapshot(&snapshot, &records).expect("commit");
+        let error = store.documents_for_snapshot("snap_t");
+        assert!(
+            matches!(error, Err(CceError::ArtifactCorrupt(_))),
+            "unknown descriptor version must error, got {error:?}"
         );
     }
 }

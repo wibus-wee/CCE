@@ -195,6 +195,12 @@ impl EngineConfig {
         options.insert("call_edges".to_owned(), "v2".to_owned());
         // Same rule for type references: v2 dedups on (source, target).
         options.insert("type_refs".to_owned(), "v2".to_owned());
+        // Descriptor materialization: v2 persists FileDescriptor and
+        // SymbolSummary bodies as their own artifacts (read dispatch keys on
+        // generated_by -v2). v1 pointed those documents at the source file
+        // artifact, so restored/dense-embedded text was raw source — snapshots
+        // built under v1 must not satisfy a v2 profile.
+        options.insert("descriptor_bodies".to_owned(), "v2".to_owned());
         IndexProfile {
             schema_version: DATA_FORMAT_VERSION,
             engine_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -236,6 +242,10 @@ mod tests {
             profile.options.get("type_refs").map(String::as_str),
             Some("v2")
         );
+        assert_eq!(
+            profile.options.get("descriptor_bodies").map(String::as_str),
+            Some("v2")
+        );
 
         let mut legacy = profile.clone();
         legacy
@@ -247,6 +257,9 @@ mod tests {
         legacy
             .options
             .insert("type_refs".to_owned(), "v1".to_owned());
+        legacy
+            .options
+            .insert("descriptor_bodies".to_owned(), "v1".to_owned());
         assert_ne!(
             profile_hash(&profile),
             profile_hash(&legacy),

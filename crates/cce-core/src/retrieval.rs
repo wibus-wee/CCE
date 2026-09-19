@@ -124,13 +124,19 @@ pub struct RetrievalDocument {
     pub snapshot_id: String,
     /// Which representation the body carries.
     pub representation: RetrievalRepresentation,
-    /// Content-addressed digest of the body payload.
+    /// Content-addressed digest of the body payload. For v2 descriptors
+    /// (`cce-file-descriptor-v2`, `cce-symbol-descriptor-v2`) this artifact
+    /// holds the descriptor text itself; under older `generated_by` versions
+    /// it is the source file artifact and the body is recovered by slicing
+    /// `address` — see `documents_for_snapshot` for the version dispatch.
     pub body_artifact_digest: String,
     /// Canonical region this document's content is drawn from, when it maps
     /// to a concrete source range.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region_id: Option<String>,
     /// Source address of the document's primary range, when applicable.
+    /// Always provenance pointing at source — never the location of a
+    /// descriptor's body text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<SourceAddress>,
     /// Embedding profile used for dense indexing, when embedded.

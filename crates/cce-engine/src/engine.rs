@@ -893,7 +893,14 @@ impl CceEngine {
 
             // L1 file descriptor: bounded routing evidence (path, language,
             // imports, top-level signatures) instead of the whole file body.
+            // The descriptor text is its own artifact — the file artifact
+            // stays addressable as source, the descriptor restores verbatim.
             let descriptor = file_descriptor(file, file_text, parsed);
+            let descriptor_artifact = self
+                .store
+                .artifacts()
+                .put_bytes(ArtifactKind::RetrievalText, descriptor.as_bytes())?;
+            records.artifacts.push(descriptor_artifact.clone());
             records.documents.push(IndexedDocument {
                 document: RetrievalDocument {
                     id: document_id(file_id, "file_descriptor", 0, descriptor.len()),
@@ -901,10 +908,10 @@ impl CceEngine {
                     region_id: Some(file_region_id.clone()),
                     snapshot_id: scanned.snapshot.id.clone(),
                     representation: RetrievalRepresentation::FileDescriptor,
-                    body_artifact_digest: file_artifact.clone(),
+                    body_artifact_digest: descriptor_artifact.digest,
                     address: None,
                     embedding_profile: None,
-                    generated_by: Some("cce-file-descriptor-v1".to_owned()),
+                    generated_by: Some("cce-file-descriptor-v2".to_owned()),
                     evidence: Vec::new(),
                     terms: lexical_terms(&descriptor),
                 },
@@ -1136,8 +1143,15 @@ impl CceEngine {
                 // descriptor per symbol. This is the dense/lexical bridge
                 // between "which code marks views stale" phrasing and
                 // identifier-shaped implementation names — semantic material,
-                // not generated knowledge.
+                // not generated knowledge. The descriptor text is its own
+                // artifact; `address` keeps pointing at the source unit —
+                // provenance, not body location.
                 let summary_body = symbol_descriptor(&file.relative_path, file_text, parsed, index);
+                let summary_artifact = self
+                    .store
+                    .artifacts()
+                    .put_bytes(ArtifactKind::RetrievalText, summary_body.as_bytes())?;
+                records.artifacts.push(summary_artifact.clone());
                 records.documents.push(IndexedDocument {
                     document: RetrievalDocument {
                         id: document_id(&unit_id, "symbol_summary", 0, summary_body.len()),
@@ -1145,10 +1159,10 @@ impl CceEngine {
                         region_id: Some(unit_region_id.clone()),
                         snapshot_id: scanned.snapshot.id.clone(),
                         representation: RetrievalRepresentation::SymbolSummary,
-                        body_artifact_digest: file_artifact.clone(),
+                        body_artifact_digest: summary_artifact.digest,
                         address: Some(unit_address.clone()),
                         embedding_profile: None,
-                        generated_by: Some("cce-symbol-descriptor-v1".to_owned()),
+                        generated_by: Some("cce-symbol-descriptor-v2".to_owned()),
                         evidence: Vec::new(),
                         terms: lexical_terms(&summary_body),
                     },
@@ -2297,7 +2311,10 @@ fn split_identifier_words(name: &str) -> String {
 /// is topical vocabulary, not a doc extract.
 fn leading_doc_comment(file_text: &str, start_line: u32) -> Option<String> {
     let lines: Vec<&str> = file_text.lines().collect();
-    let mut cursor = start_line as usize;
+    // `start_line` is 1-based and points at the declaration itself —
+    // begin one line above it, or the loop inspects the declaration first
+    // and exits on ordinary code before ever seeing the comment.
+    let mut cursor = (start_line as usize).saturating_sub(1);
     let mut collected: Vec<String> = Vec::new();
     while cursor > 0 && collected.len() < 4 {
         cursor -= 1;
@@ -2333,10 +2350,8 @@ fn leading_doc_comment(file_text: &str, start_line: u32) -> Option<String> {
         }
         if trimmed.ends_with("*/") {
             // Walk back to the block comment opener, collecting content.
-            while cursor > 0 {
-                let Some(inner) = lines.get(cursor).map(|line| line.trim()) else {
-                    break;
-                };
+            // The opener may sit on line 0 — process it before stopping.
+            while let Some(inner) = lines.get(cursor).map(|line| line.trim()) {
                 let is_open = inner.contains("/*");
                 let body = inner
                     .trim_end_matches("*/")
@@ -2346,10 +2361,10 @@ fn leading_doc_comment(file_text: &str, start_line: u32) -> Option<String> {
                 if !body.is_empty() {
                     collected.push(body.to_owned());
                 }
-                cursor -= 1;
-                if is_open {
+                if is_open || cursor == 0 {
                     break;
                 }
+                cursor -= 1;
             }
             continue;
         }
@@ -2602,5 +2617,72 @@ mod tests {
         let terms = lexical_terms("resumeAttempt workspace_overlay");
         assert!(terms.contains(&"resume".to_owned()));
         assert!(terms.contains(&"attempt".to_owned()));
+    }
+
+    /// `start_line` is 1-based on the declaration — the walk must begin one
+    /// line above it, otherwise the declaration itself eats the first probe
+    /// and the comment is never seen.
+    #[test]
+    fn leading_doc_comment_reads_above_the_declaration() {
+        let text = "/// Marks views stale.\nfn mark_stale() {}\n";
+        // Declaration on line 2 (1-based).
+        assert_eq!(
+            leading_doc_comment(text, 2).as_deref(),
+            Some("Marks views stale.")
+        );
+    }
+
+    #[test]
+    fn leading_doc_comment_declaration_is_not_a_comment() {
+        // No comment at all — the declaration line must not be collected.
+        let text = "fn plain() {}\n";
+        assert_eq!(leading_doc_comment(text, 1), None);
+    }
+
+    #[test]
+    fn leading_doc_comment_first_line_declaration_has_none() {
+        let text = "fn top() {}\n// trailing\n";
+        assert_eq!(leading_doc_comment(text, 1), None);
+    }
+
+    #[test]
+    fn leading_doc_comment_collects_contiguous_lines() {
+        let text = "/// First line.\n/// Second line.\nfn documented() {}\n";
+        assert_eq!(
+            leading_doc_comment(text, 3).as_deref(),
+            Some("First line. Second line.")
+        );
+    }
+
+    #[test]
+    fn leading_doc_comment_stops_at_code() {
+        let text = "// unattached\nfn gap() {}\n\n/// Attached.\nfn documented() {}\n";
+        // Line 5 declaration; line 4 is the comment, line 3 blank separates
+        // it from the earlier code.
+        assert_eq!(leading_doc_comment(text, 5).as_deref(), Some("Attached."));
+    }
+
+    #[test]
+    fn leading_doc_comment_skips_attributes() {
+        let text = "/// Docs.\n#[inline]\n#[doc = \"inner\"]\nfn attributed() {}\n";
+        assert_eq!(leading_doc_comment(text, 4).as_deref(), Some("Docs. inner"));
+    }
+
+    #[test]
+    fn leading_doc_comment_reads_block_comments() {
+        let text = "/* Block\n * comment\n */\nfn blocked() {}\n";
+        assert_eq!(
+            leading_doc_comment(text, 4).as_deref(),
+            Some("Block comment")
+        );
+    }
+
+    #[test]
+    fn leading_doc_comment_handles_multibyte_text() {
+        let text = "/// 中文注释说明。\nfn cjk() {}\n";
+        assert_eq!(
+            leading_doc_comment(text, 2).as_deref(),
+            Some("中文注释说明。")
+        );
     }
 }

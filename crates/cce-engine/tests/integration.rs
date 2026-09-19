@@ -196,6 +196,92 @@ async fn working_tree_change_marks_views_stale() {
     assert_eq!(manifest.views[&ViewKind::Lexical].state, ViewState::Stale);
 }
 
+/// The dense path must embed the restored descriptor text — the document's
+/// `address` is provenance pointing at source, never the body location.
+/// A recording embedder asserts on the actual strings handed in, not on
+/// representation labels.
+#[tokio::test]
+async fn dense_embeds_descriptor_text_not_source() {
+    use cce_engine::{EmbedRole, Embedder};
+    use std::sync::Mutex;
+
+    struct Recording {
+        inputs: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for Recording {
+        fn profile(&self) -> &'static str {
+            "recording-test-embedder"
+        }
+        fn production_ready(&self) -> bool {
+            false
+        }
+        async fn embed(
+            &self,
+            inputs: &[String],
+            _role: EmbedRole,
+        ) -> cce_core::Result<Vec<Vec<f32>>> {
+            self.inputs
+                .lock()
+                .expect("inputs lock")
+                .extend(inputs.iter().cloned());
+            Ok(inputs.iter().map(|_| vec![1.0_f32; 32]).collect())
+        }
+    }
+
+    let repo = fixture_repo();
+    let engine = engine(repo.path());
+    let report = engine.index().await.expect("index");
+
+    let documents = engine
+        .store()
+        .documents_for_snapshot(&report.snapshot.id)
+        .expect("documents");
+    let recorder = Recording {
+        inputs: Mutex::new(Vec::new()),
+    };
+    cce_engine::DenseIndex::build(&documents, &recorder, 64, None)
+        .await
+        .expect("dense build");
+    let embedded = recorder.inputs.lock().expect("inputs lock").clone();
+
+    let summary = documents
+        .iter()
+        .find(|doc| doc.representation == RetrievalRepresentation::SymbolSummary)
+        .expect("symbol summary document");
+    // Restored text is the descriptor: signature surfaced, body absent.
+    assert!(
+        summary.text.contains("function ") && summary.text.contains(" in src/lib.rs"),
+        "descriptor-shaped text expected, got {:?}",
+        summary.text
+    );
+    assert!(
+        !summary.text.contains("cursor.is_empty()"),
+        "descriptor must not restore the source body: {:?}",
+        summary.text
+    );
+    // And the embedder received that exact string.
+    assert!(
+        embedded.iter().any(|input| input == &summary.text),
+        "embedder must receive the descriptor verbatim"
+    );
+
+    let file_descriptor = documents
+        .iter()
+        .find(|doc| doc.representation == RetrievalRepresentation::FileDescriptor)
+        .expect("file descriptor document");
+    assert!(
+        !file_descriptor.text.contains("cursor.is_empty()"),
+        "file descriptor must be bounded, got the whole file: {:?}",
+        file_descriptor.text
+    );
+    assert!(
+        embedded.iter().any(|input| input == &file_descriptor.text),
+        "embedder must receive the file descriptor verbatim"
+    );
+}
+
 #[tokio::test]
 async fn require_fresh_false_serves_committed_snapshot_unverified() {
     let repo = fixture_repo();

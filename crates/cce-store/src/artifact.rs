@@ -28,6 +28,9 @@ pub enum ArtifactKind {
     /// Full unified patch text captured for one commit during history
     /// indexing.
     CommitPatch,
+    /// Deterministic retrieval text (file/symbol descriptors) — materialized
+    /// bodies that are not source bytes and not generated knowledge.
+    RetrievalText,
     /// Anything not in the known set.
     Other,
 }
@@ -43,6 +46,7 @@ impl std::fmt::Display for ArtifactKind {
             Self::Model => "model",
             Self::ScipIndex => "scip_index",
             Self::CommitPatch => "commit_patch",
+            Self::RetrievalText => "retrieval_text",
             Self::Other => "other",
         };
         f.write_str(value)
@@ -270,5 +274,20 @@ mod tests {
             .expect("second write");
         assert_eq!(first.digest, second.digest);
         assert_eq!(store.read(&first.digest).expect("read"), b"same payload");
+    }
+
+    #[test]
+    fn artifact_kind_serializes_stably() {
+        // Kind strings are persisted on artifact rows — renames would strand
+        // existing objects under an unparseable label.
+        assert_eq!(
+            serde_json::to_string(&ArtifactKind::RetrievalText).expect("serialize"),
+            "\"retrieval_text\""
+        );
+        assert_eq!(ArtifactKind::RetrievalText.to_string(), "retrieval_text");
+        assert_eq!(
+            serde_json::from_str::<ArtifactKind>("\"retrieval_text\"").expect("parse"),
+            ArtifactKind::RetrievalText
+        );
     }
 }
