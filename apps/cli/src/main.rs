@@ -84,6 +84,10 @@ enum Command {
         routes: Vec<RouteArgument>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Serve the last committed snapshot without rescanning the
+        /// worktree — hits report `verifiedCurrent: false`.
+        #[arg(long)]
+        no_verify: bool,
     },
     Context {
         repository: PathBuf,
@@ -97,6 +101,10 @@ enum Command {
         budget: usize,
         #[arg(long, default_value_t = 50)]
         candidates: usize,
+        /// Serve the last committed snapshot without rescanning the
+        /// worktree — hits report `verifiedCurrent: false`.
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Package-level architecture map of the repository.
     Map {
@@ -282,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
             intent,
             routes,
             limit,
+            no_verify,
         } => {
             let engine = engine(&arguments, repository)?;
             let result = engine
@@ -291,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
                     query: query.clone(),
                     intent: intent.map(Into::into),
                     limit: *limit,
-                    require_fresh: true,
+                    require_fresh: !no_verify,
                     routes: routes.iter().map(|route| (*route).into()).collect(),
                     filters: cce_core::QueryFilters::default(),
                 })
@@ -305,10 +314,12 @@ async fn main() -> anyhow::Result<()> {
             routes,
             budget,
             candidates,
+            no_verify,
         } => {
             let engine = engine(&arguments, repository)?;
             let mut request = ContextRequest::new(query, *budget);
             request.intent = intent.map(Into::into);
+            request.require_fresh = !no_verify;
             request.routes = routes.iter().map(|route| (*route).into()).collect();
             request.max_candidates = *candidates;
             let pack = engine.context(request).await?;
