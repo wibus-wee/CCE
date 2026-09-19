@@ -104,4 +104,65 @@ mod tests {
         assert_eq!(query, "a:b lang: path:");
         assert!(filters.is_empty());
     }
+
+    #[test]
+    fn pat_filter_accepts_quoted_templates() {
+        let (query, filters) =
+            parse_query_filters("pat:'fn $F($$$A) { $$$B }' lang:rust auth flow");
+        assert_eq!(query, "auth flow");
+        assert_eq!(filters.pattern.as_deref(), Some("fn $F($$$A) { $$$B }"));
+        assert_eq!(filters.language.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn pat_filter_supports_double_quotes_and_inner_colons() {
+        let (query, filters) = parse_query_filters("pat:\"foo(:[x:1])\" bar");
+        assert_eq!(query, "bar");
+        assert_eq!(filters.pattern.as_deref(), Some("foo(:[x:1])"));
+    }
+
+    #[test]
+    fn pat_filter_bare_value_runs_to_whitespace() {
+        let (query, filters) = parse_query_filters("pat:unwrap() rest");
+        assert_eq!(query, "rest");
+        assert_eq!(filters.pattern.as_deref(), Some("unwrap()"));
+    }
+
+    #[test]
+    fn unclosed_pat_quote_stays_verbatim() {
+        let (query, filters) = parse_query_filters("pat:'fn $F( trailing");
+        assert_eq!(query, "pat:'fn $F( trailing");
+        assert!(filters.pattern.is_none());
+    }
+
+    #[test]
+    fn quoted_unknown_key_stays_verbatim_and_whole() {
+        let (query, filters) = parse_query_filters("repo:'my org/repo' fix");
+        assert_eq!(query, "repo:'my org/repo' fix");
+        assert!(filters.is_empty());
+    }
+
+    #[test]
+    fn patterntype_structural_promotes_bare_text() {
+        let (query, filters) =
+            parse_query_filters("patterntype:structural fmt.Println($$$X) lang:go");
+        assert_eq!(query, "");
+        assert_eq!(filters.pattern.as_deref(), Some("fmt.Println($$$X)"));
+        assert_eq!(filters.language.as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn patterntype_structural_loses_to_explicit_pat() {
+        let (query, filters) =
+            parse_query_filters("pat:'$A.lock()' patterntype:structural loose words");
+        assert_eq!(query, "loose words");
+        assert_eq!(filters.pattern.as_deref(), Some("$A.lock()"));
+    }
+
+    #[test]
+    fn mid_token_quotes_are_inert() {
+        let (query, filters) = parse_query_filters("don't stop lang:rust");
+        assert_eq!(query, "don't stop");
+        assert_eq!(filters.language.as_deref(), Some("rust"));
+    }
 }

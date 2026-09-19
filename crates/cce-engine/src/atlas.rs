@@ -34,6 +34,45 @@ pub struct PackageNode {
     pub dependents: Vec<String>,
 }
 
+/// Violation list cap — the count field still reports the full total.
+const VIOLATION_LIST_CAP: usize = 256;
+
+/// Serde label for a kind/origin (`calls`, `tree_sitter`) with a Debug
+/// fallback — serde naming stays the single owner of the wire format.
+fn serde_label(value: &(impl Serialize + std::fmt::Debug)) -> String {
+    serde_json::to_value(value).map_or_else(
+        |_| format!("{value:?}"),
+        |json| {
+            json.as_str()
+                .map_or_else(|| format!("{value:?}"), str::to_owned)
+        },
+    )
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+/// One observed code edge crossing a build boundary without a declared
+/// package dependency — deterministic evidence, not a rule judgement.
+pub struct BoundaryViolation {
+    /// Package the edge starts in.
+    pub source_package: String,
+    /// Package the edge lands in — not a declared dependency of the source.
+    pub target_package: String,
+    /// Edge kind (`imports`, `calls`, `references`, …).
+    pub kind: String,
+    /// Source entity name.
+    pub source_entity: String,
+    /// Target entity name.
+    pub target_entity: String,
+    /// Where the edge occurs — first evidence address, else the source
+    /// entity's own path.
+    pub evidence_path: String,
+    /// Derivation origin of the edge (`tree_sitter`, `scip`, …).
+    pub origin: String,
+    /// Edge confidence — syntax-derived edges are < 1.
+    pub confidence: f32,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// Package-level architecture map for a snapshot.
@@ -44,9 +83,11 @@ pub struct CodebaseMap {
     pub packages: Vec<PackageNode>,
     /// Number of `BuildDependsOn` edges between packages.
     pub dependency_edges: usize,
-    /// Boundary violations detected at the package level — currently empty;
-    /// direction rules arrive with the declared-architecture layer.
-    pub violations: Vec<String>,
+    /// Code edges crossing into a package that declares no dependency on
+    /// it — capped at `VIOLATION_LIST_CAP`; `violation_count` is the total.
+    pub violations: Vec<BoundaryViolation>,
+    /// Total undeclared-boundary edges observed (>= `violations.len()`).
+    pub violation_count: usize,
     /// How the map was produced.
     pub provenance: String,
 }
@@ -273,13 +314,143 @@ impl CceEngine {
             node.dependencies.sort();
             node.dependents.sort();
         }
+        let (violations, violation_count) =
+            self.boundary_violations(&snapshot_id, &package_list)?;
         Ok(CodebaseMap {
             snapshot_id,
             packages: package_list,
             dependency_edges: edges.len(),
-            violations: Vec::new(),
-            provenance: "build_system manifests (deterministic)".to_owned(),
+            violations,
+            violation_count,
+            provenance: "build_system manifests + typed relation graph (deterministic); \
+                 violations are code edges crossing undeclared package boundaries"
+                .to_owned(),
         })
+    }
+
+    /// Cross-package usage edges (`imports`, `calls`, `references`, …)
+    /// whose target package is not a declared `BuildDependsOn` dependency
+    /// of the source package. Package membership resolves by longest
+    /// `rootDir` prefix over entity paths; an edge with an unpackaged
+    /// endpoint (external crate, unmapped path) cannot violate a boundary
+    /// and is skipped.
+    fn boundary_violations(
+        &self,
+        snapshot_id: &str,
+        packages: &[PackageNode],
+    ) -> Result<(Vec<BoundaryViolation>, usize)> {
+        const KINDS: [RelationKind; 8] = [
+            RelationKind::Imports,
+            RelationKind::Exports,
+            RelationKind::References,
+            RelationKind::Implements,
+            RelationKind::Extends,
+            RelationKind::TypeUses,
+            RelationKind::Instantiates,
+            RelationKind::Calls,
+        ];
+        const EDGE_CAP: usize = 100_000;
+        if packages.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        // Longest prefix first so nested packages win over a workspace-root
+        // package (rootDir "" is the catch-all).
+        let mut roots: Vec<(&str, &str)> = packages
+            .iter()
+            .map(|node| (node.root_dir.as_str(), node.name.as_str()))
+            .collect();
+        roots.sort_by_key(|(root, _)| std::cmp::Reverse(root.len()));
+        let package_of = |path: &str| -> Option<&str> {
+            roots
+                .iter()
+                .find(|(root, _)| {
+                    root.is_empty()
+                        || path == *root
+                        || path
+                            .strip_prefix(root)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .map(|(_, name)| *name)
+        };
+        let mut declared: HashMap<&str, std::collections::HashSet<&str>> = HashMap::new();
+        for node in packages {
+            declared.insert(
+                node.name.as_str(),
+                node.dependencies.iter().map(String::as_str).collect(),
+            );
+        }
+        // One bulk entity load for endpoint resolution — path and name by id.
+        let entities: HashMap<String, (String, Option<String>)> = self
+            .store()
+            .entities_for_snapshot(snapshot_id)?
+            .into_iter()
+            .map(|entity| {
+                let path = entity.address.map(|address| address.path);
+                (entity.id, (entity.name, path))
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut violations = Vec::new();
+        let mut total = 0_usize;
+        for kind in &KINDS {
+            for edge in self
+                .store()
+                .relations_by_kind(snapshot_id, kind, EDGE_CAP)?
+            {
+                let Some((source_name, source_path)) = entities.get(&edge.source_entity_id) else {
+                    continue;
+                };
+                let Some((target_name, target_path)) = entities.get(&edge.target_entity_id) else {
+                    continue;
+                };
+                let (Some(source_path), Some(target_path)) = (source_path, target_path) else {
+                    continue;
+                };
+                let (Some(source_pkg), Some(target_pkg)) = (
+                    package_of(source_path.as_str()),
+                    package_of(target_path.as_str()),
+                ) else {
+                    continue;
+                };
+                if source_pkg == target_pkg
+                    || declared
+                        .get(source_pkg)
+                        .is_some_and(|deps| deps.contains(target_pkg))
+                {
+                    continue;
+                }
+                total += 1;
+                if !seen.insert((
+                    edge.kind.clone(),
+                    edge.source_entity_id.clone(),
+                    edge.target_entity_id.clone(),
+                )) {
+                    continue;
+                }
+                if violations.len() < VIOLATION_LIST_CAP {
+                    violations.push(BoundaryViolation {
+                        source_package: source_pkg.to_owned(),
+                        target_package: target_pkg.to_owned(),
+                        kind: serde_label(&edge.kind),
+                        source_entity: source_name.clone(),
+                        target_entity: target_name.clone(),
+                        evidence_path: edge
+                            .evidence
+                            .first()
+                            .map_or_else(|| source_path.clone(), |address| address.path.clone()),
+                        origin: serde_label(&edge.origin),
+                        confidence: edge.confidence,
+                    });
+                }
+            }
+        }
+        violations.sort_by(|left, right| {
+            left.source_package
+                .cmp(&right.source_package)
+                .then_with(|| left.target_package.cmp(&right.target_package))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        Ok((violations, total))
     }
 
     /// Explain one named component: package or symbol entity, its members,

@@ -107,6 +107,20 @@ impl Default for ProviderConfig {
     }
 }
 
+/// Which build product a scan+commit produces. Runtime-only — callers
+/// flip it per call, never persist it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexVariant {
+    /// Full pipeline: parse, providers, dense, zoekt, history.
+    #[default]
+    Full,
+    /// Shallow pass: parse + relations + artifacts only — the verify-loop
+    /// snapshot. A distinct profile hash means a distinct snapshot id for
+    /// identical content, so a checkpoint can never satisfy or shadow a
+    /// full index of the same worktree.
+    Checkpoint,
+}
+
 /// Root configuration for one engine instance (single repository scope).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
@@ -114,6 +128,10 @@ pub struct EngineConfig {
     pub repository_root: PathBuf,
     /// Where `.cce` state lives (`SQLite`, artifacts, provider work dirs).
     pub data_root: PathBuf,
+    /// Snapshot build variant — `index()` runs `Full`; `checkpoint()`
+    /// clones this config with `Checkpoint` for the scan, so the minted
+    /// snapshot carries the shallow profile in its identity.
+    pub variant: IndexVariant,
     /// Indexing tunables.
     pub index: IndexOptions,
     /// Dense embedding backend selection.
@@ -136,6 +154,7 @@ impl EngineConfig {
         Self {
             repository_root,
             data_root,
+            variant: IndexVariant::Full,
             index: IndexOptions::default(),
             dense: DenseBackendConfig::Disabled,
             reranker_model: None,
@@ -201,6 +220,12 @@ impl EngineConfig {
         // artifact, so restored/dense-embedded text was raw source — snapshots
         // built under v1 must not satisfy a v2 profile.
         options.insert("descriptor_bodies".to_owned(), "v2".to_owned());
+        // A checkpoint commits parse+relations only — no providers, dense,
+        // or zoekt. The marker lives in the profile so checkpoint snapshots
+        // get distinct ids from full snapshots of identical content.
+        if self.variant == IndexVariant::Checkpoint {
+            options.insert("snapshot_variant".to_owned(), "checkpoint".to_owned());
+        }
         IndexProfile {
             schema_version: DATA_FORMAT_VERSION,
             engine_version: env!("CARGO_PKG_VERSION").to_owned(),

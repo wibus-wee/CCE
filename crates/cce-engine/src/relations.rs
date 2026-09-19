@@ -33,6 +33,32 @@ pub(crate) struct SymbolCandidate {
     pub kind: EntityKind,
 }
 
+/// Demotion applied when name resolution had to choose among several
+/// same-name candidates: the picked target is a guess, so the edge must
+/// not carry — or propagate — the same trust as a unique resolution.
+const AMBIGUOUS_RESOLUTION_FACTOR: f32 = 0.5;
+
+/// Confidence for a name-resolved edge: `base` when the spelling picked
+/// out exactly one viable candidate, demoted when the resolver chose
+/// among several.
+fn resolved_confidence(base: f32, candidates: usize) -> f32 {
+    if candidates > 1 {
+        base * AMBIGUOUS_RESOLUTION_FACTOR
+    } else {
+        base
+    }
+}
+
+/// Record an ambiguous resolution on the edge's attributes so consumers
+/// can distinguish a guessed target from a uniquely resolved one without
+/// re-running the name index.
+fn mark_ambiguity(attributes: &mut serde_json::Map<String, serde_json::Value>, candidates: usize) {
+    if candidates > 1 {
+        attributes.insert("ambiguous".to_owned(), true.into());
+        attributes.insert("candidateCount".to_owned(), candidates.into());
+    }
+}
+
 pub(crate) fn add_derived_relations(context: &RelationContext<'_>, output: &mut Vec<Relation>) {
     let mut seen = output
         .iter()
@@ -294,7 +320,8 @@ fn normalize_components(path: std::path::PathBuf) -> Option<String> {
 /// `Calls` edges between symbols. Tree-sitter gives us the callee's
 /// *spelling*, not its canonical definition, so resolution prefers a
 /// same-file candidate, then callable kinds, and carries confidence 0.6 —
-/// these are syntax facts, not compiler truth.
+/// these are syntax facts, not compiler truth. A spelling shared by
+/// several symbols is a guess: the edge is demoted and marked `ambiguous`.
 fn call_relations(context: &RelationContext<'_>) -> Vec<Relation> {
     let mut relations = Vec::new();
     for file in context.files {
@@ -319,7 +346,9 @@ fn call_relations(context: &RelationContext<'_>) -> Vec<Relation> {
                 .caller
                 .and_then(|index| unit_ids.get(index))
                 .unwrap_or(file_id);
-            let Some(callee) = resolve_callee(&call.name, &file.relative_path, context) else {
+            let Some((callee, candidates)) =
+                resolve_callee(&call.name, &file.relative_path, context)
+            else {
                 continue;
             };
             if callee.entity_id == *caller_id
@@ -328,36 +357,39 @@ fn call_relations(context: &RelationContext<'_>) -> Vec<Relation> {
                 continue;
             }
             let evidence = call_site_address(context, file, text, call.start_byte, call.end_byte);
+            let mut attributes =
+                serde_json::Map::from_iter([("calleeName".to_owned(), call.name.clone().into())]);
+            mark_ambiguity(&mut attributes, candidates);
             relations.push(Relation {
                 id: relation_id(caller_id, &callee.entity_id, "calls"),
                 source_entity_id: caller_id.clone(),
                 target_entity_id: callee.entity_id.clone(),
                 kind: RelationKind::Calls,
                 origin: RelationOrigin::TreeSitter,
-                confidence: 0.6,
+                confidence: resolved_confidence(0.6, candidates),
                 snapshot_id: context.snapshot_id.to_owned(),
                 extractor: format!(
                     "cce-call-extract-v2:{}",
                     parsed.parser.as_deref().unwrap_or("unknown")
                 ),
                 evidence: evidence.into_iter().collect(),
-                attributes: serde_json::Map::from_iter([(
-                    "calleeName".to_owned(),
-                    call.name.clone().into(),
-                )]),
+                attributes,
             });
         }
     }
     relations
 }
 
+/// Returns the picked candidate plus the size of the same-name choice
+/// set. Every candidate is viable — the final fallback accepts any kind —
+/// so a non-unique spelling always means the pick was a guess.
 fn resolve_callee<'a>(
     name: &str,
     caller_path: &str,
     context: &'a RelationContext<'_>,
-) -> Option<&'a SymbolCandidate> {
+) -> Option<(&'a SymbolCandidate, usize)> {
     let candidates = context.name_index.get(name)?;
-    candidates
+    let picked = candidates
         .iter()
         .find(|candidate| candidate.path == caller_path)
         .or_else(|| {
@@ -365,7 +397,8 @@ fn resolve_callee<'a>(
                 matches!(candidate.kind, EntityKind::Function | EntityKind::Method)
             })
         })
-        .or_else(|| candidates.first())
+        .or_else(|| candidates.first())?;
+    Some((picked, candidates.len()))
 }
 
 fn call_site_address(
@@ -406,7 +439,8 @@ fn call_site_address(
 /// `References` edges from a symbol to the type-level entities named in its
 /// type positions (parameters, returns, fields, annotations). Resolution is
 /// spelling-based like calls but restricted to type kinds, so confidence
-/// stays at 0.55 — syntax-level, not compiler-resolved.
+/// stays at 0.55 — syntax-level, not compiler-resolved. Spellings shared by
+/// several type-level candidates are demoted and marked `ambiguous`.
 fn type_reference_relations(context: &RelationContext<'_>) -> Vec<Relation> {
     let mut relations = Vec::new();
     for file in context.files {
@@ -426,7 +460,8 @@ fn type_reference_relations(context: &RelationContext<'_>) -> Vec<Relation> {
         for (index, unit) in parsed.units.iter().enumerate() {
             let source_id = unit_ids.get(index).unwrap_or(file_id);
             for name in &unit.type_references {
-                let Some(target) = resolve_type_reference(name, &file.relative_path, context)
+                let Some((target, candidates)) =
+                    resolve_type_reference(name, &file.relative_path, context)
                 else {
                     continue;
                 };
@@ -443,23 +478,23 @@ fn type_reference_relations(context: &RelationContext<'_>) -> Vec<Relation> {
                     unit.start_line..=unit.end_line,
                 )
                 .ok();
+                let mut attributes =
+                    serde_json::Map::from_iter([("typeName".to_owned(), name.clone().into())]);
+                mark_ambiguity(&mut attributes, candidates);
                 relations.push(Relation {
                     id: relation_id(source_id, &target.entity_id, "references"),
                     source_entity_id: source_id.clone(),
                     target_entity_id: target.entity_id.clone(),
                     kind: RelationKind::References,
                     origin: RelationOrigin::TreeSitter,
-                    confidence: 0.55,
+                    confidence: resolved_confidence(0.55, candidates),
                     snapshot_id: context.snapshot_id.to_owned(),
                     extractor: format!(
                         "cce-type-ref-v2:{}",
                         parsed.parser.as_deref().unwrap_or("unknown")
                     ),
                     evidence: evidence.into_iter().collect(),
-                    attributes: serde_json::Map::from_iter([(
-                        "typeName".to_owned(),
-                        name.clone().into(),
-                    )]),
+                    attributes,
                 });
             }
         }
@@ -469,21 +504,27 @@ fn type_reference_relations(context: &RelationContext<'_>) -> Vec<Relation> {
 
 /// A type spelling only resolves to type-level entities: a function named
 /// `Token` must not win over a struct in another file. Same-file candidates
-/// win first, mirroring call resolution.
+/// win first, mirroring call resolution. Returns the picked candidate plus
+/// the number of viable (type-kind) candidates it was chosen among.
 fn resolve_type_reference<'a>(
     name: &str,
     path: &str,
     context: &'a RelationContext<'_>,
-) -> Option<&'a SymbolCandidate> {
+) -> Option<(&'a SymbolCandidate, usize)> {
     let candidates = context.name_index.get(name)?;
-    candidates
+    let viable = candidates
+        .iter()
+        .filter(|candidate| is_type_kind(&candidate.kind))
+        .count();
+    let picked = candidates
         .iter()
         .find(|candidate| candidate.path == path && is_type_kind(&candidate.kind))
         .or_else(|| {
             candidates
                 .iter()
                 .find(|candidate| is_type_kind(&candidate.kind))
-        })
+        })?;
+    Some((picked, viable))
 }
 
 const fn is_type_kind(kind: &EntityKind) -> bool {

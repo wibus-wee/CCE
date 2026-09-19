@@ -65,4 +65,9 @@ pub struct SnapshotIdentity {
     pub file_count: u64,
     /// Total source bytes captured.
     pub source_bytes: u64,
+    /// Who produced this snapshot (`cli`, `watch`, an MCP client name,
+    /// `checkpoint`). Metadata, not identity — the hash above never sees
+    /// it, so identical content indexed by two origins shares one id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }

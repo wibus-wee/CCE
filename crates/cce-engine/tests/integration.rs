@@ -126,6 +126,111 @@ async fn reactivates_prior_snapshot() {
     assert!(result.hits.iter().all(|hit| !hit.verified_current));
 }
 
+/// A checkpoint commits a parse+relations snapshot under a distinct id
+/// without moving `current`, and `architecture_diff` can read it.
+#[tokio::test]
+async fn checkpoint_detaches_and_stays_diffable() {
+    let repo = fixture_repo();
+    let engine = engine(repo.path());
+
+    let full = engine.index().await.expect("full index");
+    let snap_full = full.snapshot.id.clone();
+
+    // Same worktree: a checkpoint mints its own id (distinct profile) —
+    // never the full snapshot's.
+    let same = engine
+        .checkpoint(Some("test".to_owned()))
+        .await
+        .expect("checkpoint of unchanged tree");
+    assert_ne!(same.snapshot.id, snap_full);
+    assert_eq!(same.snapshot.origin.as_deref(), Some("test"));
+
+    // Edit, checkpoint again: current stays on the full snapshot while
+    // the checkpoint captures the worktree delta.
+    write(
+        repo.path(),
+        "src/lib.rs",
+        "pub fn resume_attempt(cursor: &str) -> bool {\n    !cursor.is_empty()\n}\n",
+    );
+    let moved = engine.checkpoint(None).await.expect("checkpoint of edit");
+    assert_ne!(moved.snapshot.id, snap_full);
+    assert_ne!(moved.snapshot.id, same.snapshot.id);
+    assert_eq!(
+        engine
+            .store()
+            .current_snapshot(&full.repository_id)
+            .expect("current"),
+        Some(snap_full.clone()),
+        "checkpoint must not move current"
+    );
+
+    // Diffable: full → checkpoint shows the changed function. Explicit
+    // base — a bare `head` would diff against the previous checkpoint.
+    let diff = engine
+        .architecture_diff(Some(&snap_full), Some(&moved.snapshot.id))
+        .expect("architecture diff");
+    assert_eq!(diff.base_snapshot_id, snap_full);
+    assert_eq!(diff.head_snapshot_id, moved.snapshot.id);
+
+    // Repeating the same checkpoint reuses it instead of duplicating.
+    let repeat = engine.checkpoint(None).await.expect("repeat checkpoint");
+    assert!(repeat.reused_snapshot);
+    assert_eq!(repeat.snapshot.id, moved.snapshot.id);
+
+    // Skipped views report Unavailable, never Ready-by-omission.
+    let dense = &repeat.manifest.views[&ViewKind::Dense].state;
+    let zoekt = &repeat.manifest.views[&ViewKind::Zoekt].state;
+    assert_eq!(*dense, ViewState::Unavailable);
+    assert_eq!(*zoekt, ViewState::Unavailable);
+    assert_eq!(
+        repeat.manifest.views[&ViewKind::Lexical].state,
+        ViewState::Ready
+    );
+}
+
+/// A call edge into a package that never declares the dependency is a
+/// boundary violation; declaring it clears the violation.
+#[tokio::test]
+async fn map_reports_undeclared_cross_package_edges() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        dir.path(),
+        "pkg-a/Cargo.toml",
+        "[package]\nname = \"pkg-a\"\n",
+    );
+    write(
+        dir.path(),
+        "pkg-a/src/lib.rs",
+        "pub fn run() { helper() }\n",
+    );
+    write(
+        dir.path(),
+        "pkg-b/Cargo.toml",
+        "[package]\nname = \"pkg-b\"\n",
+    );
+    write(dir.path(), "pkg-b/src/lib.rs", "pub fn helper() {}\n");
+    let engine = engine(dir.path());
+    engine.index().await.expect("index");
+
+    let map = engine.codebase_map().expect("map");
+    assert_eq!(map.packages.len(), 2);
+    assert!(map.violations.iter().any(|v| {
+        v.source_package == "pkg-a" && v.target_package == "pkg-b" && v.kind == "calls"
+    }));
+    assert_eq!(map.violation_count, map.violations.len());
+
+    // Declaring the dependency clears the violation.
+    write(
+        dir.path(),
+        "pkg-a/Cargo.toml",
+        "[package]\nname = \"pkg-a\"\n\n[dependencies]\npkg-b = { path = \"../pkg-b\" }\n",
+    );
+    engine.index().await.expect("reindex");
+    let map = engine.codebase_map().expect("map");
+    assert!(map.violations.is_empty(), "{:?}", map.violations);
+    assert_eq!(map.violation_count, 0);
+}
+
 /// When activation requires the index lease and another writer holds it,
 /// `index()` must fail with `IndexBusy` — never report a successful reuse while
 /// leaving `current` on the stale snapshot.
@@ -486,6 +591,79 @@ async fn typed_relations_carry_provenance_and_confidence() {
     );
 }
 
+/// Ambiguity-aware confidence: `shared_name` is defined in two files, so a
+/// call spelling it resolves by guessing among candidates — the edge must
+/// be demoted below a uniquely-resolved call and carry the marker; the
+/// uniquely-named `unique_helper` call keeps full confidence.
+#[tokio::test]
+async fn ambiguous_call_targets_are_demoted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        dir.path(),
+        "src/left.rs",
+        "pub fn shared_name() -> u32 {\n    1\n}\n",
+    );
+    write(
+        dir.path(),
+        "src/right.rs",
+        "pub fn shared_name() -> u32 {\n    2\n}\n",
+    );
+    write(
+        dir.path(),
+        "src/helper.rs",
+        "pub fn unique_helper() -> u32 {\n    3\n}\n",
+    );
+    write(
+        dir.path(),
+        "src/caller.rs",
+        "pub fn invoke() -> u32 {\n    shared_name() + unique_helper()\n}\n",
+    );
+    let engine = engine(dir.path());
+    let report = engine.index().await.expect("index");
+
+    let calls = engine
+        .store()
+        .relations_by_kind(&report.snapshot.id, &cce_core::RelationKind::Calls, 64)
+        .expect("calls relations");
+    let edge_to = |name: &str| {
+        calls
+            .iter()
+            .find(|relation| {
+                relation
+                    .attributes
+                    .get("calleeName")
+                    .and_then(|value| value.as_str())
+                    == Some(name)
+            })
+            .expect("Calls edge for fixture callee")
+    };
+    let ambiguous = edge_to("shared_name");
+    let unique = edge_to("unique_helper");
+
+    assert!(
+        ambiguous.confidence < unique.confidence,
+        "ambiguous call must be demoted below the unique call: {} vs {}",
+        ambiguous.confidence,
+        unique.confidence
+    );
+    assert_eq!(
+        ambiguous
+            .attributes
+            .get("ambiguous")
+            .and_then(serde_json::value::Value::as_bool),
+        Some(true),
+        "the guessed edge must carry the ambiguity marker"
+    );
+    assert!(
+        unique
+            .attributes
+            .get("ambiguous")
+            .and_then(serde_json::value::Value::as_bool)
+            .is_none_or(|flag| !flag),
+        "the uniquely-resolved edge must not be marked ambiguous"
+    );
+}
+
 /// Call edges dedup on (caller, callee), not callee alone: two callers in
 /// the same file invoking one helper are two edges, while a repeated call
 /// from the same caller is still one.
@@ -627,7 +805,7 @@ async fn package_graph_comes_from_build_manifests() {
         .find(|package| package.name == "beta")
         .expect("beta package");
     assert_eq!(beta.dependents, vec!["alpha".to_owned()]);
-    assert_eq!(map.provenance, "build_system manifests (deterministic)");
+    assert!(map.provenance.starts_with("build_system manifests"));
 
     let explanation = engine.explain_component("alpha").expect("explain alpha");
     assert_eq!(explanation.kind, "Package");
@@ -1108,6 +1286,7 @@ async fn worktree_grep_is_fresh_and_policy_aware() {
                 path_prefix: Some("src/".to_owned()),
                 language: None,
                 hit_type: None,
+                pattern: None,
             },
             limit: 50,
             ignore_case: false,
@@ -2081,4 +2260,250 @@ async fn dense_query_perf_follows_hits_not_corpus() {
         "p018-perf {}",
         serde_json::to_string_pretty(&report).unwrap()
     );
+}
+
+/// Multi-language fixture for `pat:` route tests. `STATE.lock().unwrap()`
+/// appears in three Rust files and (as `cache.lock().unwrap()`) in a
+/// TypeScript file; the Go file never contains the call so a hit there
+/// would mean text-matching leaked into the structural route.
+fn pattern_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        dir.path(),
+        "src/lib.rs",
+        "use std::sync::Mutex;\n\
+         static STATE: Mutex<u64> = Mutex::new(0);\n\
+         pub fn alpha_tick() {\n    let mut guard = STATE.lock().unwrap();\n    *guard += 1;\n}\n",
+    );
+    write(
+        dir.path(),
+        "src/helper.rs",
+        "// zephyr marker\n\
+         pub fn helper_touch() {\n    let _value = CACHE.lock().unwrap();\n}\n",
+    );
+    write(
+        dir.path(),
+        "tools/util.rs",
+        "pub fn util_bump() {\n    let _g = COUNTER.lock().unwrap();\n}\n",
+    );
+    write(
+        dir.path(),
+        "web/app.ts",
+        "export function touch(): void {\n    const v = cache.lock().unwrap();\n}\n",
+    );
+    write(
+        dir.path(),
+        "cmd/main.go",
+        "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n",
+    );
+    dir
+}
+
+fn hit_paths(result: &cce_engine::SearchResult) -> Vec<String> {
+    let mut paths: Vec<String> = result
+        .hits
+        .iter()
+        .filter_map(|hit| hit.address.as_ref().map(|a| a.path.clone()))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+#[tokio::test]
+async fn pattern_route_maps_matches_to_regions() {
+    let repo = pattern_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    let result = engine
+        .search(search_request("pat:'$S.lock().unwrap()'", true))
+        .await
+        .expect("search");
+
+    // `pat:` pins the plan to the structural route and the template leaves
+    // the query text — FTS never sees `$S`, so a nonempty hit set also
+    // proves the template was not fed through as free text.
+    assert_eq!(result.plan.routes, vec![cce_core::SearchRoute::Pattern]);
+    assert!(
+        result
+            .plan
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("pat:")),
+        "pin reason recorded"
+    );
+    assert!(result.request.query.is_empty(), "template stripped");
+    assert!(
+        result
+            .missing_capabilities
+            .iter()
+            .all(|cap| !cap.contains("pat:")),
+        "supported languages must not report template failures: {:?}",
+        result.missing_capabilities
+    );
+
+    let paths = hit_paths(&result);
+    assert_eq!(
+        paths,
+        vec![
+            "src/helper.rs".to_owned(),
+            "src/lib.rs".to_owned(),
+            "tools/util.rs".to_owned(),
+            "web/app.ts".to_owned(),
+        ],
+        "exactly the files containing a structural match"
+    );
+    for hit in &result.hits {
+        assert_eq!(hit.route, cce_core::SearchRoute::Pattern);
+        assert_eq!(hit.contributing_routes, vec![cce_core::SearchRoute::Pattern]);
+        assert!(hit.verified_current);
+        let address = hit
+            .address
+            .as_ref()
+            .unwrap_or_else(|| panic!("hit address: {hit:?}"));
+        assert_eq!(address.snapshot_id, result.request.snapshot_id);
+        assert!(
+            hit.explanation
+                .iter()
+                .any(|line| line.starts_with("pat: structural match")),
+            "provenance explanation present"
+        );
+    }
+    // Matches inside functions must resolve to their enclosing regions —
+    // at least one hit carries a canonical region pointer.
+    assert!(result.hits.iter().any(|hit| hit.region_id.is_some()));
+}
+
+#[tokio::test]
+async fn pattern_route_reports_unsupported_language() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        dir.path(),
+        "src/lib.rs",
+        "pub fn tick() {\n    let _g = STATE.lock().unwrap();\n}\n",
+    );
+    write(dir.path(), "config.toml", "[pkg]\nkey = \"value\"\n");
+    let engine = engine(dir.path());
+    engine.index().await.expect("index");
+
+    let result = engine
+        .search(search_request("pat:'$S.lock().unwrap()'", true))
+        .await
+        .expect("search");
+
+    // The toml file is a candidate (indexed source file) but has no
+    // grammar — that is an explicit capability gap, not a silent skip.
+    assert!(
+        result
+            .missing_capabilities
+            .iter()
+            .any(|cap| cap.contains("structural matching unavailable for `toml`")),
+        "unsupported language reported: {:?}",
+        result.missing_capabilities
+    );
+    // Supported-language candidates still produce hits.
+    assert_eq!(hit_paths(&result), vec!["src/lib.rs".to_owned()]);
+}
+
+#[tokio::test]
+async fn pattern_route_and_semantics() {
+    let repo = pattern_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // `lang:` narrows candidates to one grammar.
+    let rust_only = engine
+        .search(search_request("pat:'$S.lock().unwrap()' lang:rust", true))
+        .await
+        .expect("lang:rust search");
+    assert_eq!(
+        hit_paths(&rust_only),
+        vec![
+            "src/helper.rs".to_owned(),
+            "src/lib.rs".to_owned(),
+            "tools/util.rs".to_owned(),
+        ]
+    );
+
+    // `path:` narrows candidates to a prefix.
+    let src_only = engine
+        .search(search_request("pat:'$S.lock().unwrap()' path:src/", true))
+        .await
+        .expect("path: search");
+    assert_eq!(
+        hit_paths(&src_only),
+        vec!["src/helper.rs".to_owned(), "src/lib.rs".to_owned()]
+    );
+
+    // Free text ANDs against the pattern: only files whose content
+    // FTS-matches the residual term stay candidates.
+    let narrowed = engine
+        .search(search_request("pat:'$S.lock().unwrap()' zephyr", true))
+        .await
+        .expect("free-text narrowed search");
+    assert_eq!(narrowed.request.query, "zephyr");
+    assert_eq!(hit_paths(&narrowed), vec!["src/helper.rs".to_owned()]);
+}
+
+#[tokio::test]
+async fn pattern_route_deterministic_replay() {
+    let repo = pattern_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    let first = engine
+        .search(search_request("pat:'fmt.Println($$$X)'", true))
+        .await
+        .expect("first search");
+    let second = engine
+        .search(search_request("pat:'fmt.Println($$$X)'", true))
+        .await
+        .expect("replay search");
+
+    assert_eq!(hit_paths(&first), vec!["cmd/main.go".to_owned()]);
+    let key = |result: &cce_engine::SearchResult| {
+        result
+            .hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.document_id.clone(),
+                    hit.region_id.clone(),
+                    hit.score.to_bits(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(key(&first), key(&second), "identical hit order on replay");
+}
+
+#[tokio::test]
+async fn pattern_route_reports_unparseable_template_once() {
+    let repo = pattern_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // `fn $F(` parses to an ERROR root — an illegal template is an
+    // explicit capability failure, reported once per language rather than
+    // once per candidate file.
+    let result = engine
+        .search(search_request("pat:'fn $F('", true))
+        .await
+        .expect("search");
+    let failures: Vec<&String> = result
+        .missing_capabilities
+        .iter()
+        .filter(|cap| cap.contains("does not parse"))
+        .collect();
+    assert!(!failures.is_empty(), "template failure reported");
+    let mut unique = failures.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        failures.len(),
+        unique.len(),
+        "one message per grammar, not per file: {failures:?}"
+    );
+    assert!(result.hits.is_empty());
 }

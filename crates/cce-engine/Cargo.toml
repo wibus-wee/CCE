@@ -11,6 +11,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+# 0.44+ moves to tree-sitter 0.27; 0.43 is the last line on tree-sitter 0.26.
+ast-grep-core = { version = "=0.43.0", features = ["tree-sitter"] }
 async-trait.workspace = true
 blake3.workspace = true
 cce-core = { version = "0.1.0", path = "../cce-core" }

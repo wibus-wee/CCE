@@ -167,6 +167,29 @@ pub enum RelationDirection {
     Both,
 }
 
+/// One row of a repository's completed-snapshot listing.
+#[derive(Debug, Clone)]
+pub struct SnapshotListEntry {
+    /// Snapshot id.
+    pub id: String,
+    /// Creation timestamp (RFC 3339).
+    pub created_at: String,
+    /// Who produced it (`cli`, `watch`, `checkpoint`, an MCP client).
+    pub origin: Option<String>,
+}
+
+/// Committed row counts of one snapshot — entity/relation/region totals a
+/// consumer can size an export or projection against.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotCounts {
+    /// Entities committed for the snapshot.
+    pub entities: usize,
+    /// Relations committed for the snapshot.
+    pub relations: usize,
+    /// Canonical regions committed for the snapshot.
+    pub regions: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// Result of a store health check.
@@ -316,10 +339,10 @@ impl MetadataStore {
             .lock()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(storage_error)?;
-        if version > 5 {
+        if version > 6 {
             return Err(CceError::UnsupportedFormat {
                 found: version,
-                supported: 5,
+                supported: 6,
             });
         }
         if version == 0 {
@@ -346,6 +369,11 @@ impl MetadataStore {
             pool.lock()
                 .execute_batch(include_str!("migrations/0005_entity_name_trigrams.sql"))
                 .map_err(|error| CceError::Storage(format!("migration 5 failed: {error}")))?;
+        }
+        if version < 6 {
+            pool.lock()
+                .execute_batch(include_str!("migrations/0006_snapshot_origin.sql"))
+                .map_err(|error| CceError::Storage(format!("migration 6 failed: {error}")))?;
         }
         let artifacts = ArtifactStore::open(data_root)?;
         Ok(Self {
@@ -460,8 +488,8 @@ impl MetadataStore {
             .execute(
                 "INSERT OR REPLACE INTO snapshots(
                   id, repository_id, base_revision, workspace_overlay_hash, index_profile_hash,
-                  created_at, file_count, source_bytes, complete
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                  created_at, file_count, source_bytes, complete, origin
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
                 params![
                     snapshot.id,
                     snapshot.repository_id,
@@ -471,6 +499,7 @@ impl MetadataStore {
                     snapshot.created_at.to_rfc3339(),
                     u64_to_i64(snapshot.file_count)?,
                     u64_to_i64(snapshot.source_bytes)?,
+                    snapshot.origin,
                 ],
             )
             .map_err(storage_error)?;
@@ -486,6 +515,30 @@ impl MetadataStore {
         &self,
         snapshot: &SnapshotIdentity,
         records: &SnapshotRecords,
+    ) -> Result<()> {
+        self.commit_snapshot_inner(snapshot, records, true)
+    }
+
+    /// Commit a snapshot's records without promoting it to `current`.
+    /// Checkpoint snapshots are diffable artifacts — committing one must
+    /// not move the serving pointer or `resolve_diff_pair`'s defaults
+    /// onto a provider-less, dense-less build.
+    ///
+    /// # Errors
+    /// Storage error on write failure.
+    pub fn commit_snapshot_detached(
+        &self,
+        snapshot: &SnapshotIdentity,
+        records: &SnapshotRecords,
+    ) -> Result<()> {
+        self.commit_snapshot_inner(snapshot, records, false)
+    }
+
+    fn commit_snapshot_inner(
+        &self,
+        snapshot: &SnapshotIdentity,
+        records: &SnapshotRecords,
+        set_current: bool,
     ) -> Result<()> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction().map_err(storage_error)?;
@@ -683,14 +736,16 @@ impl MetadataStore {
                 [&snapshot.id],
             )
             .map_err(storage_error)?;
-        transaction
-            .execute(
-                "INSERT INTO current_snapshots(repository_id, snapshot_id, updated_at)
-                 VALUES (?1, ?2, ?3) ON CONFLICT(repository_id) DO UPDATE SET
-                 snapshot_id=excluded.snapshot_id, updated_at=excluded.updated_at",
-                params![snapshot.repository_id, snapshot.id, Utc::now().to_rfc3339()],
-            )
-            .map_err(storage_error)?;
+        if set_current {
+            transaction
+                .execute(
+                    "INSERT INTO current_snapshots(repository_id, snapshot_id, updated_at)
+                     VALUES (?1, ?2, ?3) ON CONFLICT(repository_id) DO UPDATE SET
+                     snapshot_id=excluded.snapshot_id, updated_at=excluded.updated_at",
+                    params![snapshot.repository_id, snapshot.id, Utc::now().to_rfc3339()],
+                )
+                .map_err(storage_error)?;
+        }
         transaction.commit().map_err(storage_error)?;
         Ok(())
     }
@@ -2030,35 +2085,7 @@ impl MetadataStore {
             .map_err(storage_error)?;
         let mut regions = Vec::new();
         for row in rows {
-            let (
-                id,
-                path,
-                kind,
-                language,
-                symbol_name,
-                symbol_kind,
-                qualified_name,
-                parent_region_id,
-                start_byte,
-                end_byte,
-                start_line,
-                end_line,
-            ) = row.map_err(storage_error)?;
-            regions.push(CodeRegion {
-                id,
-                snapshot_id: snapshot_id.to_owned(),
-                path,
-                kind: parse_json(&kind)?,
-                language,
-                symbol_name,
-                symbol_kind: symbol_kind.as_deref().map(parse_json).transpose()?,
-                qualified_name,
-                parent_region_id,
-                start_byte: u64::try_from(start_byte).unwrap_or(0),
-                end_byte: u64::try_from(end_byte).unwrap_or(0),
-                start_line: u32::try_from(start_line).unwrap_or(0),
-                end_line: u32::try_from(end_line).unwrap_or(0),
-            });
+            regions.push(region_from_cols(row.map_err(storage_error)?, snapshot_id)?);
         }
         Ok(regions)
     }
@@ -2562,6 +2589,243 @@ impl MetadataStore {
             .filter_map(|id| contents.remove(id.as_str()))
             .collect())
     }
+
+    /// Every entity in a snapshot ordered by id — the bulk read behind
+    /// snapshot diffs and full exports.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn entities_for_snapshot(&self, snapshot_id: &str) -> Result<Vec<CodeEntity>> {
+        let connection = self.connection.read();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, kind, name, qualified_name, signature, language, region_id,
+                 address_json, capabilities_json, attributes_json FROM entities
+                 WHERE snapshot_id=?1 ORDER BY id",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([snapshot_id], entity_cols)
+            .map_err(storage_error)?;
+        rows.map(|row| entity_from_cols(row.map_err(storage_error)?))
+            .collect()
+    }
+
+    /// One id-ordered page of entities: rows with `id > cursor`, at most
+    /// `limit`. Cursor pagination is stable because ids are unique within a
+    /// snapshot and never mutate after commit.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn entities_page(
+        &self,
+        snapshot_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CodeEntity>> {
+        let connection = self.connection.read();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, kind, name, qualified_name, signature, language, region_id,
+                 address_json, capabilities_json, attributes_json FROM entities
+                 WHERE snapshot_id=?1 AND id > ?2 ORDER BY id LIMIT ?3",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    snapshot_id,
+                    cursor.unwrap_or_default(),
+                    usize_to_i64(limit)?
+                ],
+                entity_cols,
+            )
+            .map_err(storage_error)?;
+        rows.map(|row| entity_from_cols(row.map_err(storage_error)?))
+            .collect()
+    }
+
+    /// Every relation in a snapshot ordered by id — the bulk read behind
+    /// snapshot diffs and full exports.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn relations_for_snapshot(&self, snapshot_id: &str) -> Result<Vec<Relation>> {
+        let connection = self.connection.read();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, source_entity_id, target_entity_id, kind, origin, confidence,
+                 extractor, evidence_json, attributes_json FROM relations
+                 WHERE snapshot_id=?1 ORDER BY id",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([snapshot_id], relation_cols)
+            .map_err(storage_error)?;
+        let mut relations = Vec::new();
+        for row in rows {
+            relations.push(relation_from_cols(
+                row.map_err(storage_error)?,
+                snapshot_id,
+            )?);
+        }
+        Ok(relations)
+    }
+
+    /// One id-ordered page of relations: rows with `id > cursor`, at most
+    /// `limit`.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn relations_page(
+        &self,
+        snapshot_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Relation>> {
+        let connection = self.connection.read();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, source_entity_id, target_entity_id, kind, origin, confidence,
+                 extractor, evidence_json, attributes_json FROM relations
+                 WHERE snapshot_id=?1 AND id > ?2 ORDER BY id LIMIT ?3",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    snapshot_id,
+                    cursor.unwrap_or_default(),
+                    usize_to_i64(limit)?
+                ],
+                relation_cols,
+            )
+            .map_err(storage_error)?;
+        let mut relations = Vec::new();
+        for row in rows {
+            relations.push(relation_from_cols(
+                row.map_err(storage_error)?,
+                snapshot_id,
+            )?);
+        }
+        Ok(relations)
+    }
+
+    /// Every canonical region in a snapshot ordered by id — the bulk read
+    /// behind snapshot exports.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn regions_for_snapshot(&self, snapshot_id: &str) -> Result<Vec<CodeRegion>> {
+        let connection = self.connection.read();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, path, kind, language, symbol_name, symbol_kind, qualified_name,
+                 parent_region_id, start_byte, end_byte, start_line, end_line
+                 FROM regions WHERE snapshot_id=?1 ORDER BY id",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([snapshot_id], region_cols)
+            .map_err(storage_error)?;
+        let mut regions = Vec::new();
+        for row in rows {
+            regions.push(region_from_cols(row.map_err(storage_error)?, snapshot_id)?);
+        }
+        Ok(regions)
+    }
+
+    /// One id-ordered page of regions: rows with `id > cursor`, at most
+    /// `limit`.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn regions_page(
+        &self,
+        snapshot_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CodeRegion>> {
+        let connection = self.connection.read();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, path, kind, language, symbol_name, symbol_kind, qualified_name,
+                 parent_region_id, start_byte, end_byte, start_line, end_line
+                 FROM regions WHERE snapshot_id=?1 AND id > ?2 ORDER BY id LIMIT ?3",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    snapshot_id,
+                    cursor.unwrap_or_default(),
+                    usize_to_i64(limit)?
+                ],
+                region_cols,
+            )
+            .map_err(storage_error)?;
+        let mut regions = Vec::new();
+        for row in rows {
+            regions.push(region_from_cols(row.map_err(storage_error)?, snapshot_id)?);
+        }
+        Ok(regions)
+    }
+
+    /// Completed snapshots of a repository, newest first — the ordering
+    /// "previous snapshot" resolves against.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn snapshots_for_repository(&self, repository_id: &str) -> Result<Vec<SnapshotListEntry>> {
+        let connection = self.connection.read();
+        let mut statement = connection
+            .prepare(
+                "SELECT id, created_at, origin FROM snapshots
+                 WHERE repository_id=?1 AND complete=1
+                 ORDER BY created_at DESC, id DESC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([repository_id], |row| {
+                Ok(SnapshotListEntry {
+                    id: row.get::<_, String>(0)?,
+                    created_at: row.get::<_, String>(1)?,
+                    origin: row.get::<_, Option<String>>(2)?,
+                })
+            })
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)
+    }
+
+    /// Committed entity/relation/region counts of a snapshot — sizing
+    /// information for export consumers.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn snapshot_counts(&self, snapshot_id: &str) -> Result<SnapshotCounts> {
+        self.connection
+            .read()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entities WHERE snapshot_id=?1),
+                 (SELECT COUNT(*) FROM relations WHERE snapshot_id=?1),
+                 (SELECT COUNT(*) FROM regions WHERE snapshot_id=?1)",
+                [snapshot_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(storage_error)
+            .map(|(entities, relations, regions)| SnapshotCounts {
+                entities: usize::try_from(entities).unwrap_or(0),
+                relations: usize::try_from(relations).unwrap_or(0),
+                regions: usize::try_from(regions).unwrap_or(0),
+            })
+    }
 }
 
 /// A document row awaiting body resolution — metadata parsed, body
@@ -2714,6 +2978,21 @@ type EntityCols = (
     String,
 );
 
+fn entity_cols(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntityCols> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, Option<String>>(3)?,
+        row.get::<_, Option<String>>(4)?,
+        row.get::<_, Option<String>>(5)?,
+        row.get::<_, Option<String>>(6)?,
+        row.get::<_, Option<String>>(7)?,
+        row.get::<_, String>(8)?,
+        row.get::<_, String>(9)?,
+    ))
+}
+
 fn entity_from_cols(
     (
         id,
@@ -2743,6 +3022,73 @@ fn entity_from_cols(
 }
 
 #[allow(clippy::type_complexity)]
+type RegionCols = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+fn region_cols(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegionCols> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, Option<String>>(3)?,
+        row.get::<_, Option<String>>(4)?,
+        row.get::<_, Option<String>>(5)?,
+        row.get::<_, Option<String>>(6)?,
+        row.get::<_, Option<String>>(7)?,
+        row.get::<_, i64>(8)?,
+        row.get::<_, i64>(9)?,
+        row.get::<_, i64>(10)?,
+        row.get::<_, i64>(11)?,
+    ))
+}
+
+fn region_from_cols(
+    (
+        id,
+        path,
+        kind,
+        language,
+        symbol_name,
+        symbol_kind,
+        qualified_name,
+        parent_region_id,
+        start_byte,
+        end_byte,
+        start_line,
+        end_line,
+    ): RegionCols,
+    snapshot_id: &str,
+) -> Result<CodeRegion> {
+    Ok(CodeRegion {
+        id,
+        snapshot_id: snapshot_id.to_owned(),
+        path,
+        kind: parse_json(&kind)?,
+        language,
+        symbol_name,
+        symbol_kind: symbol_kind.as_deref().map(parse_json).transpose()?,
+        qualified_name,
+        parent_region_id,
+        start_byte: u64::try_from(start_byte).unwrap_or(0),
+        end_byte: u64::try_from(end_byte).unwrap_or(0),
+        start_line: u32::try_from(start_line).unwrap_or(0),
+        end_line: u32::try_from(end_line).unwrap_or(0),
+    })
+}
+
+#[allow(clippy::type_complexity)]
 type RelationCols = (
     String,
     String,
@@ -2754,6 +3100,20 @@ type RelationCols = (
     String,
     String,
 );
+
+fn relation_cols(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelationCols> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, String>(4)?,
+        row.get::<_, f64>(5)?,
+        row.get::<_, String>(6)?,
+        row.get::<_, String>(7)?,
+        row.get::<_, String>(8)?,
+    ))
+}
 
 fn relation_from_cols(
     (
@@ -3157,6 +3517,7 @@ mod tests {
             created_at: Utc::now(),
             file_count: 0,
             source_bytes: 0,
+            origin: None,
         };
         store.begin_snapshot(&snapshot).expect("begin snapshot");
 
@@ -3309,6 +3670,7 @@ mod tests {
             created_at: Utc::now(),
             file_count: 0,
             source_bytes: 0,
+            origin: None,
         };
         store.begin_snapshot(&snapshot).expect("begin snapshot");
         let records = SnapshotRecords {
@@ -3419,6 +3781,7 @@ mod tests {
             created_at: Utc::now(),
             file_count: 0,
             source_bytes: 0,
+            origin: None,
         };
         store.begin_snapshot(&snapshot).expect("begin snapshot");
 
@@ -3650,6 +4013,7 @@ mod tests {
             created_at: Utc::now(),
             file_count: 0,
             source_bytes: 0,
+            origin: None,
         };
         store.begin_snapshot(&snapshot).expect("begin snapshot");
 
@@ -3758,6 +4122,7 @@ mod tests {
             created_at: Utc::now(),
             file_count: 0,
             source_bytes: 0,
+            origin: None,
         };
         store.begin_snapshot(&snapshot).expect("begin snapshot");
         let entity = |id: &str, name: &str, qualified: Option<&str>| CodeEntity {
@@ -3925,6 +4290,7 @@ mod tests {
             .expect("region docs");
         assert_eq!(region_docs.len(), 3);
     }
+
     fn activation_fixture() -> (tempfile::TempDir, MetadataStore) {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = MetadataStore::open(directory.path()).expect("store");
@@ -3951,6 +4317,7 @@ mod tests {
             created_at: Utc::now(),
             file_count: 0,
             source_bytes: 0,
+            origin: None,
         };
         // Commit A then B under repo_a: current lands on B.
         for id in ["snap_a", "snap_b"] {
@@ -4024,6 +4391,7 @@ mod tests {
             created_at: Utc::now(),
             file_count: 0,
             source_bytes: 0,
+            origin: None,
         };
         store.begin_snapshot(&pending).expect("begin pending");
         let error = store.activate_complete_snapshot("repo_a", "snap_pending");
@@ -4044,6 +4412,84 @@ mod tests {
             store.current_snapshot("repo_a").expect("current"),
             Some("snap_b".to_owned())
         );
+    }
+
+    /// A checkpoint is a diff artifact, not a serving snapshot: its commit
+    /// completes the snapshot row without moving `current_snapshots`.
+    #[test]
+    fn detached_commit_completes_without_moving_current() {
+        let (_dir, store) = activation_fixture();
+        assert_eq!(
+            store.current_snapshot("repo_a").expect("current"),
+            Some("snap_b".to_owned())
+        );
+        let checkpoint = SnapshotIdentity {
+            id: "snap_ckpt".to_owned(),
+            repository_id: "repo_a".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile-checkpoint".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+            origin: Some("checkpoint".to_owned()),
+        };
+        store.begin_snapshot(&checkpoint).expect("begin checkpoint");
+        store
+            .commit_snapshot_detached(&checkpoint, &SnapshotRecords::default())
+            .expect("detached commit");
+        assert!(store.snapshot_is_complete("snap_ckpt").expect("complete"));
+        assert_eq!(
+            store.current_snapshot("repo_a").expect("current"),
+            Some("snap_b".to_owned()),
+            "detached commit must not move current"
+        );
+    }
+
+    /// `begin_snapshot` persists `origin`; the repository's snapshot
+    /// listing carries it back out.
+    #[test]
+    fn snapshot_origin_round_trips() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        store
+            .register_repository(&RepositoryIdentity {
+                id: "repo_t".to_owned(),
+                canonical_root: "/repo".to_owned(),
+                remote: None,
+            })
+            .expect("repository");
+        for (id, origin) in [
+            ("snap_cli", Some("cli")),
+            ("snap_watch", Some("watch")),
+            ("snap_plain", None),
+        ] {
+            let snapshot = SnapshotIdentity {
+                id: id.to_owned(),
+                repository_id: "repo_t".to_owned(),
+                base_revision: None,
+                workspace_overlay_hash: "overlay".to_owned(),
+                index_profile_hash: "profile".to_owned(),
+                created_at: Utc::now(),
+                file_count: 0,
+                source_bytes: 0,
+                origin: origin.map(str::to_owned),
+            };
+            store.begin_snapshot(&snapshot).expect("begin");
+            store
+                .commit_snapshot(&snapshot, &SnapshotRecords::default())
+                .expect("commit");
+        }
+        let entries = store.snapshots_for_repository("repo_t").expect("snapshots");
+        let origin_of = |id: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .and_then(|entry| entry.origin.clone())
+        };
+        assert_eq!(origin_of("snap_cli"), Some("cli".to_owned()));
+        assert_eq!(origin_of("snap_watch"), Some("watch".to_owned()));
+        assert_eq!(origin_of("snap_plain"), None);
     }
 
     /// Descriptor bodies live in their own artifacts under -v2 `generated_by`;
@@ -4069,6 +4515,7 @@ mod tests {
             created_at: Utc::now(),
             file_count: 1,
             source_bytes: 24,
+            origin: None,
         };
         store.begin_snapshot(&snapshot).expect("begin");
 
@@ -4219,6 +4666,7 @@ mod tests {
             created_at: Utc::now(),
             file_count: 0,
             source_bytes: 0,
+            origin: None,
         };
         store.begin_snapshot(&snapshot).expect("begin");
         let artifact = store
@@ -4254,6 +4702,7 @@ mod tests {
             "unknown descriptor version must error, got {error:?}"
         );
     }
+
     /// `documents_by_ids` materializes exactly the requested documents —
     /// in input order, deduplicated, skipping misses — and reads each
     /// distinct body artifact at most once.
@@ -4277,6 +4726,7 @@ mod tests {
             created_at: Utc::now(),
             file_count: 2,
             source_bytes: 64,
+            origin: None,
         };
         store.begin_snapshot(&snapshot).expect("begin");
 
@@ -4429,6 +4879,7 @@ mod tests {
             created_at: Utc::now(),
             file_count: 0,
             source_bytes: 0,
+            origin: None,
         };
         store.begin_snapshot(&other).expect("begin other");
         let foreign = store

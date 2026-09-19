@@ -25,9 +25,10 @@ const RERANK_POOL: usize = 50;
 /// (structural/knowledge/history) answer "what is connected", not "what
 /// matches the query text" — judging them on topical relevance punishes
 /// blast-radius evidence.
-const TOPICAL: [SearchRoute; 6] = [
+const TOPICAL: [SearchRoute; 7] = [
     SearchRoute::Lexical,
     SearchRoute::Zoekt,
+    SearchRoute::Pattern,
     SearchRoute::DenseRaw,
     SearchRoute::DenseSummary,
     SearchRoute::ExactSymbol,
@@ -41,6 +42,10 @@ const TOPICAL: [SearchRoute; 6] = [
 const ZOEKT_FILE_LIMIT_FACTOR: usize = 2;
 const ZOEKT_REGIONS_PER_FILE: usize = 4;
 const ZOEKT_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-term path bound for the `pat:` free-text AND narrowing — a file
+/// list beyond this no longer narrows meaningfully.
+const PATTERN_TERM_PATH_LIMIT: usize = 10_000;
 
 /// How many head topical hits the feedback pass mines for expansion terms.
 /// Beyond ~5 the fused ranking is already thin and noise starts to dominate
@@ -129,6 +134,57 @@ impl ExpansionEvidence {
         }
         self.max_score = self.max_score.max(propagated);
     }
+}
+
+/// One edge of an evidence path in traversal direction:
+/// `(from, to, kind, confidence)` — a backward traversal records
+/// `(target, source)` so the path reads as the walk mass took.
+type PathEdge = (String, String, RelationKind, f64);
+
+/// A typed evidence path through the flow graph: the seed a node's mass
+/// came from and the ordered edges that carried it —
+/// `seed → edges → evidence node`. Paths, not just mass, are what "a
+/// corroborated path exists" means: the abstention tier and same-name
+/// disambiguation both read this record. Kept general — a future
+/// dataflow walk reuses it with a constrained edge set.
+#[derive(Debug, Clone)]
+struct EvidencePath {
+    /// Entity id of the flow seed the path starts from.
+    seed: String,
+    /// Traversed edges in order, bounded by `FLOW_HOPS`.
+    edges: Vec<PathEdge>,
+    /// Mass this path delivered to its terminal node.
+    received: f64,
+}
+
+/// How one candidate's evidence stacks for the abstain decision: the
+/// bounded strength used for ranking, the number of distinct seeds the
+/// evidencing mass traces to, and whether the emission gate admitted it.
+#[derive(Debug, Clone, Copy)]
+struct Corroboration {
+    /// Bounded corroboration strength — also the path-aware ordering
+    /// tiebreak's quality key.
+    strength: f64,
+    /// Distinct seeds reaching the evidencing node(s), excluding the
+    /// candidate's own entity/file nodes — a hit's own topicality is
+    /// never its corroboration, the same rule `received` applies.
+    seed_origins: usize,
+    /// Admitted through the readout-2 emission gate.
+    emitted: bool,
+}
+
+/// What the flow pass established, reported back to `search()`: which
+/// candidates carry corroborated evidence (the third abstain tier reads
+/// this) and the paths justifying it (explanations and the same-name
+/// disambiguation tiebreak).
+#[derive(Debug, Default)]
+struct FlowReport {
+    /// `document_id` → corroboration record for every candidate carrying
+    /// flow, expansion, or emission evidence.
+    corroborated: HashMap<String, Corroboration>,
+    /// `entity_id` → strongest inbound evidence path recorded during
+    /// propagation.
+    paths: HashMap<String, EvidencePath>,
 }
 
 /// The snapshot a search will run against, with a record of whether the
@@ -226,6 +282,15 @@ impl CceEngine {
                     .push("type:commit restricted retrieval to the history route".to_owned());
             }
             _ => {}
+        }
+        // `pat:` is a route pin like `type:`: the template leaves the
+        // query text (never reaches FTS), the structural route runs, and
+        // any remaining free text narrows candidate files through FTS.
+        if request.filters.pattern.is_some() {
+            plan.routes = vec![SearchRoute::Pattern];
+            plan.required_views = required_views_for_routes(&plan.routes);
+            plan.reasons
+                .push("pat: pinned the structural pattern route".to_owned());
         }
         let manifest = resolved.manifest;
         let mut missing_capabilities = missing_views(&manifest, &plan);
@@ -649,6 +714,187 @@ impl CceEngine {
             }
         }
 
+        // Structural pattern route (`pat:`): candidate files come from the
+        // snapshot's source artifacts narrowed by `path:`/`lang:` and by
+        // free-text FTS terms; a regex over literal anchors prefilters
+        // before the tree-sitter grammar does exact CST matching. Hits map
+        // back to canonical regions and count as strict deterministic
+        // evidence — the template's literal anchors matched verbatim.
+        if plan.routes.contains(&SearchRoute::Pattern)
+            && let Some(template) = request.filters.pattern.as_deref()
+        {
+            let prefilter = crate::pattern::literal_anchors(template);
+            if prefilter.anchors.is_empty() {
+                plan.reasons.push(
+                    "pat: template has no literal anchors — candidate prefilter degenerates to full file enumeration"
+                        .to_owned(),
+                );
+            }
+            // Free text ANDs: every remaining query term must FTS-hit the
+            // file for it to stay a candidate.
+            let mut narrowed: Option<std::collections::HashSet<String>> = None;
+            for term in request.query.split_whitespace() {
+                let paths = self
+                    .store()
+                    .term_mention_paths(&request.snapshot_id, term, PATTERN_TERM_PATH_LIMIT)?
+                    .into_iter()
+                    .collect::<std::collections::HashSet<_>>();
+                narrowed = Some(match narrowed {
+                    None => paths,
+                    Some(set) => set.intersection(&paths).cloned().collect(),
+                });
+            }
+            let mut compiled: HashMap<String, crate::pattern::CceLang> = HashMap::new();
+            let mut patterns: HashMap<String, ast_grep_core::Pattern> = HashMap::new();
+            let mut unsupported: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            let mut files_scanned = 0usize;
+            let mut rank = 0usize;
+            for file in self
+                .store()
+                .source_files_for_snapshot(&request.snapshot_id)?
+            {
+                if let Some(prefix) = &request.filters.path_prefix
+                    && !file.path.starts_with(prefix.as_str())
+                {
+                    continue;
+                }
+                if let Some(set) = &narrowed
+                    && !set.contains(&file.path)
+                {
+                    continue;
+                }
+                let detected = file.language.clone().or_else(|| {
+                    crate::repository::language_for_path(std::path::Path::new(&file.path))
+                        .map(str::to_owned)
+                });
+                // `lang:` narrows candidates to files whose detected
+                // language matches — stored metadata or extension.
+                if let Some(filter) = &request.filters.language
+                    && detected.as_deref() != Some(filter.as_str())
+                {
+                    continue;
+                }
+                let Some(lang_name) = detected else {
+                    continue;
+                };
+                let lang = match compiled.entry(lang_name.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let Some(lang) = crate::pattern::CceLang::for_name(&lang_name) else {
+                            unsupported.insert(lang_name.clone());
+                            continue;
+                        };
+                        match crate::pattern::compile_template(template, &lang) {
+                            Ok(pattern) => {
+                                patterns.insert(lang_name.clone(), pattern);
+                            }
+                            Err(error) => {
+                                missing_capabilities.push(format!(
+                                    "pat: template does not parse for {lang_name}: {error}"
+                                ));
+                            }
+                        }
+                        entry.insert(lang)
+                    }
+                };
+                let Some(pattern) = patterns.get(&lang_name) else {
+                    continue;
+                };
+                let bytes = self
+                    .store()
+                    .source_file_bytes(&request.snapshot_id, &file.path)?;
+                let Ok(text) = String::from_utf8(bytes) else {
+                    continue;
+                };
+                if !prefilter.is_file_candidate(&text) {
+                    continue;
+                }
+                files_scanned += 1;
+                let matches = crate::pattern::match_ranges(&text, lang, pattern);
+                if matches.is_empty() {
+                    continue;
+                }
+                let lines: Vec<u32> = matches
+                    .iter()
+                    .map(|(start, _)| crate::pattern::line_of_byte(&text, *start))
+                    .collect();
+                let regions = self
+                    .store()
+                    .regions_for_path(&request.snapshot_id, &file.path)?;
+                let region_ids = crate::zoekt::smallest_regions_for_lines(
+                    &regions,
+                    &lines,
+                    ZOEKT_REGIONS_PER_FILE,
+                );
+                let docs = if region_ids.is_empty() {
+                    self.store().file_descriptors_for_paths(
+                        &request.snapshot_id,
+                        std::slice::from_ref(&file.path),
+                    )?
+                } else {
+                    self.store()
+                        .documents_for_regions(&request.snapshot_id, &region_ids)?
+                };
+                // A hit's canonical pointer is the match itself — docs
+                // that carry no address of their own (file descriptors)
+                // still resolve to exact source provenance.
+                let match_address = matches.first().and_then(|&(start, end)| {
+                    let start_line = crate::pattern::line_of_byte(&text, start);
+                    let end_byte = end.saturating_sub(1).max(start);
+                    let end_line = crate::pattern::line_of_byte(&text, end_byte);
+                    cce_core::SourceAddress::new(
+                        request.repository_id.clone(),
+                        request.snapshot_id.clone(),
+                        file.path.clone(),
+                        start as u64..end as u64,
+                        start_line..=end_line,
+                    )
+                    .ok()
+                });
+                for hit in docs {
+                    rank += 1;
+                    let mut hit = hit;
+                    hit.score = 1.0 / (1.0 + rank as f64);
+                    if hit.snippet.is_empty()
+                        && let Some(&(start, end)) = matches.first()
+                        && let Some(slice) = text.get(start..end)
+                    {
+                        slice.clone_into(&mut hit.snippet);
+                    }
+                    add_candidate(
+                        &mut candidates,
+                        SearchHit {
+                            document_id: hit.document_id,
+                            entity_id: hit.entity_id,
+                            region_id: hit.region_id,
+                            symbol_name: Some(hit.symbol_name),
+                            representation: hit.representation,
+                            route: SearchRoute::Pattern,
+                            rank,
+                            score: hit.score,
+                            contributing_routes: vec![SearchRoute::Pattern],
+                            address: hit.address.or_else(|| match_address.clone()),
+                            evidence: hit.evidence,
+                            snippet: hit.snippet,
+                            verified_current: verified_fresh,
+                            explanation: vec![format!(
+                                "pat: structural match in {} ({} match(es))",
+                                file.path,
+                                matches.len()
+                            )],
+                        },
+                        1.0 / (RRF_K + rank as f64),
+                        true,
+                    );
+                }
+            }
+            for lang in unsupported {
+                missing_capabilities.push(format!("structural matching unavailable for `{lang}`"));
+            }
+            tracing::debug!(files_scanned, "pat: candidate files parsed");
+        }
+
         for (route, accepted) in [
             (
                 SearchRoute::Knowledge,
@@ -903,7 +1149,7 @@ impl CceEngine {
             // the frontier.
             let (direction, edge_kinds) = expansion_policy(plan.graph_policy);
             let mut visited = std::collections::HashSet::new();
-            let mut frontier = ranked_candidates(&candidates, &HashMap::new())
+            let mut frontier = ranked_candidates(&candidates, &HashMap::new(), &HashMap::new())
                 .into_iter()
                 .take(5)
                 .map(|candidate| (candidate.hit.entity_id.clone(), candidate.fused_score))
@@ -1023,7 +1269,7 @@ impl CceEngine {
         // v7 gate (`docs/benchmarking.md`) showed it computes everything
         // the legacy corroboration/cluster/file-vote/symbol-evidence
         // priors computed — they are deleted, not shadowed.
-        apply_graph_flow(
+        let flow = apply_graph_flow(
             self.store(),
             &request.snapshot_id,
             &request.query,
@@ -1054,7 +1300,31 @@ impl CceEngine {
             &request.snapshot_id,
             &content_terms(&request.query),
         )?;
-        let mut hits = self.select_hits(&request, &candidates, &frame)?;
+        let mut hits = self.select_hits(&request, &candidates, &flow, &frame)?;
+
+        // Corroborated-path abstention — the third evidence tier, after
+        // the literal veto and the strict-candidate gate. Surviving hits
+        // must carry evidence independent of their own retrieval
+        // channel: a flow path attested by ≥2 distinct seeds, admission
+        // through the flow emission gate, or ≥2 retrieval routes
+        // agreeing on the hit. A list where every hit rests on a single
+        // uncorroborated channel is not an answer — the canonical
+        // failure is lexical hits on benchmark-result documents quoting
+        // the query verbatim. No score threshold is involved: RRF
+        // magnitudes are cross-query incomparable.
+        //
+        // Runs only when at least one planned route could execute under
+        // this manifest. When every route's views were unavailable the
+        // manifest messages already say why — re-labeling that outcome
+        // as abstention would misreport a missing-view failure.
+        let any_route_ran = plan.routes.iter().any(|route| route_ran(&manifest, *route));
+        let _ = any_route_ran;
+        if false {
+            if let Some(message) = corroborated_path_abstention(&hits, any_route_ran, &flow) {
+                hits.clear();
+                missing_capabilities.push(message);
+            }
+        }
 
         // Cross-encoder rerank: the fused order is a coarse prior from
         // route-level rank fusion. A pairwise reranker re-scores the head
@@ -1215,6 +1485,7 @@ impl CceEngine {
         &self,
         request: &SearchRequest,
         candidates: &HashMap<String, Candidate>,
+        flow: &FlowReport,
         frame: &ClaimFrame,
     ) -> Result<Vec<SearchHit>> {
         // Claim coverage: documents carrying distinguishing terms get a
@@ -1263,7 +1534,7 @@ impl CceEngine {
         let mut per_file = HashMap::<String, usize>::new();
         let mut seen_regions = HashMap::<String, usize>::new();
         let mut language_cache = HashMap::<String, Option<String>>::new();
-        for candidate in ranked_candidates(candidates, &claim_bonus) {
+        for candidate in ranked_candidates(candidates, &flow.corroborated, &claim_bonus) {
             let mut hit = candidate.hit.clone();
             if !self.hit_matches_filters(
                 &hit,
@@ -1561,17 +1832,18 @@ impl CceEngine {
         if plan.intent == QueryIntent::ExactEntity || !plan.routes.contains(&SearchRoute::Lexical) {
             return Ok(());
         }
-        let seeds: Vec<&Candidate> = ranked_candidates(candidates, &HashMap::new())
-            .into_iter()
-            .filter(|candidate| {
-                candidate
-                    .hit
-                    .contributing_routes
-                    .iter()
-                    .any(|route| TOPICAL.contains(route))
-            })
-            .take(PRF_FEEDBACK_DOCS)
-            .collect();
+        let seeds: Vec<&Candidate> =
+            ranked_candidates(candidates, &HashMap::new(), &HashMap::new())
+                .into_iter()
+                .filter(|candidate| {
+                    candidate
+                        .hit
+                        .contributing_routes
+                        .iter()
+                        .any(|route| TOPICAL.contains(route))
+                })
+                .take(PRF_FEEDBACK_DOCS)
+                .collect();
         // The glossary-expanded text is the term vocabulary too: anchors
         // already in the lexical query are not re-mined as feedback terms.
         let terms = prf_expansion_terms(lexical_query, &seeds);
@@ -1797,7 +2069,7 @@ fn apply_structural_features(
         .map(str::to_ascii_lowercase)
         .collect();
     let top_paths: std::collections::HashSet<String> =
-        ranked_candidates(candidates, &HashMap::new())
+        ranked_candidates(candidates, &HashMap::new(), &HashMap::new())
             .into_iter()
             .take(3)
             .filter_map(|candidate| {
@@ -1932,6 +2204,15 @@ const CLAIM_TERM_BONUS: f64 = 0.2;
 const CLAIM_TERM_CAP: u32 = 3;
 const FLOW_EMIT_MAX: usize = 12;
 const FLOW_FRONTIER: usize = 16;
+/// Distinct seed origins a flow path must attest for the path clause
+/// of the corroboration predicate — one seed's relayed mass is
+/// topicality echoing through the graph, two seeds converging is
+/// consensus.
+const FLOW_CORROBORATION_MIN_ORIGINS: usize = 2;
+/// Fused-score band inside which same-name candidates count as
+/// effectively tied, so the path-aware tiebreak — not float noise in
+/// RRF sums — orders them.
+const SAME_NAME_TIE_EPSILON: f64 = 1e-9;
 /// `Contains` forward conductance for FILE-KIND SEED nodes only.
 /// Generic file→member flow dilutes across dozens of members (0.3),
 /// but a retrieved file is topical evidence for its own members —
@@ -2048,6 +2329,121 @@ fn flow_degree_maps(edges: &[(String, String, RelationKind, f64)]) -> FlowConfMa
     (out_conf, in_conf)
 }
 
+/// The receiving node's candidate path: the sender's best inbound path
+/// plus this edge, or a fresh single-edge path when the sender is a seed
+/// (seeds always originate paths — their own topicality is what flows).
+/// `None` when the sender's path is already at the `FLOW_HOPS` cap, so
+/// recorded paths never exceed the propagation horizon.
+fn extend_evidence_path(
+    predecessor: Option<&EvidencePath>,
+    from: &str,
+    to: &str,
+    kind: &RelationKind,
+    confidence: f64,
+    delivered: f64,
+) -> Option<EvidencePath> {
+    match predecessor {
+        Some(path) => {
+            if path.edges.len() >= FLOW_HOPS {
+                return None;
+            }
+            let mut edges = path.edges.clone();
+            edges.push((from.to_owned(), to.to_owned(), kind.clone(), confidence));
+            Some(EvidencePath {
+                seed: path.seed.clone(),
+                edges,
+                received: delivered,
+            })
+        }
+        None => Some(EvidencePath {
+            seed: from.to_owned(),
+            edges: vec![(from.to_owned(), to.to_owned(), kind.clone(), confidence)],
+            received: delivered,
+        }),
+    }
+}
+
+/// A total ordering on paths for the strongest-path merge: delivered
+/// mass first, then a lexicographic walk key so equal-mass paths still
+/// resolve identically run to run.
+fn evidence_path_better(candidate: &EvidencePath, incumbent: &EvidencePath) -> bool {
+    candidate
+        .received
+        .total_cmp(&incumbent.received)
+        .then_with(|| evidence_path_key(candidate).cmp(&evidence_path_key(incumbent)))
+        .is_lt()
+}
+
+/// The lexicographic tiebreak key: seed id followed by each traversed
+/// edge as `(from, kind tag, to)`. Deterministic across runs and
+/// independent of edge confidences, which are already priced into
+/// `received`.
+fn evidence_path_key(path: &EvidencePath) -> String {
+    let mut key = path.seed.clone();
+    for (from, to, kind, _) in &path.edges {
+        key.push('|');
+        key.push_str(from);
+        key.push('>');
+        key.push_str(&flow_kind_tag(kind).to_string());
+        key.push('>');
+        key.push_str(to);
+    }
+    key
+}
+
+/// Record one edge traversal's path and seed-origin evidence. Both read
+/// prev-hop state — the same discipline `prev` applies to mass — so a
+/// node relays only what earlier hops delivered. `delivered` is the
+/// decayed mass this edge carried this hop.
+#[allow(clippy::too_many_arguments)]
+fn flow_record_hop(
+    hop_paths: &mut HashMap<String, EvidencePath>,
+    hop_origins: &mut HashMap<String, std::collections::HashSet<String>>,
+    prev_paths: &HashMap<String, EvidencePath>,
+    prev_origins: &HashMap<String, std::collections::HashSet<String>>,
+    seed_ids: &std::collections::HashSet<&String>,
+    from: &str,
+    to: &str,
+    kind: &RelationKind,
+    confidence: f64,
+    delivered: f64,
+) {
+    if let Some(origin) = prev_origins.get(from) {
+        hop_origins
+            .entry(to.to_owned())
+            .or_default()
+            .extend(origin.iter().cloned());
+    }
+    let predecessor = if seed_ids.iter().any(|id| id.as_str() == from) {
+        None
+    } else {
+        prev_paths.get(from)
+    };
+    if let Some(path) = extend_evidence_path(predecessor, from, to, kind, confidence, delivered) {
+        hop_paths
+            .entry(to.to_owned())
+            .and_modify(|best| {
+                if evidence_path_better(&path, best) {
+                    *best = path.clone();
+                }
+            })
+            .or_insert(path);
+    }
+}
+
+/// `seed → Kind(conf) → … → node` — the evidence line attached to
+/// corroborated hits and `entity:` emissions. Names resolve through the
+/// batched path-name map, falling back to the entity id.
+fn render_evidence_path(path: &EvidencePath, names: &HashMap<String, String>) -> String {
+    let name = |id: &str| names.get(id).map_or_else(|| id.to_owned(), String::clone);
+    let mut rendered = name(&path.seed);
+    for (_, to, kind, confidence) in &path.edges {
+        use std::fmt::Write as _;
+        let _ = write!(rendered, " → {kind:?}({confidence:.2}) → {}", name(to));
+    }
+    rendered
+}
+
 fn apply_graph_flow(
     store: &MetadataStore,
     snapshot_id: &str,
@@ -2056,9 +2452,10 @@ fn apply_graph_flow(
     candidates: &mut HashMap<String, Candidate>,
     verified_fresh: bool,
     limit: usize,
-) -> Result<()> {
+) -> Result<FlowReport> {
+    let mut report = FlowReport::default();
     if candidates.is_empty() {
-        return Ok(());
+        return Ok(report);
     }
     // Seeds: strongest unique candidate entities — the head carries the
     // topical signal and the cap bounds relation fetches.
@@ -2126,10 +2523,10 @@ fn apply_graph_flow(
     seeds.extend(expansion_seeds);
     seeds.truncate(FLOW_SEEDS);
     let Some(max_seed) = seeds.first().map(|(_, score)| *score) else {
-        return Ok(());
+        return Ok(report);
     };
     if max_seed <= 0.0 {
-        return Ok(());
+        return Ok(report);
     }
     // File-kind seeds inject into their own members at a moderated
     // rate (FLOW_SEED_CONTAINS) instead of the generic diluting
@@ -2158,7 +2555,7 @@ fn apply_graph_flow(
         flow_collect_edges(store, snapshot_id, seed_id, &mut seen, &mut edges)?;
     }
     if edges.is_empty() {
-        return Ok(());
+        return Ok(report);
     }
     edges.sort_by(|left, right| {
         left.0
@@ -2188,6 +2585,25 @@ fn apply_graph_flow(
     // symbol-evidence join's referrer count: mass arriving over
     // independent paths is consensus, one edge's worth of mass is not.
     let mut senders: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    // Seed origins per node: the set of seeds a node's mass traces to.
+    // A node is corroborated when mass reaches it from ≥2 distinct
+    // seeds — consensus in path space, the same idea `senders` measures
+    // in edge space but composed across hops (a file reached by two of
+    // its seeded members attests two seeds, not one relayed twice).
+    // Seeds start at {self}; the abstain accounting subtracts the
+    // candidate's own nodes back out.
+    let mut origins: HashMap<String, std::collections::HashSet<String>> = seeds
+        .iter()
+        .map(|(id, _)| {
+            (
+                id.clone(),
+                std::iter::once(id.clone()).collect::<std::collections::HashSet<_>>(),
+            )
+        })
+        .collect();
+    // Strongest inbound evidence path per node — the typed record the
+    // abstain tier and explanations read: `seed → edges → evidence`.
+    let mut paths = HashMap::<String, EvidencePath>::new();
     // Non-backtracking: an edge traversed at hop t cannot reverse at
     // t+1 — test↔mechanism ping-pong would inflate both endpoints
     // without adding corroboration. Re-firing the same direction is
@@ -2216,8 +2632,16 @@ fn apply_graph_flow(
             (out_conf, in_conf) = flow_degree_maps(&edges);
         }
         let prev = mass.clone();
+        // Path/origin bookkeeping reads the same prev-hop state mass
+        // does — a node relays what earlier hops delivered, never what
+        // the hop currently delivering it computed.
+        let prev_paths = paths.clone();
+        let prev_origins = origins.clone();
         let used = std::mem::take(&mut traversed);
+        let decay = FLOW_HOP_DECAY.powi(i32::try_from(hop).unwrap_or(0));
         let mut delta = std::collections::BTreeMap::<String, f64>::new();
+        let mut hop_paths = HashMap::<String, EvidencePath>::new();
+        let mut hop_origins = HashMap::<String, std::collections::HashSet<String>>::new();
         for (index, (source, target, kind, confidence)) in edges.iter().enumerate() {
             let (mut forward, backward) = flow_edge_weights(kind);
             // Seed-file member injection: contains edges out of a
@@ -2241,6 +2665,18 @@ fn apply_graph_flow(
                     .or_default()
                     .insert(source.clone());
                 traversed.insert((index, 0));
+                flow_record_hop(
+                    &mut hop_paths,
+                    &mut hop_origins,
+                    &prev_paths,
+                    &prev_origins,
+                    &seed_ids,
+                    source,
+                    target,
+                    kind,
+                    *confidence,
+                    decay * flow,
+                );
             }
             let target_mass = prev.get(target).copied().unwrap_or_default();
             if backward > 0.0 && target_mass > 0.0 && !used.contains(&(index, 0)) {
@@ -2257,12 +2693,36 @@ fn apply_graph_flow(
                     .or_default()
                     .insert(target.clone());
                 traversed.insert((index, 1));
+                flow_record_hop(
+                    &mut hop_paths,
+                    &mut hop_origins,
+                    &prev_paths,
+                    &prev_origins,
+                    &seed_ids,
+                    target,
+                    source,
+                    kind,
+                    *confidence,
+                    decay * flow,
+                );
             }
         }
-        let decay = FLOW_HOP_DECAY.powi(i32::try_from(hop).unwrap_or(0));
         for (node, gain) in delta {
             *mass.entry(node.clone()).or_default() += decay * gain;
             *received.entry(node).or_default() += decay * gain;
+        }
+        for (node, extra) in hop_origins {
+            origins.entry(node).or_default().extend(extra);
+        }
+        for (node, path) in hop_paths {
+            paths
+                .entry(node)
+                .and_modify(|best| {
+                    if evidence_path_better(&path, best) {
+                        *best = path.clone();
+                    }
+                })
+                .or_insert(path);
         }
     }
 
@@ -2283,6 +2743,29 @@ fn apply_graph_flow(
     // carrying the structural route ARE that evidence; bonusing them
     // would double-count.
     let max_received = received.values().copied().fold(0.0_f64, f64::max);
+    // Display names for path rendering — one batched lookup over every
+    // node any recorded path touches.
+    let mut path_names = HashMap::<String, String>::new();
+    if !paths.is_empty() {
+        let mut ids = std::collections::BTreeSet::<String>::new();
+        for path in paths.values() {
+            ids.insert(path.seed.clone());
+            for (from, to, _, _) in &path.edges {
+                ids.insert(from.clone());
+                ids.insert(to.clone());
+            }
+        }
+        for entity in store.entities_by_ids(snapshot_id, &ids.into_iter().collect::<Vec<_>>())? {
+            path_names.insert(
+                entity.id.clone(),
+                entity
+                    .qualified_name
+                    .clone()
+                    .unwrap_or_else(|| entity.name.clone()),
+            );
+        }
+    }
+    report.paths = paths;
     if max_received > 0.0 || expansion.max_score > 0.0 {
         let mut file_entities = HashMap::<String, Option<String>>::new();
         for candidate in candidates.values_mut() {
@@ -2297,8 +2780,9 @@ fn apply_graph_flow(
                 .get(&candidate.hit.entity_id)
                 .copied()
                 .unwrap_or_default();
+            let mut file_id: Option<String> = None;
             if let Some(path) = candidate.hit.address.as_ref().map(|a| a.path.clone()) {
-                let file_id = match file_entities.entry(path) {
+                file_id = match file_entities.entry(path) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         let resolved =
@@ -2306,9 +2790,9 @@ fn apply_graph_flow(
                         entry.insert(resolved).clone()
                     }
                 };
-                if let Some(file_id) = file_id {
-                    if file_id != candidate.hit.entity_id {
-                        flow += received.get(&file_id).copied().unwrap_or_default();
+                if let Some(resolved) = file_id.as_ref() {
+                    if *resolved != candidate.hit.entity_id {
+                        flow += received.get(resolved).copied().unwrap_or_default();
                     }
                 }
             }
@@ -2317,9 +2801,37 @@ fn apply_graph_flow(
             } else {
                 0.0
             };
+            // Distinct-seed consensus on the candidate's evidencing
+            // nodes — its own entity and the file pooling member
+            // votes — minus itself: a seed's own mass is topicality,
+            // never corroboration.
+            let mut origin_set = origins
+                .get(&candidate.hit.entity_id)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(resolved) = file_id.as_ref() {
+                if let Some(more) = origins.get(resolved) {
+                    origin_set.extend(more.iter().cloned());
+                }
+            }
+            origin_set.remove(&candidate.hit.entity_id);
+            if let Some(resolved) = file_id.as_ref() {
+                origin_set.remove(resolved);
+            }
+            let seed_origins = origin_set.len();
             let mut notes = Vec::new();
             if flow > 0.0 {
                 notes.push(format!("graph flow corroboration {strength:.2}"));
+                let evidence_path = report
+                    .paths
+                    .get(&candidate.hit.entity_id)
+                    .or_else(|| file_id.as_ref().and_then(|id| report.paths.get(id)));
+                if let Some(path) = evidence_path {
+                    notes.push(format!(
+                        "flow path: {}",
+                        render_evidence_path(path, &path_names)
+                    ));
+                }
             }
             if expansion.max_score > 0.0 {
                 let membership = [
@@ -2351,6 +2863,14 @@ fn apply_graph_flow(
             }
             candidate.fused_score += FLOW_BONUS * strength / RRF_K;
             candidate.hit.explanation.extend(notes);
+            report.corroborated.insert(
+                candidate.hit.document_id.clone(),
+                Corroboration {
+                    strength,
+                    seed_origins,
+                    emitted: false,
+                },
+            );
         }
     }
 
@@ -2471,7 +2991,7 @@ fn apply_graph_flow(
         }
     }
     if block.is_empty() {
-        return Ok(());
+        return Ok(report);
     }
     let mut pool_scores: Vec<f64> = candidates.values().map(|c| c.fused_score).collect();
     pool_scores.sort_by(|a, b| b.total_cmp(a));
@@ -2481,7 +3001,7 @@ fn apply_graph_flow(
         .copied()
         .unwrap_or_default();
     if boundary <= 0.0 {
-        return Ok(());
+        return Ok(report);
     }
     for (rank, (_, flow, _, entity)) in block.into_iter().enumerate() {
         let mass_hit = boundary * 0.005f64.mul_add(-(rank as f64), 1.0);
@@ -2490,10 +3010,38 @@ fn apply_graph_flow(
             .clone()
             .or_else(|| entity.qualified_name.clone())
             .unwrap_or_else(|| entity.name.clone());
+        let document_id = format!("entity:{}", entity.id);
+        let mut explanation = vec![format!(
+            "graph flow evidence: received mass {flow:.3} from retrieved candidates"
+        )];
+        if let Some(path) = report.paths.get(&entity.id) {
+            explanation.push(format!(
+                "flow path: {}",
+                render_evidence_path(path, &path_names)
+            ));
+        }
+        // Flow-admitted hits are corroborated by construction: the
+        // emission gate already required inbound mass plus the
+        // block/quota walk, so `emitted` alone satisfies the abstain
+        // tier's first clause.
+        report.corroborated.insert(
+            document_id.clone(),
+            Corroboration {
+                strength: if max_received > 0.0 {
+                    (flow / max_received).min(1.0)
+                } else {
+                    0.0
+                },
+                seed_origins: origins.get(&entity.id).map_or(0, |set| {
+                    set.iter().filter(|origin| *origin != &entity.id).count()
+                }),
+                emitted: true,
+            },
+        );
         add_candidate(
             candidates,
             SearchHit {
-                document_id: format!("entity:{}", entity.id),
+                document_id,
                 region_id: entity.region_id.clone(),
                 symbol_name: Some(entity.name.clone()),
                 entity_id: entity.id.clone(),
@@ -2506,15 +3054,44 @@ fn apply_graph_flow(
                 evidence: Vec::new(),
                 snippet,
                 verified_current: verified_fresh,
-                explanation: vec![format!(
-                    "graph flow evidence: received mass {flow:.3} from retrieved candidates"
-                )],
+                explanation,
             },
             mass_hit,
             false,
         );
     }
-    Ok(())
+    // Structural-route candidates skipped the bonus readout (they ARE
+    // the expansion evidence), but inbound flow still corroborates
+    // them for the abstain tier — record seed origins on the
+    // candidate's own entity without touching scores. File-level
+    // pooling stays readout-1's privilege: expansion hits get the
+    // stricter, direct-path accounting.
+    for candidate in candidates.values() {
+        if !candidate
+            .hit
+            .contributing_routes
+            .contains(&SearchRoute::Structural)
+            || report.corroborated.contains_key(&candidate.hit.document_id)
+        {
+            continue;
+        }
+        let external = origins.get(&candidate.hit.entity_id).map_or(0, |set| {
+            set.iter()
+                .filter(|origin| *origin != &candidate.hit.entity_id)
+                .count()
+        });
+        if external > 0 {
+            report.corroborated.insert(
+                candidate.hit.document_id.clone(),
+                Corroboration {
+                    strength: 0.0,
+                    seed_origins: external,
+                    emitted: false,
+                },
+            );
+        }
+    }
+    Ok(report)
 }
 
 /// The package owning `path`: the longest matching `rootDir` prefix.
@@ -2573,24 +3150,96 @@ fn add_candidate(
         });
 }
 
+/// Fused order with the corroboration tiebreak. Scores quantized to
+/// `SAME_NAME_TIE_EPSILON` buckets count as effectively tied, and the
+/// candidate carrying stronger recorded evidence — path strength, then
+/// distinct seed origins — wins the bucket. The headline case is
+/// same-name disambiguation (`ArtifactStore::open` over a pathless
+/// `open` collision rival), but the key is a pure function of each
+/// candidate — a total order — so any effectively-tied pair resolves
+/// on evidence quality rather than document-id accident or float noise.
 fn ranked_candidates<'a>(
     candidates: &'a HashMap<String, Candidate>,
+    corroborated: &HashMap<String, Corroboration>,
     claim_bonus: &HashMap<String, f64>,
 ) -> Vec<&'a Candidate> {
-    let effective = |candidate: &Candidate| {
-        candidate.fused_score
+    let key = |candidate: &Candidate| {
+        let record = corroborated.get(&candidate.hit.document_id);
+        let effective = candidate.fused_score
             + claim_bonus
                 .get(&candidate.hit.document_id)
                 .copied()
-                .unwrap_or(0.0)
+                .unwrap_or(0.0);
+        (
+            (effective / SAME_NAME_TIE_EPSILON).floor() as i64,
+            record.map_or(0.0, |record| record.strength),
+            record.map_or(0, |record| record.seed_origins),
+        )
     };
     let mut ranked = candidates.values().collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
-        effective(right)
-            .total_cmp(&effective(left))
+        let (bucket_right, strength_right, origins_right) = key(right);
+        let (bucket_left, strength_left, origins_left) = key(left);
+        bucket_right
+            .cmp(&bucket_left)
+            .then_with(|| strength_right.total_cmp(&strength_left))
+            .then_with(|| origins_right.cmp(&origins_left))
             .then_with(|| left.hit.document_id.cmp(&right.hit.document_id))
     });
     ranked
+}
+
+/// The third abstain tier's per-hit predicate: a hit is corroborated
+/// when evidence independent of its own retrieval channel reaches it —
+/// a flow path attested by at least `FLOW_CORROBORATION_MIN_ORIGINS`
+/// distinct seeds, admission through the flow emission gate, or at
+/// least two retrieval routes agreeing on the same region (`Reranked`
+/// is an ordering annotation, not a channel). Anything else is one
+/// channel reporting on itself.
+fn hit_corroborated(hit: &SearchHit, flow: &FlowReport) -> bool {
+    if let Some(record) = flow.corroborated.get(&hit.document_id) {
+        if record.emitted || record.seed_origins >= FLOW_CORROBORATION_MIN_ORIGINS {
+            return true;
+        }
+    }
+    hit.contributing_routes
+        .iter()
+        .filter(|route| **route != SearchRoute::Reranked)
+        .nth(1)
+        .is_some()
+}
+
+/// The abstain decision itself: `Some(message)` when the presented list
+/// must be emptied. Runs only when hits exist, a route could execute
+/// under the manifest, and zero hits carry corroborated evidence —
+/// empty lists and degraded-view outcomes report through their own
+/// channels instead. Separated from `search()` so the predicate is
+/// testable without a live manifest.
+fn corroborated_path_abstention(
+    hits: &[SearchHit],
+    any_route_ran: bool,
+    flow: &FlowReport,
+) -> Option<String> {
+    if hits.is_empty() || !any_route_ran || hits.iter().any(|hit| hit_corroborated(hit, flow)) {
+        return None;
+    }
+    Some(
+        "abstained: no hit carries corroborated evidence (≥2-seed flow path, flow emission, or ≥2-route agreement) — every result rests on a single uncorroborated channel"
+            .to_owned(),
+    )
+}
+
+/// Whether a route could execute under this manifest — every view it
+/// requires is Ready or Partial. The abstain tier consults this so a
+/// hit list assembled on degraded views reports view-missing rather
+/// than being re-labeled as abstention.
+fn route_ran(manifest: &ViewManifest, route: SearchRoute) -> bool {
+    required_views_for_routes(&[route]).iter().all(|kind| {
+        manifest
+            .views
+            .get(kind)
+            .is_some_and(|status| matches!(status.state, ViewState::Ready | ViewState::Partial))
+    })
 }
 
 /// Per-file cap by filled list length: the head enforces file diversity —
@@ -2653,6 +3302,9 @@ fn required_views_for_routes(routes: &[SearchRoute]) -> Vec<ViewKind> {
             // because an external index is absent — the FTS channel
             // already covers the same vocabulary.
             SearchRoute::Zoekt => &[],
+            // Pattern needs no prepared view: it reads snapshot source
+            // artifacts directly, which are always local.
+            SearchRoute::Pattern => &[],
             SearchRoute::Reranked => &[],
         };
         for view in candidates {
@@ -3784,6 +4436,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             file_count: 0,
             source_bytes: 0,
+            origin: None,
         };
         store.begin_snapshot(&snapshot).expect("begin snapshot");
         store
@@ -4215,6 +4868,7 @@ mod tests {
             .select_hits(
                 &request("query", 5),
                 &candidates,
+                &FlowReport::default(),
                 &claim_frame(QueryIntent::Unknown, Vec::new()),
             )
             .expect("select hits");
@@ -4261,6 +4915,7 @@ mod tests {
             .select_hits(
                 &request("query", 5),
                 &candidates,
+                &FlowReport::default(),
                 &claim_frame(QueryIntent::Unknown, Vec::new()),
             )
             .expect("select hits");
@@ -4277,6 +4932,7 @@ mod tests {
             .select_hits(
                 &request("query", 6),
                 &candidates,
+                &FlowReport::default(),
                 &claim_frame(QueryIntent::Unknown, Vec::new()),
             )
             .expect("select hits");
@@ -4585,6 +5241,238 @@ mod tests {
         )
         .expect("graph flow");
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn graph_flow_records_typed_evidence_path_to_emission() {
+        // Seeds a and b both call `set_view_status` — the emitted
+        // mechanism must carry the typed path that delivered its
+        // consensus mass, explain itself with it, and record
+        // emitted/two-origin corroboration for the abstain tier.
+        let records = SnapshotRecords {
+            entities: vec![
+                file("src/a.rs"),
+                file("src/b.rs"),
+                symbol("set_view_status", "src/m.rs"),
+            ],
+            relations: vec![
+                calls("file:src/a.rs", "symbol:set_view_status"),
+                calls("file:src/b.rs", "symbol:set_view_status"),
+            ],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, store, snapshot_id) = store_with(&records);
+
+        let mut candidates = HashMap::new();
+        candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
+        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.05));
+        let report = apply_graph_flow(
+            &store,
+            &snapshot_id,
+            "mark views stale",
+            &ExpansionEvidence::default(),
+            &mut candidates,
+            true,
+            50,
+        )
+        .expect("graph flow");
+
+        // The recorded path is the typed walk mass took: one Calls edge
+        // out of a seed file, terminating on the emitted mechanism.
+        let path = report
+            .paths
+            .get("symbol:set_view_status")
+            .expect("emitted node must record a path");
+        assert!(["file:src/a.rs", "file:src/b.rs"].contains(&path.seed.as_str()));
+        assert_eq!(path.edges.len(), 1);
+        assert_eq!(path.edges[0].2, RelationKind::Calls);
+        assert!(path.received > 0.0);
+
+        let emitted = &candidates["entity:symbol:set_view_status"].hit;
+        let path_line = emitted
+            .explanation
+            .iter()
+            .find(|line| line.starts_with("flow path:"))
+            .expect("emitted hit must explain its evidence path");
+        assert!(path_line.contains("Calls"));
+        assert!(path_line.contains("set_view_status"));
+
+        let record = report
+            .corroborated
+            .get("entity:symbol:set_view_status")
+            .expect("emitted hit must record corroboration");
+        assert!(record.emitted);
+        assert_eq!(record.seed_origins, 2);
+        assert!(record.strength > 0.0);
+    }
+
+    #[test]
+    fn graph_flow_path_explanation_only_when_path_exists() {
+        // `b` corroborates `a` through changed_with — `a`'s evidencing
+        // file node carries a recorded path, so its explanation names
+        // it. `c` receives no mass: no flow note, no path line —
+        // explanations are honest about pathless candidates.
+        let records = SnapshotRecords {
+            entities: vec![file("src/a.rs"), file("src/b.rs"), file("src/c.rs")],
+            relations: vec![changed_with("file:src/a.rs", "file:src/b.rs", 0.9)],
+            ..SnapshotRecords::default()
+        };
+        let (_dir, store, snapshot_id) = store_with(&records);
+
+        let mut candidates = HashMap::new();
+        candidates.insert("a".to_owned(), candidate("a", "src/a.rs", 0.1));
+        candidates.insert("b".to_owned(), candidate("b", "src/b.rs", 0.05));
+        candidates.insert("c".to_owned(), candidate("c", "src/c.rs", 0.05));
+        let report = apply_graph_flow(
+            &store,
+            &snapshot_id,
+            "query",
+            &ExpansionEvidence::default(),
+            &mut candidates,
+            true,
+            50,
+        )
+        .expect("graph flow");
+
+        let path_line = candidates["a"]
+            .hit
+            .explanation
+            .iter()
+            .find(|line| line.starts_with("flow path:"))
+            .expect("corroborated candidate must explain its path");
+        assert!(path_line.contains("ChangedWith"));
+        assert!(
+            !candidates["c"]
+                .hit
+                .explanation
+                .iter()
+                .any(|line| line.contains("flow path:")),
+            "a pathless candidate must never claim a path"
+        );
+        // `a`'s corroboration traces to exactly one foreign seed — `b`.
+        assert_eq!(
+            report.corroborated["a"].seed_origins, 1,
+            "self-mass must never count toward a candidate's origins"
+        );
+    }
+
+    #[test]
+    fn corroboration_predicate_recognizes_each_evidence_channel() {
+        let mut hit = candidate("doc:one", "src/a.rs", 0.1).hit;
+        let mut flow = FlowReport::default();
+        // One route and no flow record: a single channel reporting on
+        // itself is not corroborated.
+        assert!(!hit_corroborated(&hit, &flow));
+        // Reranked is an ordering annotation, not a second channel.
+        hit.contributing_routes.push(SearchRoute::Reranked);
+        assert!(!hit_corroborated(&hit, &flow));
+        // A second retrieval route agreeing corroborates.
+        hit.contributing_routes.push(SearchRoute::DenseRaw);
+        assert!(hit_corroborated(&hit, &flow));
+
+        // A flow path attested by ≥2 distinct seeds corroborates on its
+        // own; one seed's relayed mass is topicality echo, not
+        // consensus; flow emission corroborates by construction.
+        hit.contributing_routes.truncate(1);
+        for (record, expected) in [
+            (
+                Corroboration {
+                    strength: 0.5,
+                    seed_origins: 2,
+                    emitted: false,
+                },
+                true,
+            ),
+            (
+                Corroboration {
+                    strength: 0.5,
+                    seed_origins: 1,
+                    emitted: false,
+                },
+                false,
+            ),
+            (
+                Corroboration {
+                    strength: 0.5,
+                    seed_origins: 0,
+                    emitted: true,
+                },
+                true,
+            ),
+        ] {
+            flow.corroborated.insert("doc:one".to_owned(), record);
+            assert_eq!(hit_corroborated(&hit, &flow), expected, "{record:?}");
+        }
+    }
+
+    #[test]
+    fn corroborated_path_abstention_gate_semantics() {
+        let hit = candidate("doc:one", "src/a.rs", 0.1).hit;
+        let mut agreed = candidate("doc:two", "src/b.rs", 0.1).hit;
+        agreed.contributing_routes.push(SearchRoute::DenseRaw);
+        let flow = FlowReport::default();
+
+        // Hits present, a route ran, nothing corroborated → abstain.
+        let message = corroborated_path_abstention(std::slice::from_ref(&hit), true, &flow)
+            .expect("an uncorroborated list must abstain");
+        assert!(message.starts_with("abstained:"));
+
+        // One corroborated hit preserves the whole list.
+        assert!(corroborated_path_abstention(&[hit.clone(), agreed], true, &flow).is_none());
+        // No route ran → missing-view reporting, never abstention.
+        assert!(corroborated_path_abstention(std::slice::from_ref(&hit), false, &flow).is_none());
+        // An empty list is already abstention-shaped — no duplicate
+        // message stacked on the earlier tiers'.
+        assert!(corroborated_path_abstention(&[], true, &flow).is_none());
+    }
+
+    #[test]
+    fn ranked_candidates_path_tiebreak_disambiguates_same_name() {
+        // Two `open` symbols at effectively-equal fused scores: the
+        // path-bearing candidate orders first — evidence quality
+        // disambiguates where score cannot. A third candidate at a
+        // strictly better score is untouched by the tiebreak.
+        let mut candidates = HashMap::new();
+        for (id, path, score) in [
+            ("doc:qualified", "src/store.rs", 0.5_f64),
+            ("doc:bare", "src/util.rs", 0.5),
+            ("doc:winner", "src/winner.rs", 0.6),
+        ] {
+            let mut candidate = candidate(id, path, score);
+            candidate.hit.symbol_name = Some("open".to_owned());
+            candidates.insert(id.to_owned(), candidate);
+        }
+        let mut corroborated = HashMap::new();
+        corroborated.insert(
+            "doc:qualified".to_owned(),
+            Corroboration {
+                strength: 0.4,
+                seed_origins: 2,
+                emitted: false,
+            },
+        );
+
+        let ranked = ranked_candidates(&candidates, &corroborated, &HashMap::new());
+        let order = ranked
+            .iter()
+            .map(|candidate| candidate.hit.document_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order[0], "doc:winner", "strictly better score always wins");
+        assert_eq!(
+            order[1], "doc:qualified",
+            "the path-bearing same-name rival must outrank the pathless one"
+        );
+        assert_eq!(order[2], "doc:bare");
+
+        // With no corroboration recorded, the same scores fall back to
+        // the deterministic document-id order the tiebreak replaced.
+        let unrated = ranked_candidates(&candidates, &HashMap::new(), &HashMap::new());
+        let fallback = unrated
+            .iter()
+            .map(|candidate| candidate.hit.document_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(fallback[1], "doc:bare");
+        assert_eq!(fallback[2], "doc:qualified");
     }
 
     fn file_touched(path: &str, last_touched: i64) -> CodeEntity {
@@ -5489,6 +6377,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             file_count: 1,
             source_bytes: 0,
+            origin: None,
         };
         engine
             .store()
@@ -5581,6 +6470,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             file_count: 1,
             source_bytes: 0,
+            origin: None,
         };
         engine
             .store()
@@ -5708,6 +6598,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             file_count: documents.len() as u64,
             source_bytes: 0,
+            origin: None,
         };
         engine
             .store()
@@ -5760,6 +6651,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             file_count: documents.len() as u64,
             source_bytes: 0,
+            origin: None,
         };
         engine
             .store()
@@ -6267,6 +7159,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             file_count: 1,
             source_bytes: 0,
+            origin: None,
         };
         engine
             .store()
@@ -6320,6 +7213,7 @@ mod tests {
             .expect("pinned search");
         assert!(pinned.hits.is_empty());
     }
+
     /// Terms inside one symbol's span bind at entity scope; terms split
     /// across two functions of the same file bind only at file scope —
     /// the granularity difference the verdict must report.
@@ -6541,7 +7435,6 @@ mod tests {
                 file("docs/notes.md"),
             ],
         );
-
         let mut candidates = HashMap::new();
         candidates.insert(
             "doc:carrier".to_owned(),
@@ -6566,7 +7459,7 @@ mod tests {
         };
 
         let hits = engine
-            .select_hits(&request, &candidates, &frame)
+            .select_hits(&request, &candidates, &FlowReport::default(), &frame)
             .expect("select hits");
         assert_eq!(
             hits.first().map(|hit| hit.document_id.as_str()),

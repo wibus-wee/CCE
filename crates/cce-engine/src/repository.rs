@@ -317,6 +317,7 @@ impl RepositoryScanner {
             created_at: Utc::now(),
             file_count: files.len() as u64,
             source_bytes,
+            origin: None,
         };
 
         Ok(ScannedRepository {
@@ -370,7 +371,7 @@ pub(crate) fn is_probably_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8_192).any(|byte| *byte == 0) || std::str::from_utf8(bytes).is_err()
 }
 
-fn language_for_path(path: &Path) -> Option<&'static str> {
+pub(crate) fn language_for_path(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "rs" => Some("rust"),
         "ts" | "mts" | "cts" => Some("typescript"),

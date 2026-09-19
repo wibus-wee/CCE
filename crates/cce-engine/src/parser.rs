@@ -279,7 +279,7 @@ fn push_node_text(node: Node<'_>, source: &[u8], output: &mut Vec<String>) {
     }
 }
 
-fn language(name: &str) -> Option<Language> {
+pub(crate) fn language(name: &str) -> Option<Language> {
     match name {
         "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
         "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),

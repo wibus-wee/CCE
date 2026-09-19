@@ -15,8 +15,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DenseBackendConfig, DenseIndex, Embedder, EmbeddingBackend, EngineConfig, RepositoryScanner,
-    ScannedFile, ScannedRepository, SourceParser,
+    DenseBackendConfig, DenseIndex, Embedder, EmbeddingBackend, EngineConfig, IndexVariant,
+    RepositoryScanner, ScannedFile, ScannedRepository, SourceParser,
 };
 
 /// Everything an `index()` run produced: snapshot identity, counts, skip
@@ -90,6 +90,30 @@ pub struct CceEngine {
     /// Cumulative retrieval counters — the proof that dense query work
     /// follows the hit set, not the corpus.
     retrieval_counters: RetrievalCounters,
+    /// Snapshot lifecycle broadcast — commits and activations. SSE and
+    /// agent consumers subscribe via [`Self::subscribe_snapshots`]; a
+    /// `send` with zero receivers is a no-op by design.
+    snapshot_events: tokio::sync::broadcast::Sender<SnapshotEvent>,
+}
+
+/// One snapshot lifecycle event, broadcast on commit and activation —
+/// the signal SSE consumers re-poll their views off instead of a timer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotEvent {
+    /// Repository the snapshot belongs to.
+    pub repository_id: String,
+    /// Snapshot the event concerns.
+    pub snapshot_id: String,
+    /// `committed` — new snapshot written; `activated` — an existing
+    /// snapshot was promoted to `current`.
+    pub kind: String,
+    /// Producer label recorded on the snapshot (`cli`, `watch`,
+    /// `checkpoint`, an MCP client name).
+    pub origin: Option<String>,
+    /// Whether the event moved `current` — full commits and activations
+    /// do; detached checkpoint commits do not.
+    pub promoted: bool,
 }
 
 /// Identity of a decoded dense index for caching. The digest is
@@ -196,7 +220,27 @@ impl CceEngine {
             repair_attempts: std::sync::Mutex::new(std::collections::HashSet::new()),
             dense_indexes: std::sync::Mutex::new(HashMap::new()),
             retrieval_counters: RetrievalCounters::default(),
+            snapshot_events: tokio::sync::broadcast::channel(64).0,
         })
+    }
+
+    /// Subscribe to snapshot lifecycle events (`committed`, `activated`).
+    /// Receivers that lag past the 64-event buffer get `Lagged` and should
+    /// re-fetch state rather than replay.
+    pub fn subscribe_snapshots(&self) -> tokio::sync::broadcast::Receiver<SnapshotEvent> {
+        self.snapshot_events.subscribe()
+    }
+
+    /// Publish one snapshot event; an absent-subscriber error is expected
+    /// and meaningless to producers.
+    fn emit_snapshot(&self, snapshot: &SnapshotIdentity, kind: &str, promoted: bool) {
+        let _ = self.snapshot_events.send(SnapshotEvent {
+            repository_id: snapshot.repository_id.clone(),
+            snapshot_id: snapshot.id.clone(),
+            kind: kind.to_owned(),
+            origin: snapshot.origin.clone(),
+            promoted,
+        });
     }
 
     /// Shared reranker backend, initialized on first use. `Ok(None)` when
@@ -720,15 +764,55 @@ impl CceEngine {
     /// parse, or provider errors surface in the report/status rather than
     /// aborting where recoverable.
     pub async fn index(&self) -> Result<IndexReport> {
+        self.index_inner(IndexVariant::Full, None).await
+    }
+
+    /// `index()` attributing the produced snapshot to `origin` — who ran
+    /// it (cli, watch, an MCP client name) is review context, never part
+    /// of snapshot identity.
+    ///
+    /// # Errors
+    /// Same as [`Self::index`].
+    pub async fn index_with_origin(&self, origin: Option<String>) -> Result<IndexReport> {
+        self.index_inner(IndexVariant::Full, origin).await
+    }
+
+    /// Checkpoint: commit a parse+relations snapshot of the worktree — no
+    /// providers, dense, or zoekt — under a distinct profile hash. The
+    /// commit never promotes to `current`, so a checkpoint answers "what
+    /// did this session change" via `architecture_diff` without moving
+    /// the serving view or satisfying a later full index of the same
+    /// content.
+    ///
+    /// # Errors
+    /// Same as [`Self::index`].
+    pub async fn checkpoint(&self, origin: Option<String>) -> Result<IndexReport> {
+        self.index_inner(IndexVariant::Checkpoint, origin).await
+    }
+
+    async fn index_inner(
+        &self,
+        variant: IndexVariant,
+        origin: Option<String>,
+    ) -> Result<IndexReport> {
+        let checkpoint = matches!(variant, IndexVariant::Checkpoint);
+        // The scan config carries the variant — its profile hashes into
+        // the snapshot id, so a checkpoint of unchanged content mints its
+        // own id instead of colliding with the full-index snapshot.
+        let mut scan_config = self.config.clone();
+        scan_config.variant = variant;
         // Scan before taking the write lease: an unchanged repository returns
         // without ever contending with concurrent readers or writers.
-        let mut scanned = RepositoryScanner::new(self.config.clone()).scan(Some(&self.store))?;
+        let mut scanned = RepositoryScanner::new(scan_config.clone()).scan(Some(&self.store))?;
+        scanned.snapshot.origin = origin.clone();
         self.store.register_repository(&scanned.identity)?;
         // One lease may be taken early — for the activation gate below — and
         // then shared by view repair, Zoekt repair, or the write path. Inner
         // acquisitions must reuse it: `IndexLease` is not re-entrant.
         let mut lease: Option<crate::lock::IndexLease> = None;
-        if self.store.snapshot_is_complete(&scanned.snapshot.id)? {
+        // Activation gate: full snapshots only — a checkpoint is committed
+        // for diffing, never promoted to `current`.
+        if !checkpoint && self.store.snapshot_is_complete(&scanned.snapshot.id)? {
             // "Data present" is not "snapshot active": reusing a complete
             // historical snapshot must move `current` to it, or status,
             // atlas and non-fresh search keep resolving the stale one.
@@ -738,7 +822,8 @@ impl CceEngine {
                 // it — the first scan predates serialization, and another
                 // writer may have committed a different snapshot meanwhile.
                 let held = crate::lock::IndexLease::acquire(&self.config.data_root)?;
-                scanned = RepositoryScanner::new(self.config.clone()).scan(Some(&self.store))?;
+                scanned = RepositoryScanner::new(scan_config.clone()).scan(Some(&self.store))?;
+                scanned.snapshot.origin = origin.clone();
                 if self.store.snapshot_is_complete(&scanned.snapshot.id)? {
                     let current = self.store.current_snapshot(&scanned.identity.id)?;
                     if current.as_deref() != Some(scanned.snapshot.id.as_str()) {
@@ -746,6 +831,7 @@ impl CceEngine {
                             &scanned.identity.id,
                             &scanned.snapshot.id,
                         )?;
+                        self.emit_snapshot(&scanned.snapshot, "activated", true);
                     }
                 }
                 // `refreshed` may map to a snapshot that is not complete —
@@ -758,74 +844,85 @@ impl CceEngine {
             let mut manifest = self
                 .store
                 .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
-            // A snapshot is marked complete when its records transaction
-            // commits — post-commit steps (the dense build, view status
-            // writes) can still be interrupted, leaving `Building` (or a
-            // transient `Failed`) committed in the manifest while the early
-            // return above would skip the rebuild forever. Repair in place:
-            // every post-commit input is derivable from committed records.
-            // Once per snapshot per process — a deterministically failing
-            // step reports `Failed` once rather than re-running per search.
-            let needs_repair = manifest
-                .views
-                .values()
-                .any(|view| matches!(view.state, ViewState::Building | ViewState::Failed));
-            let first_attempt = needs_repair
-                && self
-                    .repair_attempts
-                    .lock()
-                    .map_err(|_| CceError::Storage("repair mutex poisoned".to_owned()))?
-                    .insert(scanned.snapshot.id.clone());
-            if first_attempt {
-                if lease.is_none() {
-                    lease = Some(crate::lock::IndexLease::acquire(&self.config.data_root)?);
-                }
-                self.repair_committed_views(&scanned, &manifest).await?;
-                manifest = self
-                    .store
-                    .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
-            }
-            // Zoekt shards are derived content outside the snapshot
-            // commit; a reused snapshot may predate the toolchain or
-            // carry a stale marker. Rebuild once per mismatch — this
-            // branch skips `ingest_providers` entirely.
             let mut providers = Vec::new();
-            let zoekt_fresh =
-                crate::zoekt::indexed_snapshot(&crate::zoekt::index_dir(&self.config.data_root))
-                    == Some(scanned.snapshot.id.clone());
-            if !zoekt_fresh || !manifest.views.contains_key(&ViewKind::Zoekt) {
-                // A concurrent writer owns freshness — its fresh-index
-                // pass rebuilds the shards anyway, so busy means skip.
-                if lease.is_none() {
-                    match crate::lock::IndexLease::acquire(&self.config.data_root) {
-                        Ok(held) => lease = Some(held),
-                        Err(CceError::IndexBusy(_)) => {}
-                        Err(error) => return Err(error),
+            // A reused checkpoint has nothing to repair: it commits
+            // parse+relations plus honest `Unavailable` statuses for the
+            // skipped views, so its manifest is returned untouched.
+            if !checkpoint {
+                // A snapshot is marked complete when its records transaction
+                // commits — post-commit steps (the dense build, view status
+                // writes) can still be interrupted, leaving `Building` (or a
+                // transient `Failed`) committed in the manifest while the
+                // early return above would skip the rebuild forever. Repair
+                // in place: every post-commit input is derivable from
+                // committed records. Once per snapshot per process — a
+                // deterministically failing step reports `Failed` once
+                // rather than re-running per search.
+                let needs_repair = manifest
+                    .views
+                    .values()
+                    .any(|view| matches!(view.state, ViewState::Building | ViewState::Failed));
+                let first_attempt = needs_repair
+                    && self
+                        .repair_attempts
+                        .lock()
+                        .map_err(|_| CceError::Storage("repair mutex poisoned".to_owned()))?
+                        .insert(scanned.snapshot.id.clone());
+                if first_attempt {
+                    if lease.is_none() {
+                        lease = Some(crate::lock::IndexLease::acquire(&self.config.data_root)?);
                     }
-                }
-                if lease.is_some() {
-                    let repo_root = self.config.repository_root.clone();
-                    let data_root = self.config.data_root.clone();
-                    let snapshot_id = scanned.snapshot.id.clone();
-                    let timeout =
-                        std::time::Duration::from_secs(self.config.providers.timeout_secs);
-                    let report = tokio::task::spawn_blocking(move || {
-                        crate::zoekt::ensure_report(&repo_root, &data_root, &snapshot_id, timeout)
-                    })
-                    .await
-                    .map_err(|error| {
-                        CceError::Configuration(format!("provider runner failed: {error}"))
-                    })?;
-                    self.store.set_view_status(
-                        &scanned.identity.id,
-                        &scanned.snapshot.id,
-                        ViewKind::Zoekt,
-                        &zoekt_view_status(&scanned.snapshot, std::slice::from_ref(&report)),
-                    )?;
-                    providers.push(report);
+                    self.repair_committed_views(&scanned, &manifest).await?;
                     manifest = self
                         .store
                         .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
+                }
+                // Zoekt shards are derived content outside the snapshot
+                // commit; a reused snapshot may predate the toolchain or
+                // carry a stale marker. Rebuild once per mismatch — this
+                // branch skips `ingest_providers` entirely.
+                let zoekt_fresh = crate::zoekt::indexed_snapshot(&crate::zoekt::index_dir(
+                    &self.config.data_root,
+                )) == Some(scanned.snapshot.id.clone());
+                if !zoekt_fresh || !manifest.views.contains_key(&ViewKind::Zoekt) {
+                    // A concurrent writer owns freshness — its fresh-index
+                    // pass rebuilds the shards anyway, so busy means skip.
+                    if lease.is_none() {
+                        match crate::lock::IndexLease::acquire(&self.config.data_root) {
+                            Ok(held) => lease = Some(held),
+                            Err(CceError::IndexBusy(_)) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    if lease.is_some() {
+                        let repo_root = self.config.repository_root.clone();
+                        let data_root = self.config.data_root.clone();
+                        let snapshot_id = scanned.snapshot.id.clone();
+                        let timeout =
+                            std::time::Duration::from_secs(self.config.providers.timeout_secs);
+                        let report = tokio::task::spawn_blocking(move || {
+                            crate::zoekt::ensure_report(
+                                &repo_root,
+                                &data_root,
+                                &snapshot_id,
+                                timeout,
+                            )
+                        })
+                        .await
+                        .map_err(|error| {
+                            CceError::Configuration(format!("provider runner failed: {error}"))
+                        })?;
+                        self.store.set_view_status(
+                            &scanned.identity.id,
+                            &scanned.snapshot.id,
+                            ViewKind::Zoekt,
+                            &zoekt_view_status(&scanned.snapshot, std::slice::from_ref(&report)),
+                        )?;
+                        providers.push(report);
+                        manifest = self
+                            .store
+                            .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
+                    }
                 }
             }
             return Ok(IndexReport {
@@ -1501,9 +1598,11 @@ impl CceEngine {
         // External code-intelligence providers (SCIP indexers). Subprocess
         // runs happen on the blocking pool; ingestion into `records` is a
         // pure in-memory merge — a failed provider degrades its report and
-        // view status, never the snapshot.
-        let provider_reports = self
-            .ingest_providers(
+        // view status, never the snapshot. Checkpoints invoke none of it.
+        let provider_reports = if checkpoint {
+            Vec::new()
+        } else {
+            self.ingest_providers(
                 &scanned,
                 &texts_by_path,
                 &parsed_by_path,
@@ -1511,9 +1610,18 @@ impl CceEngine {
                 &file_entities,
                 &mut records,
             )
-            .await?;
+            .await?
+        };
 
-        self.store.commit_snapshot(&scanned.snapshot, &records)?;
+        if checkpoint {
+            // A checkpoint is a diff artifact, not a serving snapshot:
+            // records commit complete but `current_snapshots` stays put.
+            self.store
+                .commit_snapshot_detached(&scanned.snapshot, &records)?;
+        } else {
+            self.store.commit_snapshot(&scanned.snapshot, &records)?;
+        }
+        self.emit_snapshot(&scanned.snapshot, "committed", !checkpoint);
         let syntax_coverage = if parse_candidates == 0 {
             1.0
         } else {
@@ -1544,8 +1652,26 @@ impl CceEngine {
             ViewKind::Graph,
             &graph_status,
         )?;
-        self.build_dense_view(&scanned.identity.id, &scanned.snapshot)
-            .await?;
+        if checkpoint {
+            self.store.set_view_status(
+                &scanned.identity.id,
+                &scanned.snapshot.id,
+                ViewKind::Dense,
+                &status(
+                    &scanned.snapshot,
+                    ViewState::Unavailable,
+                    Vec::new(),
+                    Some(
+                        "checkpoint snapshot — parse+relations only; run `cce index` for the full \
+                         build"
+                            .to_owned(),
+                    ),
+                ),
+            )?;
+        } else {
+            self.build_dense_view(&scanned.identity.id, &scanned.snapshot)
+                .await?;
+        }
         self.store.set_view_status(
             &scanned.identity.id,
             &scanned.snapshot.id,
@@ -1568,7 +1694,16 @@ impl CceEngine {
             &scanned.identity.id,
             &scanned.snapshot.id,
             ViewKind::Zoekt,
-            &zoekt_view_status(&scanned.snapshot, &provider_reports),
+            &if checkpoint {
+                status(
+                    &scanned.snapshot,
+                    ViewState::Unavailable,
+                    Vec::new(),
+                    Some("checkpoint snapshot — zoekt index skipped".to_owned()),
+                )
+            } else {
+                zoekt_view_status(&scanned.snapshot, &provider_reports)
+            },
         )?;
         if let Err(error) = self
             .store

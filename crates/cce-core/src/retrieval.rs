@@ -76,6 +76,9 @@ pub enum SearchRoute {
     /// Zoekt trigram index candidates (external sidecar index; file hits
     /// resolve back to snapshot documents through matched line numbers).
     Zoekt,
+    /// Structural CST pattern matching (`pat:`) — deterministic matches
+    /// over tree-sitter grammars behind a regex candidate prefilter.
+    Pattern,
     /// Result ordering produced by the reranker stage.
     Reranked,
 }
@@ -199,29 +202,97 @@ pub struct QueryFilters {
     /// default.
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub hit_type: Option<String>,
+    /// Structural pattern template (`pat:'fn $F($$$A) { $$$B }'`).
+    /// Comby-style `:[hole]` and `...` spellings are translated to the
+    /// engine's metavariable syntax at compile time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
 }
 
 impl QueryFilters {
     /// Whether any filter is set.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.path_prefix.is_none() && self.language.is_none() && self.hit_type.is_none()
+        self.path_prefix.is_none()
+            && self.language.is_none()
+            && self.hit_type.is_none()
+            && self.pattern.is_none()
     }
 }
 
-/// Extracts `lang:`/`path:`/`type:` tokens into structured filters.
+/// Splits a query into whitespace-separated tokens, keeping
+/// `key:'quoted value'` and `key:"quoted value"` together so values may
+/// contain spaces, colons, and parentheses. An unterminated quote makes
+/// the token run to end-of-input — callers see the raw text and the
+/// unclosed construct is preserved verbatim, never half-parsed.
+fn tokenize_filters(query: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut token_start: Option<usize> = None;
+    let mut quote = None;
+    for (index, character) in query.char_indices() {
+        if let Some(mark) = quote {
+            if character == mark {
+                quote = None;
+            }
+            continue;
+        }
+        if character.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                tokens.push(&query[start..index]);
+            }
+            continue;
+        }
+        let start = *token_start.get_or_insert(index);
+        // A quote opens a quoted span only directly after the first
+        // `key:` of a bare token — `a'b` and `x:'y` mid-token are
+        // inert, matching the untouched-verbatim contract.
+        if matches!(character, '\'' | '"')
+            && query[start..index]
+                .strip_suffix(':')
+                .is_some_and(|key| key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        {
+            quote = Some(character);
+        }
+    }
+    if let Some(start) = token_start {
+        tokens.push(&query[start..]);
+    }
+    tokens
+}
+
+/// Extracts `lang:`/`path:`/`type:`/`pat:` tokens into structured
+/// filters.
 ///
 /// Returns the cleaned query text and the filters. Unknown `key:` tokens
 /// (and unknown `type:` values) stay in the query text untouched.
+/// `patterntype:structural` promotes the remaining bare text to the
+/// pattern template — Sourcegraph's spelling for the same operator.
 #[must_use]
 pub fn parse_query_filters(query: &str) -> (String, QueryFilters) {
     let mut filters = QueryFilters::default();
+    let mut patterntype_structural = false;
     let mut kept = Vec::new();
-    for token in query.split_whitespace() {
-        let Some((key, value)) = token.split_once(':') else {
+    for token in tokenize_filters(query) {
+        let Some((key, raw_value)) = token.split_once(':') else {
             kept.push(token);
             continue;
         };
+        let quoted = matches!(raw_value.as_bytes().first(), Some(b'\'' | b'"'));
+        let value = raw_value
+            .strip_prefix('\'')
+            .and_then(|v| v.strip_suffix('\''))
+            .or_else(|| {
+                raw_value
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+            })
+            .unwrap_or(raw_value);
+        // An opener without a closer produced one long raw token —
+        // keep it verbatim rather than half-parse the value.
+        if quoted && value == raw_value {
+            kept.push(token);
+            continue;
+        }
         if value.is_empty() {
             kept.push(token);
             continue;
@@ -232,8 +303,14 @@ pub fn parse_query_filters(query: &str) -> (String, QueryFilters) {
             "type" if matches!(value, "diff" | "commit" | "file") => {
                 filters.hit_type = Some(value.to_owned());
             }
+            "pat" => filters.pattern = Some(value.to_owned()),
+            "patterntype" if value == "structural" => patterntype_structural = true,
             _ => kept.push(token),
         }
+    }
+    if patterntype_structural && filters.pattern.is_none() {
+        filters.pattern = Some(kept.join(" "));
+        kept.clear();
     }
     (kept.join(" "), filters)
 }
