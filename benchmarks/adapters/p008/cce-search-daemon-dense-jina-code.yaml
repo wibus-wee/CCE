@@ -1,0 +1,20 @@
+name: cce-search-daemon-dense-jina-code-p008
+# v8 evidence-paths arm: dense daemon session against the p008 sandbox.
+# CCE_FLOW is gone (flow is the only structural pass post-007).
+session: daemon
+command:
+  - .cce-benchmark-p008/bin/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 360
+model_revision: none
+dense: local
+embedding_model: jinaai/jina-embeddings-v2-base-code
+environment:
+  CCE_DATA_DIR: /Users/wibus/dev/CCE/.cce-benchmark-p008

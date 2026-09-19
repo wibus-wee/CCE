@@ -1,0 +1,26 @@
+name: cce-external-search-daemon-dense-jina-code
+# External-corpus dense arm: warm cce-daemon session, jina-code local
+# embeddings (downloaded once into <CCE_DATA_DIR>/models on first index).
+# Index lands in .cce-bench-external inside the external repo checkout —
+# the internal dogfood index is untouched.
+#
+# NOTE: daemon binary is resolved as the sibling of command[0]
+# (…/cce → …/cce-daemon), so an absolute path is required because the
+# subprocess cwd is the external repo. Adjust to this checkout's location.
+session: daemon
+command:
+  - /Users/wibus/dev/CCE/target/release/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 1800
+model_revision: none
+dense: local
+embedding_model: jinaai/jina-embeddings-v2-base-code
+environment:
+  CCE_DATA_DIR: .cce-bench-external

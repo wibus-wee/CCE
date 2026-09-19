@@ -1,0 +1,21 @@
+name: cce-external-search-daemon-sparse
+# External-corpus sparse arm over a warm cce-daemon session: identical to
+# cce-external-search-sparse but pays process spawn once per run instead of
+# per case. Index lands in .cce-bench-external inside the external repo.
+session: daemon
+command:
+  - /Users/wibus/dev/CCE/target/release/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 1800
+model_identity: none
+model_revision: none
+dense: disabled
+environment:
+  CCE_DATA_DIR: .cce-bench-external

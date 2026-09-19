@@ -1,0 +1,25 @@
+name: cce-external-search-sparse
+# External-corpus sparse arm: identical to cce-search-sparse but writes its
+# index to .cce-bench-external (relative to the subprocess cwd = the external
+# repo checkout) so the internal dogfood index in .cce-benchmark is untouched.
+# No model downloads — safest first external run.
+#
+# NOTE: the subprocess cwd is the EXTERNAL repo, so the cce binary must be an
+# absolute path (the `target/release/cce` shorthand only resolves when the
+# repository under test is CCE itself). Adjust to this checkout's location.
+command:
+  - /Users/wibus/dev/CCE/target/release/cce
+  - --json
+  - search
+  - "{repository}"
+  - "{query}"
+  - "{intent_args}"
+  - "{route_args}"
+  - --limit
+  - "50"
+timeout_seconds: 1800
+model_identity: none
+model_revision: none
+dense: disabled
+environment:
+  CCE_DATA_DIR: .cce-bench-external
