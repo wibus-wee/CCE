@@ -203,6 +203,152 @@ export interface ReferencesReport {
   truncated: boolean
 }
 
+// --- atlas: package map, explain, impact -------------------------------------
+
+export interface PackageNode {
+  name: string
+  ecosystem: string
+  manifestPath: string
+  rootDir: string
+  memberFiles: number
+  dependencies: string[]
+  dependents: string[]
+}
+
+export interface BoundaryViolation {
+  sourcePackage: string
+  targetPackage: string
+  kind: string
+  sourceEntity: string
+  targetEntity: string
+  evidencePath: string
+  origin: string
+  confidence: number
+}
+
+export interface CodebaseMap {
+  snapshotId: string
+  packages: PackageNode[]
+  dependencyEdges: number
+  violations: BoundaryViolation[]
+  violationCount: number
+  provenance: string
+}
+
+export interface ComponentExplanation {
+  name: string
+  kind: string
+  qualifiedName?: string
+  address?: SourceAddress
+  memberFiles: string[]
+  dependencies: string[]
+  dependents: string[]
+  tests: string[]
+  provenance: string
+}
+
+export interface ImpactedEntity {
+  name: string
+  kind: string
+  path?: string
+  hops: number
+  via: string
+  confidence: number
+}
+
+export interface ImpactReport {
+  query: string
+  snapshotId: string
+  matchedEntities: string[]
+  impacted: ImpactedEntity[]
+  edgeKinds: string[]
+  provenance: string
+  caveats: string[]
+}
+
+// --- worktree grep ------------------------------------------------------------
+
+export interface GrepHit {
+  path: string
+  line: number
+  column: number
+  text: string
+}
+
+export interface GrepReport {
+  pattern: string
+  matches: GrepHit[]
+  truncated: boolean
+  filesScanned: number
+  skippedBinary: number
+  /** Always "worktree" — reads live bytes, fresh by construction. */
+  freshness: string
+}
+
+// --- snapshot architecture diff -----------------------------------------------
+
+export interface DiffEntityRef {
+  entityId: string
+  kind: string
+  name: string
+  qualifiedName?: string
+  path?: string
+  language?: string
+}
+
+export interface DiffRelation {
+  relationId: string
+  kind: string
+  source: DiffEntityRef
+  target: DiffEntityRef
+  origin: string
+  confidence: number
+  extractor: string
+}
+
+export interface ChangedRelation {
+  kind: string
+  source: DiffEntityRef
+  target: DiffEntityRef
+  baseRelationId: string
+  headRelationId: string
+  baseOrigin: string
+  baseConfidence: number
+  headOrigin: string
+  headConfidence: number
+}
+
+export interface DiffCounts {
+  addedEntities: number
+  removedEntities: number
+  addedRelations: number
+  removedRelations: number
+  changedRelations: number
+}
+
+export interface ArchitectureDiff {
+  repositoryId: string
+  baseSnapshotId: string
+  headSnapshotId: string
+  addedEntities: DiffEntityRef[]
+  removedEntities: DiffEntityRef[]
+  addedRelations: DiffRelation[]
+  removedRelations: DiffRelation[]
+  changedRelations: ChangedRelation[]
+  counts: DiffCounts
+  truncated: boolean
+  provenance: string
+}
+
+// --- export -------------------------------------------------------------------
+
+export interface ExportSummary {
+  snapshotId: string
+  entityCount: number
+  relationCount: number
+  regionCount: number
+}
+
 // --- indexing ----------------------------------------------------------------
 
 export interface SnapshotIdentity {
@@ -308,6 +454,11 @@ export function setBase(prefix: string) {
   base = prefix
 }
 
+/** The resolved request prefix — '' standalone, '/{slug}' behind a gateway. */
+export function apiBase(): string {
+  return base
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(base + path, {
     ...init,
@@ -334,6 +485,7 @@ export function describeError(value: unknown): string {
 export const api = {
   index: () => request<IndexReport>('/v1/index', { method: 'POST' }),
   status: () => request<ViewManifest>('/v1/status'),
+  health: () => request<HealthReport>('/healthz'),
   search: (input: SearchInput) =>
     request<SearchResult>('/v1/search', {
       method: 'POST',
@@ -356,6 +508,36 @@ export const api = {
     request<DefinitionsReport>(`/v1/def/${encodeURIComponent(name)}`),
   references: (name: string) =>
     request<ReferencesReport>(`/v1/refs/${encodeURIComponent(name)}`),
+  // Atlas — package-level architecture map, component explanation, and
+  // two-hop impact analysis, all read from persisted relations.
+  map: () => request<CodebaseMap>('/v1/map'),
+  explain: (name: string) =>
+    request<ComponentExplanation>(`/v1/explain/${encodeURIComponent(name)}`),
+  impact: (name: string) =>
+    request<ImpactReport>(`/v1/impact/${encodeURIComponent(name)}`),
+  // Worktree regex — live bytes, fresh by construction (freshness:'worktree').
+  grep: (input: {
+    pattern: string
+    pathPrefix?: string
+    language?: string
+    ignoreCase?: boolean
+    limit?: number
+  }) =>
+    request<GrepReport>('/v1/grep', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  // Entity/relation delta between two committed snapshots — defaults to
+  // (previous committed, current); errors ViewUnavailable without a pair.
+  archDiff: (base?: string, head?: string) => {
+    const q = new URLSearchParams()
+    if (base) q.set('base', base)
+    if (head) q.set('head', head)
+    const s = q.toString()
+    return request<ArchitectureDiff>(`/v1/diff/architecture${s ? `?${s}` : ''}`)
+  },
+  exportSummary: (snapshot?: string) =>
+    request<ExportSummary>(`/v1/export${snapshot ? `?snapshot=${encodeURIComponent(snapshot)}` : ''}`),
   files: () => request<FileListReport>('/v1/files'),
   file: (path: string) => request<FileContent>(`/v1/file?path=${encodeURIComponent(path)}`),
 }
@@ -368,6 +550,14 @@ export const gateway = {
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
     return (await response.json()) as RepoEntry[]
   },
+}
+
+// /healthz answer — the serving binary's own version stamp. Routed through
+// `base` like every other call, so in gateway mode it reports the selected
+// repo's daemon, not the gateway registry.
+export interface HealthReport {
+  status: string
+  version: string
 }
 
 export type ServiceMode = 'gateway' | 'daemon'

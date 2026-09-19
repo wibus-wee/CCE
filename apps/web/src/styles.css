@@ -1,5 +1,8 @@
 /* Global base — everything theme-aware lives in StyleX tokens; this file is
- * only the reset and the document-level surface. */
+ * only the reset and the document-level surface. It lives in the `base`
+ * cascade layer (ordered first in index.html) so StyleX's priority layers
+ * always override it — an unlayered reset would win over every atomic class. */
+@layer base {
 
 *,
 *::before,
@@ -53,4 +56,14 @@ select {
 }
 *::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* Shiki: tokens emit `color: light-dark(#light, #dark)` inline — resolved by
+   `color-scheme` on <html> (set by useDark). Only the engine <mark>
+   decoration needs a rule here. */
+[role='code'] .marked {
+  background-color: light-dark(rgba(250, 204, 21, 0.4), rgba(250, 204, 21, 0.22));
+  border-radius: 2px;
+}
+
 }

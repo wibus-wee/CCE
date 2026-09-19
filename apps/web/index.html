@@ -4,7 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark light" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>CCE Repository Intelligence</title>
+    <!-- Cascade order, established before any injected sheets: `base` (the
+         styles.css reset) sits below StyleX's priority1..7 layers, so atomic
+         classes always win over the element reset. -->
+    <style>
+      @layer base, priority1, priority2, priority3, priority4, priority5, priority6, priority7;
+    </style>
   </head>
   <body>
     <div id="root"></div>
