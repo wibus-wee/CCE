@@ -659,6 +659,124 @@ async fn context_pack_is_bounded_and_source_linked() {
     );
 }
 
+/// The context pack carries the search verdict verbatim plus a delivery
+/// report naming what shipped and what was cut — a consumer must not have
+/// to re-derive delivery coverage from the item list.
+#[tokio::test]
+async fn context_pack_preserves_verdict_and_delivery_gaps() {
+    let repo = fixture_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    let pack = engine
+        .context(ContextRequest::new("resume_attempt", 4_096))
+        .await
+        .expect("context");
+
+    let verdict = pack.search_verdict.as_ref().expect("searchVerdict present");
+    assert_ne!(
+        verdict.state,
+        cce_core::VerdictState::Abstained,
+        "a real query on the fixture repo must produce evidence"
+    );
+    let report = pack
+        .delivery_report
+        .as_ref()
+        .expect("deliveryReport present");
+    // Every shipped evidence item is named; orientation is furniture, not
+    // an included evidence id.
+    assert!(
+        report
+            .included_item_ids
+            .iter()
+            .all(|id| id != "orientation"),
+        "orientation must not be listed as delivered evidence"
+    );
+    let shipped: std::collections::HashSet<&str> = pack
+        .items
+        .iter()
+        .map(|item| item.id.as_str())
+        .filter(|id| *id != "orientation")
+        .collect();
+    assert_eq!(
+        report.included_item_ids.len(),
+        shipped.len(),
+        "included ids must equal the shipped evidence items"
+    );
+    // Wire shape: snake_case omission reasons, camelCase fields.
+    let json = serde_json::to_value(&pack).expect("serialize");
+    assert!(json.get("searchVerdict").is_some());
+    assert!(json.get("deliveryReport").is_some());
+    // Total latency covers the whole call — at minimum the search stage.
+    let search_ms = pack.search_latency_ms.expect("searchLatencyMs");
+    assert!(
+        pack.latency_ms >= search_ms,
+        "context latency {} must include the {}ms search stage",
+        pack.latency_ms,
+        search_ms
+    );
+}
+
+/// A tiny budget forces omissions: the report must name the cut hits with
+/// reasons rather than silently dropping them.
+#[tokio::test]
+async fn context_pack_reports_budget_omissions() {
+    let repo = fixture_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index");
+
+    // Generous search first to learn what retrieval finds, then a pack
+    // budget that cannot fit it all.
+    let full = engine
+        .context(ContextRequest::new("resume_attempt", 65_536))
+        .await
+        .expect("full context");
+    let tiny = engine
+        .context(ContextRequest::new("resume_attempt", 600))
+        .await
+        .expect("tiny context");
+    let report = tiny
+        .delivery_report
+        .as_ref()
+        .expect("deliveryReport present");
+    if report.omitted_hits.is_empty() {
+        // The fixture repo may genuinely fit under 600 tokens — then the
+        // contract is simply that included ids match shipped items.
+        assert_eq!(report.included_item_ids.len() + 1, tiny.items.len());
+        return;
+    }
+    assert!(
+        report.omitted_hits.iter().all(|omitted| matches!(
+            omitted.reason,
+            cce_core::OmissionReason::Budget
+                | cce_core::OmissionReason::DuplicateRange
+                | cce_core::OmissionReason::FileCap
+                | cce_core::OmissionReason::DuplicateEntity
+        )),
+        "every omission carries a typed reason: {:?}",
+        report.omitted_hits
+    );
+    // Nothing omitted also shipped; nothing shipped is reported omitted.
+    let shipped: std::collections::HashSet<&str> = report
+        .included_item_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        report
+            .omitted_hits
+            .iter()
+            .all(|omitted| !shipped.contains(omitted.document_id.as_str())),
+        "omitted hits must not overlap shipped items"
+    );
+    // The fuller pack delivered at least as much evidence as the tiny one.
+    let full_report = full.delivery_report.as_ref().expect("full report");
+    assert!(
+        full_report.included_item_ids.len() >= report.included_item_ids.len(),
+        "larger budget must not deliver less evidence"
+    );
+}
+
 /// Honest abstention: when no query terms — or only a single coincidental
 /// term — match the index, search must return zero hits rather than noise
 /// from the lexical prefix fallback. `abstained` in the benchmark adapter is

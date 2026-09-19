@@ -489,6 +489,7 @@ class Adapter:
             result_kind=normalized.result_kind,
             used_tokens=normalized.used_tokens,
             verdict_state=normalized.verdict_state,
+            delivery_report=normalized.delivery_report,
             metrics_version=METRICS_VERSION,
             abstained=not normalized.retrieved,
             predicted_intent=predicted_intent(payload),
@@ -548,6 +549,9 @@ class NormalizedPayload:
     result_kind: Literal["search", "context"]
     verdict_state: str | None
     used_tokens: int | None
+    # Context packs only: the engine's shipped-vs-omitted accounting.
+    # None on search results and legacy payloads.
+    delivery_report: dict[str, Any] | None = None
 
 
 def normalize_payload(payload: dict[str, Any]) -> NormalizedPayload:
@@ -645,6 +649,11 @@ def normalize_context_pack(payload: dict[str, Any]) -> NormalizedPayload:
         verdict_state=_verdict_state(payload),
         used_tokens=(
             int(payload["usedTokens"]) if payload.get("usedTokens") is not None else None
+        ),
+        delivery_report=(
+            payload.get("deliveryReport")
+            if isinstance(payload.get("deliveryReport"), dict)
+            else None
         ),
     )
 

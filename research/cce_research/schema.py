@@ -215,6 +215,10 @@ class CaseResult(BaseModel):
     # The engine's own evidence verdict, when the payload carried one.
     # Distinct from `abstained`: weak_witness retains candidates.
     verdict_state: VerdictState | None = None
+    # Context packs only: shipped-vs-omitted accounting from the engine —
+    # included item ids, per-hit omission reasons, delivered/missing claim
+    # terms. None on search results and legacy rows.
+    delivery_report: dict | None = None
     # Metric-accounting semantics this result was written under.
     # 1 = legacy flat rows; 2 = item-aware accounting.
     metrics_version: int = 1

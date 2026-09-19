@@ -115,3 +115,56 @@ def test_dense_flags_do_not_disturb_template_expansion(tmp_path: Path) -> None:
     assert command[:5] == ["cce", "--json", "search", "/repo", "q"]
     assert command[5:9] == ["--route", "lexical", "--route", "dense_summary"]
     assert command[-2:] == ["--dense", "local"]
+
+
+def test_context_pack_preserves_verdict_and_delivery_report() -> None:
+    from cce_research.adapters import normalize_payload
+
+    payload = {
+        "items": [
+            {
+                "id": "d1",
+                "kind": "source",
+                "title": "src/a.rs:1-5",
+                "body": "…",
+                "estimatedTokens": 40,
+                "provenance": {
+                    "route": "lexical",
+                    "rank": 1,
+                    "score": 1.0,
+                    "snapshotId": "snap",
+                    "verifiedCurrent": True,
+                    "sourceAddress": {
+                        "path": "src/a.rs",
+                        "startLine": 1,
+                        "endLine": 5,
+                    },
+                },
+            }
+        ],
+        "searchVerdict": {"state": "weak_witness", "reasons": ["gap"]},
+        "deliveryReport": {
+            "includedItemIds": ["d1"],
+            "omittedHits": [{"documentId": "d2", "reason": "budget"}],
+            "deliveredTerms": ["zebra"],
+            "missingTerms": ["koala"],
+            "witnessVerification": "not_verified",
+        },
+        "usedTokens": 40,
+    }
+    normalized = normalize_payload(payload)
+    assert normalized.result_kind == "context"
+    # Both signal layers survive: the corpus verdict and the delivery gaps.
+    assert normalized.verdict_state == "weak_witness"
+    assert normalized.delivery_report is not None
+    assert normalized.delivery_report["omittedHits"][0]["reason"] == "budget"
+    assert normalized.delivery_report["missingTerms"] == ["koala"]
+
+
+def test_context_pack_without_delivery_report_reads_none() -> None:
+    from cce_research.adapters import normalize_payload
+
+    normalized = normalize_payload({"items": [], "usedTokens": 0})
+    assert normalized.result_kind == "context"
+    assert normalized.delivery_report is None
+    assert normalized.verdict_state is None

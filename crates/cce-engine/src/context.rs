@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{CceEngine, SearchResult};
+use cce_core::{DeliveryReport, OmissionReason, OmittedHit, WitnessVerification};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -97,6 +98,10 @@ impl ContextPacker {
         let mut seen_ranges = HashSet::new();
         let mut ranges_per_file = HashMap::<String, usize>::new();
         let mut taken = HashSet::new();
+        // The last rejection reason per hit — a hit rejected in role
+        // preselection can still ship in rank-order fill, so omissions
+        // are only final once both passes are done.
+        let mut last_rejection = HashMap::<&str, OmissionReason>::new();
         for role in [
             ContextRole::Test,
             ContextRole::Contract,
@@ -108,7 +113,7 @@ impl ContextPacker {
             if let Some((_, hit)) = classified.iter().find(|(hit_role, hit)| {
                 *hit_role == role && !taken.contains(hit.document_id.as_str())
             }) {
-                if let Some(item) = render_item(
+                match render_item(
                     hit,
                     role,
                     search,
@@ -118,9 +123,14 @@ impl ContextPacker {
                     &mut seen_ranges,
                     &mut ranges_per_file,
                 ) {
-                    used_tokens += item.estimated_tokens;
-                    taken.insert(hit.document_id.clone());
-                    items.push(item);
+                    Ok(item) => {
+                        used_tokens += item.estimated_tokens;
+                        taken.insert(hit.document_id.clone());
+                        items.push(item);
+                    }
+                    Err(reason) => {
+                        last_rejection.insert(hit.document_id.as_str(), reason);
+                    }
                 }
             }
         }
@@ -128,7 +138,7 @@ impl ContextPacker {
             if taken.contains(hit.document_id.as_str()) {
                 continue;
             }
-            if let Some(item) = render_item(
+            match render_item(
                 hit,
                 *role,
                 search,
@@ -138,12 +148,17 @@ impl ContextPacker {
                 &mut seen_ranges,
                 &mut ranges_per_file,
             ) {
-                used_tokens += item.estimated_tokens;
-                taken.insert(hit.document_id.clone());
-                items.push(item);
+                Ok(item) => {
+                    used_tokens += item.estimated_tokens;
+                    taken.insert(hit.document_id.clone());
+                    items.push(item);
+                }
+                Err(reason) => {
+                    last_rejection.insert(hit.document_id.as_str(), reason);
+                }
             }
         }
-        let uncertainties = search
+        let mut uncertainties: Vec<Uncertainty> = search
             .missing_capabilities
             .iter()
             .map(|message| Uncertainty {
@@ -154,6 +169,23 @@ impl ContextPacker {
                 ),
             })
             .collect();
+        // Weak-witness reasons are evidence gaps, not missing views —
+        // surface them under a fixed evidence capability so consumers
+        // cannot confuse "the index is unsure" with "a view failed".
+        if search.verdict.state == cce_core::VerdictState::WeakWitness {
+            for reason in &search.verdict.reasons {
+                if uncertainties.iter().any(|gap| gap.message == *reason) {
+                    continue;
+                }
+                uncertainties.push(Uncertainty {
+                    capability: "evidence_witness".to_owned(),
+                    message: reason.clone(),
+                    recommended_action: Some(
+                        "inspect the cited evidence or run a drill-down query".to_owned(),
+                    ),
+                });
+            }
+        }
         ContextPack {
             repository_id: search.request.repository_id.clone(),
             snapshot_id: search.request.snapshot_id.clone(),
@@ -164,6 +196,15 @@ impl ContextPacker {
             budget_tokens,
             used_tokens,
             latency_ms: search.latency_ms,
+            search_latency_ms: Some(search.latency_ms),
+            search_verdict: Some(search.verdict.clone()),
+            delivery_report: Some(delivery_report(
+                &classified,
+                &taken,
+                &last_rejection,
+                &items,
+                &search.verdict.claim.distinguishing_terms,
+            )),
             items,
             uncertainties,
             missing_capabilities: search.missing_capabilities.clone(),
@@ -178,6 +219,10 @@ impl CceEngine {
     /// # Errors
     /// Propagates search/storage errors.
     pub async fn context(&self, request: ContextRequest) -> Result<ContextPack> {
+        // `latency_ms` must cover the whole call — search, backlink
+        // expansion, and packing. The search-only segment stays on
+        // `search_latency_ms`.
+        let started = std::time::Instant::now();
         let mut search = self
             .search(SearchRequest {
                 repository_id: String::new(),
@@ -204,7 +249,7 @@ impl CceEngine {
             hit.rank = rank + 1;
         }
         let mut pack = ContextPacker::new().pack(&search, request.budget_tokens);
-        pack.latency_ms = search.latency_ms;
+        pack.latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         Ok(pack)
     }
 }
@@ -265,7 +310,7 @@ fn render_item(
     seen_entities: &mut HashSet<String>,
     seen_ranges: &mut HashSet<(String, u64, u64)>,
     ranges_per_file: &mut HashMap<String, usize>,
-) -> Option<ContextItem> {
+) -> std::result::Result<ContextItem, OmissionReason> {
     // Admission checks are read-only: a rejected candidate must not
     // consume range, entity, or per-file quota, or later evidence that
     // would fit gets starved by state from items that never shipped.
@@ -280,20 +325,20 @@ fn render_item(
         .as_ref()
         .is_some_and(|key| seen_ranges.contains(key))
     {
-        return None;
+        return Err(OmissionReason::DuplicateRange);
     }
     if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
         if ranges_per_file.get(path).copied().unwrap_or(0) >= 4 {
-            return None;
+            return Err(OmissionReason::FileCap);
         }
     }
     if hit.address.is_none() && seen_entities.contains(&hit.entity_id) {
-        return None;
+        return Err(OmissionReason::DuplicateEntity);
     }
     let body = render_hit(hit);
     let tokens = estimate_tokens(&body);
     if tokens > budget_tokens.saturating_sub(used_tokens) {
-        return None;
+        return Err(OmissionReason::Budget);
     }
     // Admitted — commit all three quotas now that the item ships.
     if let Some(key) = range_key {
@@ -313,7 +358,7 @@ fn render_item(
         ContextRole::Target if hit.route == SearchRoute::ExactSymbol => ContextItemKind::EntryPoint,
         ContextRole::Target => ContextItemKind::Source,
     };
-    Some(ContextItem {
+    Ok(ContextItem {
         id: hit.document_id.clone(),
         kind,
         title: hit.address.as_ref().map_or_else(
@@ -343,6 +388,66 @@ fn render_item(
             evidence_addresses: hit.evidence.clone(),
         },
     })
+}
+
+/// What the pack shipped versus what retrieval found. Term coverage is
+/// computed only over shipped evidence snippets — the orientation text,
+/// item titles, provenance strings, and source tails that never shipped
+/// are not delivery evidence.
+fn delivery_report(
+    classified: &[(ContextRole, &cce_core::SearchHit)],
+    taken: &HashSet<String>,
+    last_rejection: &HashMap<&str, OmissionReason>,
+    items: &[ContextItem],
+    distinguishing_terms: &[String],
+) -> DeliveryReport {
+    let included_item_ids = items
+        .iter()
+        .filter(|item| item.kind != ContextItemKind::Orientation)
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let omitted_hits = classified
+        .iter()
+        .filter(|(_, hit)| !taken.contains(hit.document_id.as_str()))
+        .map(|(_, hit)| OmittedHit {
+            document_id: hit.document_id.clone(),
+            // Every untaken hit passed through render_item in the fill
+            // pass, so a reason always exists; Budget is the safe label
+            // if a future pass ever skips an attempt.
+            reason: last_rejection
+                .get(hit.document_id.as_str())
+                .copied()
+                .unwrap_or(OmissionReason::Budget),
+        })
+        .collect();
+    let delivered_snippets = classified
+        .iter()
+        .filter(|(_, hit)| taken.contains(hit.document_id.as_str()))
+        .map(|(_, hit)| hit.snippet.to_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (delivered_terms, missing_terms): (Vec<String>, Vec<String>) = distinguishing_terms
+        .iter()
+        .cloned()
+        .partition(|term| delivered_snippets.contains(term));
+    // The packer observes shipped bodies only: it can state that no
+    // source-backed evidence shipped, but it can never promote that to a
+    // completeness claim — definitions/relations stay `not_verified`.
+    let shipped_source_evidence = classified
+        .iter()
+        .any(|(_, hit)| taken.contains(hit.document_id.as_str()) && hit.address.is_some());
+    let witness_verification = if shipped_source_evidence {
+        WitnessVerification::NotVerified
+    } else {
+        WitnessVerification::NoSourceEvidence
+    };
+    DeliveryReport {
+        included_item_ids,
+        omitted_hits,
+        delivered_terms,
+        missing_terms,
+        witness_verification,
+    }
 }
 
 fn orientation(search: &SearchResult) -> String {
@@ -453,6 +558,15 @@ mod tests {
     }
 
     fn search_result(hits: Vec<SearchHit>) -> SearchResult {
+        search_result_with_verdict(hits, VerdictState::default(), Vec::new(), Vec::new())
+    }
+
+    fn search_result_with_verdict(
+        hits: Vec<SearchHit>,
+        state: VerdictState,
+        reasons: Vec<String>,
+        distinguishing_terms: Vec<String>,
+    ) -> SearchResult {
         SearchResult {
             request: SearchRequest {
                 repository_id: "repo_t".to_owned(),
@@ -479,14 +593,14 @@ mod tests {
             hits,
             missing_capabilities: Vec::new(),
             verdict: SearchVerdict {
-                state: VerdictState::default(),
-                reasons: Vec::new(),
+                state,
+                reasons,
                 claim: ClaimFrame {
                     intent: QueryIntent::NaturalLanguageBehavior,
                     predicate: ClaimPredicate::Lookup,
                     required_witness: WitnessRequirement::Any,
                     subjects: Vec::new(),
-                    distinguishing_terms: Vec::new(),
+                    distinguishing_terms,
                 },
                 witness: WitnessReport::default(),
                 evidence_tiers: EvidenceTiers::default(),
@@ -731,5 +845,192 @@ mod tests {
         // used_tokens always equals the sum of item estimates.
         let sum: usize = pack.items.iter().map(|item| item.estimated_tokens).sum();
         assert_eq!(sum, pack.used_tokens);
+    }
+
+    #[test]
+    fn search_verdict_passes_through_verbatim() {
+        let search = search_result_with_verdict(
+            vec![hit(
+                "a",
+                "entity_a",
+                cce_core::RetrievalRepresentation::RawCode,
+                address("src/a.rs", 0, 50),
+                40,
+            )],
+            VerdictState::WeakWitness,
+            vec!["no artifact binds the claim's distinguishing terms".to_owned()],
+            vec!["zebra".to_owned()],
+        );
+        let pack = ContextPacker::new().pack(&search, 4_000);
+        let verdict = pack.search_verdict.expect("searchVerdict");
+        assert_eq!(verdict, search.verdict, "verdict must be verbatim");
+        assert_eq!(verdict.state, VerdictState::WeakWitness);
+    }
+
+    #[test]
+    fn weak_witness_reasons_surface_as_evidence_uncertainties() {
+        let search = search_result_with_verdict(
+            vec![hit(
+                "a",
+                "entity_a",
+                cce_core::RetrievalRepresentation::RawCode,
+                address("src/a.rs", 0, 50),
+                40,
+            )],
+            VerdictState::WeakWitness,
+            vec![
+                "no artifact binds the claim's distinguishing terms".to_owned(),
+                "no artifact binds the claim's distinguishing terms".to_owned(),
+            ],
+            Vec::new(),
+        );
+        let pack = ContextPacker::new().pack(&search, 4_000);
+        let witness_gaps = pack
+            .uncertainties
+            .iter()
+            .filter(|gap| gap.capability == "evidence_witness")
+            .count();
+        assert_eq!(
+            witness_gaps, 1,
+            "deduped, one witness gap: {:?}",
+            pack.uncertainties
+        );
+        // It is an evidence gap, never a view failure.
+        assert!(pack.missing_capabilities.is_empty());
+        assert!(
+            !pack
+                .uncertainties
+                .iter()
+                .any(|gap| gap.capability == "lexical")
+        );
+    }
+
+    #[test]
+    fn sole_evidence_cut_by_budget_reports_the_gap() {
+        // The only hit carrying the claim term is too big to ship:
+        // delivered_terms empty, missing_terms reports it, omission
+        // reason is budget, and nothing source-backed shipped.
+        let hits = vec![hit(
+            "sole",
+            "entity_sole",
+            cce_core::RetrievalRepresentation::RawCode,
+            address("src/sole.rs", 0, 400),
+            200_000,
+        )];
+        let search = search_result_with_verdict(
+            hits,
+            VerdictState::WeakWitness,
+            Vec::new(),
+            vec!["zebra".to_owned()],
+        );
+        let pack = ContextPacker::new().pack(&search, 4_000);
+        let report = pack.delivery_report.expect("delivery report");
+        assert!(report.included_item_ids.is_empty());
+        assert_eq!(report.delivered_terms, Vec::<String>::new());
+        assert_eq!(report.missing_terms, vec!["zebra".to_owned()]);
+        assert_eq!(
+            report.omitted_hits,
+            vec![OmittedHit {
+                document_id: "sole".to_owned(),
+                reason: OmissionReason::Budget,
+            }]
+        );
+        assert_eq!(
+            report.witness_verification,
+            WitnessVerification::NoSourceEvidence
+        );
+    }
+
+    #[test]
+    fn orientation_and_titles_never_count_as_term_coverage() {
+        // A distinguishing term that appears only in the pack's
+        // orientation/title furniture — never in a shipped snippet — must
+        // stay missing. Orientation text carries routes/rationale, not
+        // evidence.
+        let hits = vec![hit(
+            "filler",
+            "entity_f",
+            cce_core::RetrievalRepresentation::RawCode,
+            address("src/f.rs", 0, 50),
+            40,
+        )];
+        let mut search = search_result_with_verdict(
+            hits,
+            VerdictState::WeakWitness,
+            Vec::new(),
+            vec!["lexical".to_owned()],
+        );
+        // "lexical" literally appears in the orientation body (route
+        // debug listing) — if orientation counted, the term would read
+        // delivered.
+        assert!(orientation(&search).to_lowercase().contains("lexical"));
+        search.verdict.claim.distinguishing_terms = vec!["lexical".to_owned()];
+        let pack = ContextPacker::new().pack(&search, 4_000);
+        let report = pack.delivery_report.expect("delivery report");
+        assert_eq!(
+            report.missing_terms,
+            vec!["lexical".to_owned()],
+            "orientation text must not satisfy term coverage"
+        );
+    }
+
+    #[test]
+    fn term_in_undelivered_source_tail_is_not_delivered() {
+        // The hit ships, but its snippet is the truncated prefix — a
+        // claim term that exists only past the snippet boundary was not
+        // actually delivered.
+        let hits = vec![hit(
+            "truncated",
+            "entity_t",
+            cce_core::RetrievalRepresentation::RawCode,
+            address("src/t.rs", 0, 50_000),
+            40, // snippet: "xxxx..." — no "zebra"
+        )];
+        let search = search_result_with_verdict(
+            hits,
+            VerdictState::Answered,
+            Vec::new(),
+            vec!["zebra".to_owned()],
+        );
+        let pack = ContextPacker::new().pack(&search, 4_000);
+        let report = pack.delivery_report.expect("delivery report");
+        assert_eq!(report.included_item_ids, vec!["truncated".to_owned()]);
+        assert_eq!(report.missing_terms, vec!["zebra".to_owned()]);
+        assert_eq!(report.delivered_terms, Vec::<String>::new());
+        // Source-backed evidence did ship — gaps are reported, nothing
+        // promoted to a completeness claim.
+        assert_eq!(
+            report.witness_verification,
+            WitnessVerification::NotVerified
+        );
+    }
+
+    #[test]
+    fn delivered_terms_match_shipped_snippets() {
+        let hits = vec![
+            hit(
+                "carries",
+                "entity_c",
+                cce_core::RetrievalRepresentation::RawCode,
+                address("src/c.rs", 0, 50),
+                0,
+            ),
+            hit(
+                "other",
+                "entity_o",
+                cce_core::RetrievalRepresentation::RawCode,
+                address("src/o.rs", 0, 50),
+                0,
+            ),
+        ];
+        let mut search = search_result(hits);
+        search.hits[0].snippet = "fn handle_zebra_reconnect()".to_owned();
+        search.hits[1].snippet = "unrelated body".to_owned();
+        search.verdict.claim.distinguishing_terms =
+            vec!["zebra".to_owned(), "absent_term".to_owned()];
+        let pack = ContextPacker::new().pack(&search, 4_000);
+        let report = pack.delivery_report.expect("delivery report");
+        assert_eq!(report.delivered_terms, vec!["zebra".to_owned()]);
+        assert_eq!(report.missing_terms, vec!["absent_term".to_owned()]);
     }
 }

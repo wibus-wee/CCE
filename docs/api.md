@@ -36,6 +36,8 @@ The daemon binds to `127.0.0.1:7734` by default.
 
 Search JSON accepts `query`, optional `intent`, and `limit`. Context JSON accepts `query`, optional `intent`, `budgetTokens`, `maxCandidates`, `requireFresh`, and `routes`. `requireFresh=false` serves the last committed snapshot without rescanning the working tree and marks hits `verifiedCurrent: false`; the default `true` scans (and reindexes when the tree changed) before answering. Request IDs are accepted and returned as `x-request-id`. A concurrent index request returns HTTP 409.
 
+A context pack additionally reports what the retrieval stage found versus what the budget shipped: `searchVerdict` is the search verdict verbatim (`answered`/`weak_witness`/`abstained` with reasons and drill-downs), `deliveryReport` names the shipped `includedItemIds`, per-hit `omittedHits` with typed reasons (`budget`/`duplicate_range`/`file_cap`/`duplicate_entity`), which claim distinguishing terms appear in delivered snippets (`deliveredTerms`/`missingTerms`), and a `witnessVerification` limited to `not_verified`/`no_source_evidence` — packing can report gaps, never completeness. Weak-witness reasons also surface as `uncertainties` entries with the fixed `evidence_witness` capability, distinct from view failures. `latencyMs` covers the whole call (search + backlinks + packing); `searchLatencyMs` is the search segment alone.
+
 CCE does not implement public-network authentication. Non-loopback bind requires the explicit flag and must sit behind an authenticating reverse proxy with TLS, request-size limits, and an origin policy.
 
 ## MCP

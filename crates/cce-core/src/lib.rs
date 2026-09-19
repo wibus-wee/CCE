@@ -15,7 +15,10 @@ mod snapshot;
 mod text;
 
 pub use address::SourceAddress;
-pub use context::{ContextItem, ContextItemKind, ContextPack, ContextProvenance, Uncertainty};
+pub use context::{
+    ContextItem, ContextItemKind, ContextPack, ContextProvenance, DeliveryReport, OmissionReason,
+    OmittedHit, Uncertainty, WitnessVerification,
+};
 pub use entity::{CodeEntity, EntityKind};
 pub use error::{CceError, Result};
 pub use manifest::{Capability, ViewKind, ViewManifest, ViewState, ViewStatus};
