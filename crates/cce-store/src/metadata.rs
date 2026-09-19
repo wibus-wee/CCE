@@ -694,6 +694,49 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Atomically mark an already-committed snapshot as the repository's
+    /// current. The transaction verifies the snapshot exists, belongs to
+    /// this repository, and is `complete=1` — a missing, foreign, or
+    /// incomplete target is an error and leaves `current` untouched.
+    /// Idempotent when the snapshot is already current.
+    ///
+    /// Callers must hold the cross-process index lease around the rescan
+    /// that produced `snapshot_id` and this call: the transaction keeps
+    /// the database consistent, it cannot serialize the caller's view of
+    /// the worktree against other writers.
+    ///
+    /// # Errors
+    /// `CceError::Storage` when the target is missing, belongs to another
+    /// repository, or never completed; storage error on write failure.
+    pub fn activate_complete_snapshot(&self, repository_id: &str, snapshot_id: &str) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(storage_error)?;
+        let ready = transaction
+            .query_row(
+                "SELECT complete FROM snapshots WHERE id=?1 AND repository_id=?2",
+                params![snapshot_id, repository_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .unwrap_or(false);
+        if !ready {
+            return Err(CceError::Storage(format!(
+                "cannot activate snapshot {snapshot_id}: missing, incomplete, or foreign"
+            )));
+        }
+        transaction
+            .execute(
+                "INSERT INTO current_snapshots(repository_id, snapshot_id, updated_at)
+                 VALUES (?1, ?2, ?3) ON CONFLICT(repository_id) DO UPDATE SET
+                 snapshot_id=excluded.snapshot_id, updated_at=excluded.updated_at",
+                params![repository_id, snapshot_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(())
+    }
+
     /// Upsert the status of one view for a snapshot.
     ///
     /// # Errors
@@ -3662,5 +3705,125 @@ mod tests {
             .documents_for_regions("snap_t", &["reg:file".to_owned()])
             .expect("region docs");
         assert_eq!(region_docs.len(), 3);
+    }
+    fn activation_fixture() -> (tempfile::TempDir, MetadataStore) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = MetadataStore::open(directory.path()).expect("store");
+        store
+            .register_repository(&RepositoryIdentity {
+                id: "repo_a".to_owned(),
+                canonical_root: "/repo/a".to_owned(),
+                remote: None,
+            })
+            .expect("repository a");
+        store
+            .register_repository(&RepositoryIdentity {
+                id: "repo_b".to_owned(),
+                canonical_root: "/repo/b".to_owned(),
+                remote: None,
+            })
+            .expect("repository b");
+        let snapshot = |id: &str, repository: &str| SnapshotIdentity {
+            id: id.to_owned(),
+            repository_id: repository.to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        // Commit A then B under repo_a: current lands on B.
+        for id in ["snap_a", "snap_b"] {
+            let snap = snapshot(id, "repo_a");
+            store.begin_snapshot(&snap).expect("begin");
+            store
+                .commit_snapshot(&snap, &SnapshotRecords::default())
+                .expect("commit");
+        }
+        (directory, store)
+    }
+
+    #[test]
+    fn activate_complete_snapshot_switches_current() {
+        let (_dir, store) = activation_fixture();
+        assert_eq!(
+            store.current_snapshot("repo_a").expect("current"),
+            Some("snap_b".to_owned())
+        );
+        store
+            .activate_complete_snapshot("repo_a", "snap_a")
+            .expect("activate a");
+        assert_eq!(
+            store.current_snapshot("repo_a").expect("current"),
+            Some("snap_a".to_owned())
+        );
+    }
+
+    #[test]
+    fn activate_complete_snapshot_is_idempotent() {
+        let (_dir, store) = activation_fixture();
+        store
+            .activate_complete_snapshot("repo_a", "snap_b")
+            .expect("already current");
+        store
+            .activate_complete_snapshot("repo_a", "snap_a")
+            .expect("activate a");
+        store
+            .activate_complete_snapshot("repo_a", "snap_a")
+            .expect("repeat");
+        assert_eq!(
+            store.current_snapshot("repo_a").expect("current"),
+            Some("snap_a".to_owned())
+        );
+    }
+
+    #[test]
+    fn activate_complete_snapshot_rejects_foreign_target() {
+        let (_dir, store) = activation_fixture();
+        // snap_a belongs to repo_a — activating it under repo_b is an
+        // error and leaves repo_b without a current pointer.
+        let error = store.activate_complete_snapshot("repo_b", "snap_a");
+        assert!(matches!(error, Err(CceError::Storage(_))));
+        assert_eq!(store.current_snapshot("repo_b").expect("current"), None);
+        // And repo_a's pointer is untouched.
+        assert_eq!(
+            store.current_snapshot("repo_a").expect("current"),
+            Some("snap_b".to_owned())
+        );
+    }
+
+    #[test]
+    fn activate_complete_snapshot_rejects_incomplete_target() {
+        let (_dir, store) = activation_fixture();
+        let pending = SnapshotIdentity {
+            id: "snap_pending".to_owned(),
+            repository_id: "repo_a".to_owned(),
+            base_revision: None,
+            workspace_overlay_hash: "overlay".to_owned(),
+            index_profile_hash: "profile".to_owned(),
+            created_at: Utc::now(),
+            file_count: 0,
+            source_bytes: 0,
+        };
+        store.begin_snapshot(&pending).expect("begin pending");
+        let error = store.activate_complete_snapshot("repo_a", "snap_pending");
+        assert!(matches!(error, Err(CceError::Storage(_))));
+        assert_eq!(
+            store.current_snapshot("repo_a").expect("current"),
+            Some("snap_b".to_owned()),
+            "failed activation must not move current"
+        );
+    }
+
+    #[test]
+    fn activate_complete_snapshot_rejects_missing_target() {
+        let (_dir, store) = activation_fixture();
+        let error = store.activate_complete_snapshot("repo_a", "snap_missing");
+        assert!(matches!(error, Err(CceError::Storage(_))));
+        assert_eq!(
+            store.current_snapshot("repo_a").expect("current"),
+            Some("snap_b".to_owned())
+        );
     }
 }

@@ -564,8 +564,38 @@ impl CceEngine {
     pub async fn index(&self) -> Result<IndexReport> {
         // Scan before taking the write lease: an unchanged repository returns
         // without ever contending with concurrent readers or writers.
-        let scanned = RepositoryScanner::new(self.config.clone()).scan(Some(&self.store))?;
+        let mut scanned = RepositoryScanner::new(self.config.clone()).scan(Some(&self.store))?;
         self.store.register_repository(&scanned.identity)?;
+        // One lease may be taken early — for the activation gate below — and
+        // then shared by view repair, Zoekt repair, or the write path. Inner
+        // acquisitions must reuse it: `IndexLease` is not re-entrant.
+        let mut lease: Option<crate::lock::IndexLease> = None;
+        if self.store.snapshot_is_complete(&scanned.snapshot.id)? {
+            // "Data present" is not "snapshot active": reusing a complete
+            // historical snapshot must move `current` to it, or status,
+            // atlas and non-fresh search keep resolving the stale one.
+            let current = self.store.current_snapshot(&scanned.identity.id)?;
+            if current.as_deref() != Some(scanned.snapshot.id.as_str()) {
+                // Activating is a write. Take the lease, then re-scan under
+                // it — the first scan predates serialization, and another
+                // writer may have committed a different snapshot meanwhile.
+                let held = crate::lock::IndexLease::acquire(&self.config.data_root)?;
+                scanned = RepositoryScanner::new(self.config.clone()).scan(Some(&self.store))?;
+                if self.store.snapshot_is_complete(&scanned.snapshot.id)? {
+                    let current = self.store.current_snapshot(&scanned.identity.id)?;
+                    if current.as_deref() != Some(scanned.snapshot.id.as_str()) {
+                        self.store.activate_complete_snapshot(
+                            &scanned.identity.id,
+                            &scanned.snapshot.id,
+                        )?;
+                    }
+                }
+                // `refreshed` may map to a snapshot that is not complete —
+                // then the reuse return below is skipped and the write path
+                // continues with it, holding this same lease.
+                lease = Some(held);
+            }
+        }
         if self.store.snapshot_is_complete(&scanned.snapshot.id)? {
             let mut manifest = self
                 .store
@@ -589,7 +619,9 @@ impl CceEngine {
                     .map_err(|_| CceError::Storage("repair mutex poisoned".to_owned()))?
                     .insert(scanned.snapshot.id.clone());
             if first_attempt {
-                let _lease = crate::lock::IndexLease::acquire(&self.config.data_root)?;
+                if lease.is_none() {
+                    lease = Some(crate::lock::IndexLease::acquire(&self.config.data_root)?);
+                }
                 self.repair_committed_views(&scanned, &manifest).await?;
                 manifest = self
                     .store
@@ -606,38 +638,36 @@ impl CceEngine {
             if !zoekt_fresh || !manifest.views.contains_key(&ViewKind::Zoekt) {
                 // A concurrent writer owns freshness — its fresh-index
                 // pass rebuilds the shards anyway, so busy means skip.
-                match crate::lock::IndexLease::acquire(&self.config.data_root) {
-                    Ok(_lease) => {
-                        let repo_root = self.config.repository_root.clone();
-                        let data_root = self.config.data_root.clone();
-                        let snapshot_id = scanned.snapshot.id.clone();
-                        let timeout =
-                            std::time::Duration::from_secs(self.config.providers.timeout_secs);
-                        let report = tokio::task::spawn_blocking(move || {
-                            crate::zoekt::ensure_report(
-                                &repo_root,
-                                &data_root,
-                                &snapshot_id,
-                                timeout,
-                            )
-                        })
-                        .await
-                        .map_err(|error| {
-                            CceError::Configuration(format!("provider runner failed: {error}"))
-                        })?;
-                        self.store.set_view_status(
-                            &scanned.identity.id,
-                            &scanned.snapshot.id,
-                            ViewKind::Zoekt,
-                            &zoekt_view_status(&scanned.snapshot, std::slice::from_ref(&report)),
-                        )?;
-                        providers.push(report);
-                        manifest = self
-                            .store
-                            .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
+                if lease.is_none() {
+                    match crate::lock::IndexLease::acquire(&self.config.data_root) {
+                        Ok(held) => lease = Some(held),
+                        Err(CceError::IndexBusy(_)) => {}
+                        Err(error) => return Err(error),
                     }
-                    Err(CceError::IndexBusy(_)) => {}
-                    Err(error) => return Err(error),
+                }
+                if lease.is_some() {
+                    let repo_root = self.config.repository_root.clone();
+                    let data_root = self.config.data_root.clone();
+                    let snapshot_id = scanned.snapshot.id.clone();
+                    let timeout =
+                        std::time::Duration::from_secs(self.config.providers.timeout_secs);
+                    let report = tokio::task::spawn_blocking(move || {
+                        crate::zoekt::ensure_report(&repo_root, &data_root, &snapshot_id, timeout)
+                    })
+                    .await
+                    .map_err(|error| {
+                        CceError::Configuration(format!("provider runner failed: {error}"))
+                    })?;
+                    self.store.set_view_status(
+                        &scanned.identity.id,
+                        &scanned.snapshot.id,
+                        ViewKind::Zoekt,
+                        &zoekt_view_status(&scanned.snapshot, std::slice::from_ref(&report)),
+                    )?;
+                    providers.push(report);
+                    manifest = self
+                        .store
+                        .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
                 }
             }
             return Ok(IndexReport {
@@ -666,8 +696,12 @@ impl CceEngine {
         // Only the write path needs the lease. The scanned hashes pin the
         // snapshot; if the tree changes mid-build the byte-level hash check
         // in `ScannedFile::bytes` fails the index instead of committing a
-        // snapshot that misidentifies content.
-        let _lease = crate::lock::IndexLease::acquire(&self.config.data_root)?;
+        // snapshot that misidentifies content. The lease may already be held
+        // when the activation gate's rescan landed on an incomplete snapshot.
+        let _lease = match lease {
+            Some(held) => held,
+            None => crate::lock::IndexLease::acquire(&self.config.data_root)?,
+        };
         self.store.begin_snapshot(&scanned.snapshot)?;
         for kind in [
             ViewKind::Source,

@@ -71,6 +71,115 @@ async fn index_then_status_then_incremental_reuse() {
     assert_eq!(second.snapshot.id, report.snapshot.id);
 }
 
+/// A→B→A: restoring byte-identical content must reuse the old snapshot AND
+/// move `current` back to it — otherwise status, atlas and non-fresh search
+/// keep resolving B while `index()` reported A.
+#[tokio::test]
+async fn reactivates_prior_snapshot() {
+    let repo = fixture_repo();
+    let engine = engine(repo.path());
+
+    let report_a = engine.index().await.expect("index A");
+    let snap_a = report_a.snapshot.id.clone();
+
+    write(
+        repo.path(),
+        "src/lib.rs",
+        "pub fn resume_attempt(cursor: &str) -> bool {\n    !cursor.is_empty() && cursor.len() > 4\n}\n",
+    );
+    let report_b = engine.index().await.expect("index B");
+    assert_ne!(report_b.snapshot.id, snap_a);
+
+    // Restore A byte-for-byte.
+    write(
+        repo.path(),
+        "src/lib.rs",
+        "pub fn resume_attempt(cursor: &str) -> bool {\n    cursor.is_empty()\n}\n",
+    );
+    let report_a2 = engine.index().await.expect("index A again");
+    assert!(report_a2.reused_snapshot, "A must be reused, not rebuilt");
+    assert_eq!(report_a2.snapshot.id, snap_a);
+
+    // Every snapshot resolution now agrees on A.
+    assert_eq!(
+        engine
+            .store()
+            .current_snapshot(&report_a.repository_id)
+            .expect("current"),
+        Some(snap_a.clone()),
+        "store current must move back to A"
+    );
+    let manifest = engine.status().expect("status");
+    assert_eq!(manifest.snapshot_id, snap_a, "status must describe A");
+    let map = engine.codebase_map().expect("codebase map");
+    assert_eq!(map.snapshot_id, snap_a, "atlas must resolve A");
+    let result = engine
+        .search(search_request("resume_attempt", false))
+        .await
+        .expect("non-fresh search");
+    assert_eq!(
+        result.request.snapshot_id, snap_a,
+        "non-fresh search must serve A"
+    );
+    // Serving a committed-but-unscanned snapshot stays explicitly
+    // unverified — activation does not claim freshness.
+    assert!(result.hits.iter().all(|hit| !hit.verified_current));
+}
+
+/// When activation requires the index lease and another writer holds it,
+/// `index()` must fail with `IndexBusy` — never report a successful reuse while
+/// leaving `current` on the stale snapshot.
+#[tokio::test]
+async fn activation_conflict_reports_busy_not_success() {
+    let repo = fixture_repo();
+    let engine = engine(repo.path());
+    engine.index().await.expect("index A");
+
+    write(
+        repo.path(),
+        "src/lib.rs",
+        "pub fn resume_attempt(cursor: &str) -> bool {\n    !cursor.is_empty()\n}\n",
+    );
+    let report_b = engine.index().await.expect("index B");
+
+    // Restore A — the next index() would need to reactivate it.
+    write(
+        repo.path(),
+        "src/lib.rs",
+        "pub fn resume_attempt(cursor: &str) -> bool {\n    cursor.is_empty()\n}\n",
+    );
+
+    // A competing writer holds the lease file the engine uses.
+    let lock_path = engine.config().data_root.join("index.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open index.lock");
+    fs4::FileExt::try_lock(&lock_file).expect("hold lease");
+
+    let error = engine
+        .index()
+        .await
+        .expect_err("index must fail while busy");
+    assert!(
+        matches!(error, cce_core::CceError::IndexBusy(_)),
+        "expected IndexBusy, got {error:?}"
+    );
+    drop(lock_file);
+
+    // The failed activation did not move current off B.
+    assert_eq!(
+        engine
+            .store()
+            .current_snapshot(&report_b.repository_id)
+            .expect("current"),
+        Some(report_b.snapshot.id.clone())
+    );
+}
+
 #[tokio::test]
 async fn working_tree_change_marks_views_stale() {
     let repo = fixture_repo();
