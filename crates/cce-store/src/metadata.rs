@@ -263,6 +263,9 @@ pub struct TermBinding {
     pub path: String,
     /// Name of the entity whose document carries every term.
     pub entity_name: Option<String>,
+    /// Qualified name — carries the module path (`…::tests::helper`),
+    /// which marks test-scope entities the bare name cannot.
+    pub entity_qualified: Option<String>,
     /// Kind of that entity — `None` when the document's entity does
     /// not resolve (treated as file-level binding).
     pub entity_kind: Option<cce_core::EntityKind>,
@@ -1369,7 +1372,7 @@ impl MetadataStore {
         let connection = self.connection.read();
         let mut statement = connection
             .prepare(
-                "SELECT f.path, e.name, e.kind FROM documents_fts f
+                "SELECT f.path, e.name, e.qualified_name, e.kind FROM documents_fts f
                  LEFT JOIN entities e
                    ON e.id = f.entity_id AND e.snapshot_id = f.snapshot_id
                  WHERE documents_fts MATCH ?1 AND f.snapshot_id=?2 LIMIT ?3",
@@ -1383,12 +1386,13 @@ impl MetadataStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .map_err(storage_error)?;
         rows.map(|row| {
-            let (path, entity_name, kind_json) = row.map_err(storage_error)?;
+            let (path, entity_name, entity_qualified, kind_json) = row.map_err(storage_error)?;
             let entity_kind = kind_json
                 .as_deref()
                 .map(serde_json::from_str::<cce_core::EntityKind>)
@@ -1396,6 +1400,7 @@ impl MetadataStore {
             Ok(TermBinding {
                 path,
                 entity_name,
+                entity_qualified,
                 entity_kind,
             })
         })

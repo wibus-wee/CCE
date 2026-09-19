@@ -2509,7 +2509,15 @@ fn entity_tokens(query: &str) -> Vec<String> {
     // territory — so the identifier-shape gate stays off for them.
     let code_switched = tokens.iter().any(|token| token.chars().any(has_cjk));
     if tokens.len() > 1 && !code_switched {
-        tokens.retain(|token| is_identifier_like(token));
+        // Sentence-initial capitals are orthography, not naming intent:
+        // "Trace how hits are packed" claims a trace of the phrase, not
+        // an entity "Trace". Interior capitals stay name-shaped — the
+        // writer chose to capitalize mid-sentence ("how does Tokio…").
+        let mut leading = true;
+        tokens.retain(|token| {
+            let sentence_leading = std::mem::replace(&mut leading, false);
+            is_identifier_like(token) && !(sentence_leading && is_sentence_capital(token))
+        });
     }
     tokens.sort_by_key(|token| std::cmp::Reverse(token.len()));
     tokens.truncate(8);
@@ -2524,6 +2532,22 @@ fn is_identifier_like(token: &str) -> bool {
         || token
             .chars()
             .any(|character| character.is_ascii_uppercase())
+}
+
+/// Capitalized only because it opens the sentence — a plain English word
+/// wearing orthography, not a name. `SourceAddress` fails the check (a
+/// second capital marks real naming intent); `Trace`, `Describe`,
+/// `Which` pass it and are stripped when leading.
+fn is_sentence_capital(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_uppercase())
+        && !token[1..]
+            .chars()
+            .any(|character| character.is_ascii_uppercase())
+        && !token.contains('_')
+        && !token.contains("::")
 }
 
 /// Entity-name shape: capitals, qualifiers, or underscores — the markers
@@ -2989,12 +3013,25 @@ fn build_witness_report(
                         BindingScope::File
                     }
                 });
+            let test = scope == BindingScope::Entity
+                && is_test_entity(
+                    &binding.path,
+                    binding.entity_name.as_deref(),
+                    binding.entity_qualified.as_deref(),
+                );
             by_path
                 .entry(binding.path.clone())
                 .and_modify(|artifact| {
-                    if scope == BindingScope::Entity && artifact.scope == BindingScope::File {
+                    if scope == BindingScope::Entity
+                        && (artifact.scope == BindingScope::File || (artifact.test && !test))
+                    {
+                        // An implementation entity outranks a test one
+                        // for the same path — marking the artifact
+                        // test-only on a weaker binding would be
+                        // slander, not caution.
                         artifact.scope = BindingScope::Entity;
                         artifact.entity.clone_from(&binding.entity_name);
+                        artifact.test = test;
                     }
                 })
                 .or_insert_with(|| BoundArtifact {
@@ -3006,6 +3043,7 @@ fn build_witness_report(
                     } else {
                         None
                     },
+                    test,
                 });
         }
         by_path.into_values().collect()
@@ -3033,6 +3071,18 @@ fn build_witness_report(
         binding_artifacts,
         scope_gaps,
     })
+}
+
+/// Whether the binding entity is test code — the name or path rules
+/// plus the qualified-name module path (`…::tests::helper`), which
+/// marks `#[cfg(test)]` members whose bare name shows no test marker.
+fn is_test_entity(path: &str, name: Option<&str>, qualified: Option<&str>) -> bool {
+    crate::engine::is_test(path, name.unwrap_or_default())
+        || qualified.is_some_and(|qualified| {
+            qualified
+                .split("::")
+                .any(|segment| matches!(segment, "test" | "tests" | "testing"))
+        })
 }
 
 /// Whether an entity kind marks one coherent code span — the
@@ -3081,16 +3131,23 @@ fn weak_witness_reasons(frame: &ClaimFrame, report: &WitnessReport) -> Vec<Strin
         }
     }
     if frame.distinguishing_terms.len() >= 2 {
-        let entity_bound = report.binding_artifacts.iter().any(|artifact| {
-            artifact.class == DocumentClass::Code && artifact.scope == BindingScope::Entity
+        let implementation_bound = report.binding_artifacts.iter().any(|artifact| {
+            artifact.class == DocumentClass::Code
+                && artifact.scope == BindingScope::Entity
+                && !artifact.test
         });
-        if !entity_bound {
+        if !implementation_bound {
             if report.binding_artifacts.is_empty() {
                 reasons.push(format!(
                     "weak_witness: no artifact binds the claim's distinguishing terms {}",
                     quoted(&frame.distinguishing_terms)
                 ));
             } else {
+                let test_bound = report.binding_artifacts.iter().any(|artifact| {
+                    artifact.class == DocumentClass::Code
+                        && artifact.scope == BindingScope::Entity
+                        && artifact.test
+                });
                 let code_bound = report
                     .binding_artifacts
                     .iter()
@@ -3102,7 +3159,12 @@ fn weak_witness_reasons(frame: &ClaimFrame, report: &WitnessReport) -> Vec<Strin
                     .map(|artifact| artifact.path.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                if code_bound {
+                if test_bound {
+                    reasons.push(format!(
+                        "weak_witness: distinguishing terms {} co-bind only in test code — assertions name the vocabulary, they do not implement it: {paths}",
+                        quoted(&frame.distinguishing_terms)
+                    ));
+                } else if code_bound {
                     reasons.push(format!(
                         "weak_witness: distinguishing terms {} co-bind only at file scope — no single entity carries them: {paths}",
                         quoted(&frame.distinguishing_terms)
@@ -4745,6 +4807,7 @@ mod tests {
                 class: DocumentClass::Code,
                 scope: BindingScope::File,
                 entity: None,
+                test: false,
             }],
             scope_gaps: Vec::new(),
         };
@@ -4777,6 +4840,7 @@ mod tests {
                 class: DocumentClass::Prose,
                 scope: BindingScope::File,
                 entity: None,
+                test: false,
             }],
             scope_gaps: vec!["bearer".to_owned(), "validation".to_owned()],
         };
@@ -4793,6 +4857,7 @@ mod tests {
                 class: DocumentClass::Code,
                 scope: BindingScope::File,
                 entity: None,
+                test: false,
             }],
             scope_gaps: vec!["bearer".to_owned()],
             ..report
@@ -4808,6 +4873,7 @@ mod tests {
                 class: DocumentClass::Code,
                 scope: BindingScope::Entity,
                 entity: Some("validate".to_owned()),
+                test: false,
             }],
             ..report
         };
@@ -4816,6 +4882,25 @@ mod tests {
             reasons.len(),
             1,
             "only the subject gap remains: {reasons:?}"
+        );
+        // A test-only entity binding reports its own tier — assertions
+        // name vocabulary, they do not implement it.
+        let report = WitnessReport {
+            binding_artifacts: vec![BoundArtifact {
+                path: "src/gateway.rs".to_owned(),
+                class: DocumentClass::Code,
+                scope: BindingScope::Entity,
+                entity: Some("tests".to_owned()),
+                test: true,
+            }],
+            ..report
+        };
+        let reasons = weak_witness_reasons(&frame, &report);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("only in test code")),
+            "test-only binding flags its tier: {reasons:?}"
         );
     }
 
@@ -4941,6 +5026,26 @@ mod tests {
         // Code-switching does not resurrect interrogative filler.
         let tokens = entity_tokens("SnapshotIdentity 在哪定义");
         assert_eq!(tokens, ["SnapshotIdentity"]);
+    }
+
+    #[test]
+    fn entity_tokens_strips_sentence_capital_but_keeps_interior_names() {
+        // "Trace" leads the query — orthographic capitalization, not a
+        // named thing. The wrongly-abstained `self-trace-context-pack`
+        // family came from exactly this leak.
+        assert!(entity_tokens("Trace how search hits are packed").is_empty());
+        // A second capital marks real naming intent even at the lead.
+        assert_eq!(
+            entity_tokens("SourceAddress stops carrying snapshot identity"),
+            ["SourceAddress"]
+        );
+        // Interior capitals are chosen, not orthographic — keep them.
+        assert_eq!(entity_tokens("how does Tokio spawn tasks"), ["Tokio"]);
+        // Identifier characters rescue a leading plain-capital too.
+        assert_eq!(
+            entity_tokens("Trace_context packing hits"),
+            ["Trace_context"]
+        );
     }
 
     fn prf_seed(symbol: &str, snippet: &str, path: &str, score: f64) -> Candidate {
@@ -6099,6 +6204,85 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("only at file scope")),
             "file-scope binding is flagged: {:?}",
+            result.verdict.reasons
+        );
+    }
+
+    /// A binding whose only coherent entity is test code does not
+    /// witness — assertions name vocabulary, implementations implement
+    /// it. The qualified-name module path (`…::tests::…`) is what marks
+    /// a helper whose bare name shows no test marker.
+    #[tokio::test]
+    async fn binding_in_test_code_corroborates_but_does_not_witness() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let engine = engine_at(&directory);
+        binding_fixture(
+            &engine,
+            "snap_test",
+            &[
+                (
+                    "doc:helper",
+                    "symbol:helper",
+                    "src/auth.rs",
+                    "helper",
+                    "fn helper() { bearer token check }",
+                ),
+                (
+                    "doc:real",
+                    "symbol:issue",
+                    "src/issue.rs",
+                    "issue",
+                    "fn issue() { bearer token check }",
+                ),
+            ],
+            &[
+                file("src/auth.rs"),
+                CodeEntity {
+                    qualified_name: Some("src/auth.rs::tests::helper".to_owned()),
+                    ..symbol("helper", "src/auth.rs")
+                },
+                file("src/issue.rs"),
+                CodeEntity {
+                    qualified_name: Some("src/issue.rs::issue".to_owned()),
+                    ..symbol("issue", "src/issue.rs")
+                },
+            ],
+        );
+
+        // Both terms bind inside one entity each — the `tests`-module
+        // member marks its artifact test while the plain function's
+        // binding stays implementation-tier.
+        let result = engine
+            .search(request("bearer token", 10))
+            .await
+            .expect("test binding search");
+        let artifact = result
+            .verdict
+            .witness
+            .binding_artifacts
+            .iter()
+            .find(|artifact| artifact.path == "src/auth.rs")
+            .expect("test binding artifact");
+        assert_eq!(artifact.scope, BindingScope::Entity);
+        assert!(artifact.test, "test-module binding is marked: {artifact:?}");
+        let artifact = result
+            .verdict
+            .witness
+            .binding_artifacts
+            .iter()
+            .find(|artifact| artifact.path == "src/issue.rs")
+            .expect("impl binding artifact");
+        assert!(
+            !artifact.test,
+            "implementation binding stays unmarked: {artifact:?}"
+        );
+        assert!(
+            !result
+                .verdict
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("only in test code")),
+            "a real implementation binding silences the test flag: {:?}",
             result.verdict.reasons
         );
     }

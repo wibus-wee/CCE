@@ -2225,6 +2225,7 @@ pub(crate) fn is_test(path: &str, name: &str) -> bool {
         || path.contains("spec")
         || name.starts_with("test_")
         || name.ends_with("_test")
+        || matches!(name.as_str(), "test" | "tests" | "testing")
 }
 
 fn deterministic_role_summary(file: &ScannedFile, parsed: &crate::ParsedFile) -> String {

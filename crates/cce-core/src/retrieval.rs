@@ -500,6 +500,13 @@ pub struct BoundArtifact {
     /// drill-down anchor a verifier wants.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entity: Option<String>,
+    /// The binding evidence lives in test code — a `#[cfg(test)]`
+    /// module, a `tests/` tree, or a `test_` function. Tests assert
+    /// vocabulary; they do not implement it, so a test-only binding
+    /// corroborates rather than witnesses (the same contract prose
+    /// carries).
+    #[serde(default)]
+    pub test: bool,
 }
 
 /// What the evidence actually contains relative to the claim: per-term
@@ -614,12 +621,14 @@ mod tests {
                         class: DocumentClass::Prose,
                         scope: BindingScope::File,
                         entity: None,
+                        test: false,
                     },
                     BoundArtifact {
                         path: "src/gateway.rs".to_owned(),
                         class: DocumentClass::Code,
                         scope: BindingScope::Entity,
                         entity: Some("validate".to_owned()),
+                        test: false,
                     },
                 ],
                 scope_gaps: vec!["reconnect".to_owned()],
