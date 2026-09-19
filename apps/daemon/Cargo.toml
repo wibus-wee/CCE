@@ -19,7 +19,9 @@ axum.workspace = true
 cce-core = { version = "0.1.0", path = "../../crates/cce-core" }
 cce-engine = { version = "0.1.0", path = "../../crates/cce-engine" }
 clap.workspace = true
+futures.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true

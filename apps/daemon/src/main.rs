@@ -1,15 +1,19 @@
 #![forbid(unsafe_code)]
 
 //! `cce-daemon` HTTP service: the engine API over `/v1/*` plus the web
-//! dashboard's static assets, bound to loopback by default.
+//! dashboard's static assets, bound to loopback by default. `--watch`
+//! reindexes automatically when the worktree or HEAD moves.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{FromRef, Path, Query, State},
     http::{HeaderName, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
 use cce_core::{QueryIntent, SearchRequest, SearchRoute};
 use cce_engine::{
@@ -19,12 +23,32 @@ use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
-    services::ServeDir,
+    services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_swagger_ui::SwaggerUi;
+
+mod watch;
+
+/// Request state. Most handlers need only the engine — the `FromRef`
+/// impl keeps every `State<Arc<CceEngine>>` extractor working; handlers
+/// whose freshness behaviour depends on `--watch` take the whole state.
+#[derive(Clone)]
+struct DaemonState {
+    engine: Arc<CceEngine>,
+    /// `--watch` active: a background poller reindexes when the snapshot
+    /// identity moves, so freshness-demanding requests may serve the
+    /// committed snapshot instead of rescanning the worktree per query.
+    watch_keeps_fresh: bool,
+}
+
+impl FromRef<DaemonState> for Arc<CceEngine> {
+    fn from_ref(state: &DaemonState) -> Self {
+        Self::clone(&state.engine)
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "cce-daemon", version)]
@@ -61,6 +85,14 @@ struct Arguments {
     /// indexing.
     #[arg(long, env = "CCE_NO_PROVIDERS")]
     no_providers: bool,
+    /// Keep the index fresh: rescan every --watch-interval and reindex when
+    /// the snapshot identity (worktree content + HEAD + index profile)
+    /// moves.
+    #[arg(long, env = "CCE_WATCH")]
+    watch: bool,
+    /// Poll interval for --watch, in seconds.
+    #[arg(long, env = "CCE_WATCH_INTERVAL", default_value_t = 15)]
+    watch_interval: u64,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -207,11 +239,23 @@ async fn main() -> anyhow::Result<()> {
     };
     config.reranker_model = arguments.reranker;
     config.providers.enabled = !arguments.no_providers;
-    let state = Arc::new(CceEngine::open(config)?);
+    let engine = Arc::new(CceEngine::open(config)?);
+    if arguments.watch {
+        // Floor at 1s so --watch-interval 0 cannot hot-spin the scanner.
+        let interval = Duration::from_secs(arguments.watch_interval.max(1));
+        tracing::info!(interval_secs = interval.as_secs(), "watch mode enabled");
+        tokio::spawn(watch::run(Arc::clone(&engine), interval));
+    }
+    let state = DaemonState {
+        engine,
+        watch_keeps_fresh: arguments.watch,
+    };
     let request_id = HeaderName::from_static("x-request-id");
     let (api_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(health))
         .routes(routes!(index))
+        .routes(routes!(checkpoint))
+        .routes(routes!(events))
         .routes(routes!(status))
         .routes(routes!(search))
         .routes(routes!(context))
@@ -223,6 +267,11 @@ async fn main() -> anyhow::Result<()> {
         .routes(routes!(providers))
         .routes(routes!(grep))
         .routes(routes!(diff))
+        .routes(routes!(diff_architecture))
+        .routes(routes!(export))
+        .routes(routes!(export_entities))
+        .routes(routes!(export_relations))
+        .routes(routes!(export_regions))
         .routes(routes!(files))
         .routes(routes!(file_source))
         .split_for_parts();
@@ -235,8 +284,13 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     if let Some(web_root) = arguments.web_root {
-        router =
-            router.fallback_service(ServeDir::new(web_root).append_index_html_on_directories(true));
+        // SPA fallback: client-side routes (/query, /browse/<path>, …) have
+        // no file on disk — serve index.html and let the router resolve.
+        router = router.fallback_service(
+            ServeDir::new(&web_root)
+                .append_index_html_on_directories(true)
+                .not_found_service(ServeFile::new(web_root.join("index.html"))),
+        );
     }
     let listener = tokio::net::TcpListener::bind(arguments.bind).await?;
     tracing::info!(address = %arguments.bind, "CCE daemon listening");
@@ -255,8 +309,18 @@ async fn health() -> Json<Health> {
     })
 }
 
+/// `POST /v1/index` / `/v1/checkpoint` query — who produced the snapshot.
+/// Attribution is review context, never snapshot identity.
+#[derive(Debug, Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+#[serde(rename_all = "camelCase")]
+struct OriginQuery {
+    /// Producer label — `cli`, `watch`, an MCP client name, `checkpoint`.
+    origin: Option<String>,
+}
+
 #[utoipa::path(post, path = "/v1/index", tag = "worker",
     summary = "reindex the worktree",
+    params(OriginQuery),
     responses(
         (status = 200, body = cce_engine::IndexReport),
         (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
@@ -264,8 +328,63 @@ async fn health() -> Json<Health> {
     ))]
 async fn index(
     State(engine): State<Arc<CceEngine>>,
+    Query(query): Query<OriginQuery>,
 ) -> Result<Json<cce_engine::IndexReport>, ApiError> {
-    Ok(Json(engine.index().await?))
+    Ok(Json(engine.index_with_origin(query.origin).await?))
+}
+
+#[utoipa::path(post, path = "/v1/checkpoint", tag = "worker",
+    summary = "commit a detached parse+relations snapshot for diffing",
+    description = "Indexes the worktree without providers, dense, or zoekt \
+        and commits it under a checkpoint profile: a distinct snapshot id \
+        that never promotes to `current`. Pair with `GET \
+        /v1/diff/architecture?head=<snapshot>` to review what a session \
+        changed without moving the serving view.",
+    params(OriginQuery),
+    responses(
+        (status = 200, body = cce_engine::IndexReport),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
+async fn checkpoint(
+    State(engine): State<Arc<CceEngine>>,
+    Query(query): Query<OriginQuery>,
+) -> Result<Json<cce_engine::IndexReport>, ApiError> {
+    Ok(Json(engine.checkpoint(query.origin).await?))
+}
+
+#[utoipa::path(get, path = "/v1/events", tag = "worker",
+    summary = "snapshot lifecycle stream (SSE)",
+    description = "One `snapshot` event per commit or activation made by \
+        this daemon — the signal to re-poll status/map/diff instead of a \
+        timer. Commits from other processes (a bare `cce index`) do not \
+        emit here. A `lagged` event reports how many broadcasts were \
+        dropped; receivers should re-fetch state rather than replay.",
+    responses(
+        (status = 200, description = "text/event-stream of SnapshotEvent")
+    ))]
+async fn events(
+    State(engine): State<Arc<CceEngine>>,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let rx = engine.subscribe_snapshots();
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Ok(event) => {
+                let data = serde_json::to_string(&event).unwrap_or_default();
+                Some((Ok(Event::default().event("snapshot").data(data)), rx))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => Some((
+                Ok(Event::default().event("lagged").data(skipped.to_string())),
+                rx,
+            )),
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+        }
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }
 
 #[utoipa::path(get, path = "/v1/status", tag = "worker",
@@ -290,18 +409,21 @@ async fn status(
         (status = 500, description = "internal error", body = ApiErrorBody)
     ))]
 async fn search(
-    State(engine): State<Arc<CceEngine>>,
+    State(state): State<DaemonState>,
     Json(input): Json<SearchInput>,
 ) -> Result<Json<cce_engine::SearchResult>, ApiError> {
     Ok(Json(
-        engine
+        state
+            .engine
             .search(SearchRequest {
                 repository_id: String::new(),
                 snapshot_id: String::new(),
                 query: input.query,
                 intent: input.intent,
                 limit: input.limit.clamp(1, 200),
-                require_fresh: true,
+                // Under --watch the poller owns freshness — serve the
+                // committed snapshot instead of rescanning per request.
+                require_fresh: !state.watch_keeps_fresh,
                 routes: input.routes,
                 filters: input.filters,
             })
@@ -426,6 +548,7 @@ async fn grep(
             path_prefix: input.path_prefix,
             language: input.language.map(|value| value.to_lowercase()),
             hit_type: None,
+            pattern: None,
         },
         limit: input.limit.clamp(1, 5_000),
         ignore_case: input.ignore_case,
@@ -441,23 +564,142 @@ async fn grep(
         (status = 500, description = "internal error", body = ApiErrorBody)
     ))]
 async fn diff(
-    State(engine): State<Arc<CceEngine>>,
+    State(state): State<DaemonState>,
     Json(input): Json<DiffInput>,
 ) -> Result<Json<cce_engine::SearchResult>, ApiError> {
     Ok(Json(
-        engine
+        state
+            .engine
             .search(SearchRequest {
                 repository_id: String::new(),
                 snapshot_id: String::new(),
                 query: input.pattern,
                 intent: None,
                 limit: input.limit.clamp(1, 500),
-                require_fresh: true,
+                // Under --watch the poller owns freshness — serve the
+                // committed snapshot instead of rescanning per request.
+                require_fresh: !state.watch_keeps_fresh,
                 routes: vec![SearchRoute::Diff],
                 filters: cce_core::QueryFilters::default(),
             })
             .await?,
     ))
+}
+
+/// `GET /v1/diff/architecture` query — the snapshot pair to compare.
+#[derive(Debug, Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+#[serde(rename_all = "camelCase")]
+struct ArchitectureDiffQuery {
+    /// Base snapshot id; defaults to the snapshot committed before head.
+    base: Option<String>,
+    /// Head snapshot id; defaults to the current committed snapshot.
+    head: Option<String>,
+}
+
+#[utoipa::path(get, path = "/v1/diff/architecture", tag = "worker",
+    summary = "entity/relation delta between two committed snapshots",
+    params(ArchitectureDiffQuery),
+    responses(
+        (status = 200, body = cce_engine::ArchitectureDiff),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
+async fn diff_architecture(
+    State(engine): State<Arc<CceEngine>>,
+    Query(query): Query<ArchitectureDiffQuery>,
+) -> Result<Json<cce_engine::ArchitectureDiff>, ApiError> {
+    Ok(Json(engine.architecture_diff(
+        query.base.as_deref(),
+        query.head.as_deref(),
+    )?))
+}
+
+/// `GET /v1/export*` query — snapshot selection plus cursor pagination.
+#[derive(Debug, Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+#[serde(rename_all = "camelCase")]
+struct ExportQuery {
+    /// Snapshot to read; defaults to the current committed snapshot.
+    snapshot: Option<String>,
+    /// Cursor: rows with `id > cursor` (the last id of the previous page).
+    cursor: Option<String>,
+    /// Page size (default 1000, clamped to `1..=10_000`).
+    limit: Option<usize>,
+}
+
+fn export_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(1_000).clamp(1, 10_000)
+}
+
+#[utoipa::path(get, path = "/v1/export", tag = "worker",
+    summary = "committed entity/relation/region counts of a snapshot",
+    params(ExportQuery),
+    responses(
+        (status = 200, body = cce_engine::ExportSummary),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
+async fn export(
+    State(engine): State<Arc<CceEngine>>,
+    Query(query): Query<ExportQuery>,
+) -> Result<Json<cce_engine::ExportSummary>, ApiError> {
+    Ok(Json(engine.export_summary(query.snapshot.as_deref())?))
+}
+
+#[utoipa::path(get, path = "/v1/export/entities", tag = "worker",
+    summary = "one id-ordered page of a snapshot's entities",
+    params(ExportQuery),
+    responses(
+        (status = 200, body = cce_engine::EntityExportPage),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
+async fn export_entities(
+    State(engine): State<Arc<CceEngine>>,
+    Query(query): Query<ExportQuery>,
+) -> Result<Json<cce_engine::EntityExportPage>, ApiError> {
+    Ok(Json(engine.export_entities(
+        query.snapshot.as_deref(),
+        query.cursor.as_deref(),
+        export_limit(query.limit),
+    )?))
+}
+
+#[utoipa::path(get, path = "/v1/export/relations", tag = "worker",
+    summary = "one id-ordered page of a snapshot's relations",
+    params(ExportQuery),
+    responses(
+        (status = 200, body = cce_engine::RelationExportPage),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
+async fn export_relations(
+    State(engine): State<Arc<CceEngine>>,
+    Query(query): Query<ExportQuery>,
+) -> Result<Json<cce_engine::RelationExportPage>, ApiError> {
+    Ok(Json(engine.export_relations(
+        query.snapshot.as_deref(),
+        query.cursor.as_deref(),
+        export_limit(query.limit),
+    )?))
+}
+
+#[utoipa::path(get, path = "/v1/export/regions", tag = "worker",
+    summary = "one id-ordered page of a snapshot's canonical regions",
+    params(ExportQuery),
+    responses(
+        (status = 200, body = cce_engine::RegionExportPage),
+        (status = "4XX", description = "client error — invalid request or unavailable view", body = ApiErrorBody),
+        (status = 500, description = "internal error", body = ApiErrorBody)
+    ))]
+async fn export_regions(
+    State(engine): State<Arc<CceEngine>>,
+    Query(query): Query<ExportQuery>,
+) -> Result<Json<cce_engine::RegionExportPage>, ApiError> {
+    Ok(Json(engine.export_regions(
+        query.snapshot.as_deref(),
+        query.cursor.as_deref(),
+        export_limit(query.limit),
+    )?))
 }
 
 /// `GET /v1/file?path=` query — the repository-relative file path.

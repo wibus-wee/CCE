@@ -56,24 +56,44 @@ enum DenseMode {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Build or incrementally refresh the snapshot: scan, parse, run providers,
+    /// materialize views, then prune beyond the retention window.
     Index {
         #[arg(default_value = ".")]
         repository: PathBuf,
     },
+    /// Commit a detached parse+relations snapshot for diffing — no
+    /// providers/dense/zoekt, never promoted to current. The returned
+    /// snapshot id feeds `cce diff --head` for session-change review.
+    Checkpoint {
+        #[arg(default_value = ".")]
+        repository: PathBuf,
+        /// Producer label recorded on the snapshot (e.g. a session id).
+        #[arg(long)]
+        origin: Option<String>,
+    },
+    /// Read-only view manifest: each view's state and freshness for the
+    /// current snapshot. Never writes.
     Status {
         #[arg(default_value = ".")]
         repository: PathBuf,
     },
+    /// Store health: the `SQLite` self-check plus a verification pass over the
+    /// artifacts the metadata references.
     Doctor {
         #[arg(default_value = ".")]
         repository: PathBuf,
     },
+    /// Quarantine the metadata store and rebuild from scratch. Requires
+    /// `--confirm`; prior `SQLite` files are moved aside, never deleted.
     Rebuild {
         #[arg(default_value = ".")]
         repository: PathBuf,
         #[arg(long)]
         confirm: bool,
     },
+    /// Intent-aware ranked retrieval: the plan, ranked hits, and any capability
+    /// the snapshot could not supply.
     Search {
         repository: PathBuf,
         query: String,
@@ -89,6 +109,7 @@ enum Command {
         #[arg(long)]
         no_verify: bool,
     },
+    /// Emit the canonical source-linked context pack under a token budget.
     Context {
         repository: PathBuf,
         query: String,
@@ -136,14 +157,26 @@ enum Command {
         #[arg(long, default_value_t = cce_engine::DEFAULT_GREP_LIMIT)]
         limit: usize,
     },
-    /// Regex over stored commit patches — Sourcegraph `type:diff`. Results
-    /// are historical evidence bounded by the history index (most recent
-    /// 512 commits), not the current worktree.
+    /// With PATTERN: regex over stored commit patches — Sourcegraph
+    /// `type:diff`, historical evidence bounded by the history index (most
+    /// recent 512 commits). With `--base`/`--head` — or no PATTERN at all —
+    /// the entity/relation delta between two committed snapshots.
     Diff {
         repository: PathBuf,
-        pattern: String,
+        /// Patch-search regex (type:diff). Omit to diff snapshots.
+        pattern: Option<String>,
+        /// Base snapshot; defaults to the snapshot committed before --head.
+        #[arg(long)]
+        base: Option<String>,
+        /// Head snapshot; defaults to the current snapshot.
+        #[arg(long)]
+        head: Option<String>,
         #[arg(long, default_value_t = cce_engine::DEFAULT_DIFF_LIMIT)]
         limit: usize,
+        /// Patch-search only: serve the last committed snapshot without
+        /// rescanning the worktree.
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Probe external code-intelligence providers (SCIP toolchains).
     Providers {
@@ -262,7 +295,14 @@ async fn main() -> anyhow::Result<()> {
     match &arguments.command {
         Command::Index { repository } => {
             let engine = engine(&arguments, repository)?;
-            let report = engine.index().await?;
+            let report = engine.index_with_origin(Some("cli".to_owned())).await?;
+            print_value(&report)?;
+        }
+        Command::Checkpoint { repository, origin } => {
+            let engine = engine(&arguments, repository)?;
+            let report = engine
+                .checkpoint(origin.clone().or_else(|| Some("cli".to_owned())))
+                .await?;
             print_value(&report)?;
         }
         Command::Status { repository } => {
@@ -368,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
                     path_prefix: path.clone(),
                     language: lang.clone().map(|value| value.to_lowercase()),
                     hit_type: None,
+                    pattern: None,
                 },
                 limit: *limit,
                 ignore_case: *ignore_case,
@@ -387,34 +428,54 @@ async fn main() -> anyhow::Result<()> {
         Command::Diff {
             repository,
             pattern,
+            base,
+            head,
             limit,
+            no_verify,
         } => {
             let engine = engine(&arguments, repository)?;
-            let result = engine
-                .search(SearchRequest {
-                    repository_id: String::new(),
-                    snapshot_id: String::new(),
-                    query: pattern.clone(),
-                    intent: None,
-                    limit: *limit,
-                    require_fresh: true,
-                    routes: vec![SearchRoute::Diff],
-                    filters: cce_core::QueryFilters::default(),
-                })
-                .await?;
-            if arguments.json {
-                print_value(&result)?;
-            } else {
-                for hit in &result.hits {
-                    let path = hit
-                        .address
-                        .as_ref()
-                        .map_or("?", |address| address.path.as_str());
-                    let commit = hit.symbol_name.as_deref().unwrap_or("commit");
-                    println!("{commit} {path}:");
-                    for line in hit.snippet.lines() {
-                        println!("    {line}");
+            // Snapshot-delta mode: --base/--head given, or no PATTERN at
+            // all (defaults to previous-vs-current). A PATTERN combined
+            // with snapshot ids is ambiguous and rejected.
+            let patch_search = pattern.is_some() && base.is_none() && head.is_none();
+            if patch_search {
+                let result = engine
+                    .search(SearchRequest {
+                        repository_id: String::new(),
+                        snapshot_id: String::new(),
+                        query: pattern.clone().unwrap_or_default(),
+                        intent: None,
+                        limit: *limit,
+                        require_fresh: !no_verify,
+                        routes: vec![SearchRoute::Diff],
+                        filters: cce_core::QueryFilters::default(),
+                    })
+                    .await?;
+                if arguments.json {
+                    print_value(&result)?;
+                } else {
+                    for hit in &result.hits {
+                        let path = hit
+                            .address
+                            .as_ref()
+                            .map_or("?", |address| address.path.as_str());
+                        let commit = hit.symbol_name.as_deref().unwrap_or("commit");
+                        println!("{commit} {path}:");
+                        for line in hit.snippet.lines() {
+                            println!("    {line}");
+                        }
                     }
+                }
+            } else {
+                anyhow::ensure!(
+                    pattern.is_none(),
+                    "PATTERN cannot be combined with --base/--head; it selects patch search (type:diff)"
+                );
+                let report = engine.architecture_diff(base.as_deref(), head.as_deref())?;
+                if arguments.json {
+                    print_value(&report)?;
+                } else {
+                    print_architecture_diff(&report);
                 }
             }
         }
@@ -508,6 +569,78 @@ fn quarantine_metadata(data_dir: &std::path::Path) -> anyhow::Result<PathBuf> {
 fn print_value(value: &impl serde::Serialize) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn entity_line(entity: &cce_engine::DiffEntityRef) -> String {
+    let name = entity.qualified_name.as_deref().unwrap_or(&entity.name);
+    entity.path.as_deref().map_or_else(
+        || format!("{:?} {name}", entity.kind),
+        |path| format!("{:?} {name} ({path})", entity.kind),
+    )
+}
+
+fn relation_line(relation: &cce_engine::DiffRelation) -> String {
+    let source = relation
+        .source
+        .qualified_name
+        .as_deref()
+        .unwrap_or(&relation.source.name);
+    let target = relation
+        .target
+        .qualified_name
+        .as_deref()
+        .unwrap_or(&relation.target.name);
+    format!(
+        "{:?} {source} -> {target} ({:?}, {:.2})",
+        relation.kind, relation.origin, relation.confidence
+    )
+}
+
+fn print_architecture_diff(report: &cce_engine::ArchitectureDiff) {
+    println!("{} -> {}", report.base_snapshot_id, report.head_snapshot_id);
+    println!(
+        "+{} entities  -{} entities  +{} relations  -{} relations  ~{} changed",
+        report.counts.added_entities,
+        report.counts.removed_entities,
+        report.counts.added_relations,
+        report.counts.removed_relations,
+        report.counts.changed_relations
+    );
+    for entity in &report.added_entities {
+        println!("  + {}", entity_line(entity));
+    }
+    for entity in &report.removed_entities {
+        println!("  - {}", entity_line(entity));
+    }
+    for relation in &report.added_relations {
+        println!("  + {}", relation_line(relation));
+    }
+    for relation in &report.removed_relations {
+        println!("  - {}", relation_line(relation));
+    }
+    for relation in &report.changed_relations {
+        let source = relation
+            .source
+            .qualified_name
+            .as_deref()
+            .unwrap_or(&relation.source.name);
+        let target = relation
+            .target
+            .qualified_name
+            .as_deref()
+            .unwrap_or(&relation.target.name);
+        println!(
+            "  ~ {:?} {source} -> {target} ({:?}/{:.2} -> {:?}/{:.2})",
+            relation.kind,
+            relation.base_origin,
+            relation.base_confidence,
+            relation.head_origin,
+            relation.head_confidence
+        );
+    }
+    if report.truncated {
+        eprintln!("… lists truncated; see counts for full totals or use --json");
+    }
 }
 
 fn print_context(pack: &cce_core::ContextPack) {

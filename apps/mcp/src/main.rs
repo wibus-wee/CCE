@@ -1,12 +1,13 @@
 #![forbid(unsafe_code)]
 
 //! `cce-mcp` Model Context Protocol adapter: exposes the engine's index,
-//! status, search, context, map, explain, and impact operations as MCP tools
-//! over stdio JSON-RPC.
+//! status, search, context, symbol, map, explain, impact, providers,
+//! definitions, references, grep, diff, architecture-diff, export, and
+//! file operations as MCP tools over stdio JSON-RPC.
 
 use std::{path::PathBuf, sync::Arc};
 
-use cce_core::{QueryIntent, SearchRequest};
+use cce_core::{QueryFilters, QueryIntent, SearchRequest, SearchRoute};
 use cce_engine::{
     CceEngine, ContextRequest, DEFAULT_LOCAL_EMBEDDING_MODEL, DenseBackendConfig, EngineConfig,
 };
@@ -174,8 +175,24 @@ async fn call_tool(engine: &CceEngine, params: &Value) -> Result<Value, (i32, St
         .cloned()
         .unwrap_or_else(|| json!({}));
     let value = match name {
-        "cce_index" => serde_json::to_value(engine.index().await.map_err(tool_error)?)
-            .map_err(|error| (-32603, error.to_string()))?,
+        "cce_index" => serde_json::to_value(
+            engine
+                .index_with_origin(
+                    optional_string(&arguments, "origin").or_else(|| Some("mcp".to_owned())),
+                )
+                .await
+                .map_err(tool_error)?,
+        )
+        .map_err(|error| (-32603, error.to_string()))?,
+        "cce_checkpoint" => serde_json::to_value(
+            engine
+                .checkpoint(
+                    optional_string(&arguments, "origin").or_else(|| Some("mcp".to_owned())),
+                )
+                .await
+                .map_err(tool_error)?,
+        )
+        .map_err(|error| (-32603, error.to_string()))?,
         "cce_status" => serde_json::to_value(engine.status().map_err(tool_error)?)
             .map_err(|error| (-32603, error.to_string()))?,
         "cce_search" => {
@@ -194,7 +211,7 @@ async fn call_tool(engine: &CceEngine, params: &Value) -> Result<Value, (i32, St
                         limit,
                         require_fresh: true,
                         routes: Vec::new(),
-                        filters: cce_core::QueryFilters::default(),
+                        filters: QueryFilters::default(),
                     })
                     .await
                     .map_err(tool_error)?,
@@ -228,7 +245,7 @@ async fn call_tool(engine: &CceEngine, params: &Value) -> Result<Value, (i32, St
                             .clamp(1, 200),
                         require_fresh: true,
                         routes: Vec::new(),
-                        filters: cce_core::QueryFilters::default(),
+                        filters: QueryFilters::default(),
                     })
                     .await
                     .map_err(tool_error)?,
@@ -247,6 +264,113 @@ async fn call_tool(engine: &CceEngine, params: &Value) -> Result<Value, (i32, St
             serde_json::to_value(engine.impact_analysis(&name).map_err(tool_error)?)
                 .map_err(|error| (-32603, error.to_string()))?
         }
+        "cce_providers" => {
+            serde_json::to_value(engine.providers()).map_err(|error| (-32603, error.to_string()))?
+        }
+        "cce_definitions" => {
+            let name = required_string(&arguments, "name")?;
+            serde_json::to_value(engine.definitions(&name).map_err(tool_error)?)
+                .map_err(|error| (-32603, error.to_string()))?
+        }
+        "cce_references" => {
+            let name = required_string(&arguments, "name")?;
+            serde_json::to_value(engine.references(&name).map_err(tool_error)?)
+                .map_err(|error| (-32603, error.to_string()))?
+        }
+        "cce_grep" => {
+            let pattern = required_string(&arguments, "pattern")?;
+            serde_json::to_value(
+                engine
+                    .grep(&cce_engine::GrepRequest {
+                        pattern,
+                        filters: QueryFilters {
+                            path_prefix: optional_string(&arguments, "pathPrefix"),
+                            language: optional_string(&arguments, "language")
+                                .map(|value| value.to_lowercase()),
+                            hit_type: None,
+                            pattern: None,
+                        },
+                        limit: optional_usize(&arguments, "limit")
+                            .unwrap_or(200)
+                            .clamp(1, 5_000),
+                        ignore_case: arguments
+                            .get("ignoreCase")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                    .map_err(tool_error)?,
+            )
+            .map_err(|error| (-32603, error.to_string()))?
+        }
+        "cce_diff" => {
+            let pattern = required_string(&arguments, "pattern")?;
+            serde_json::to_value(
+                engine
+                    .search(SearchRequest {
+                        repository_id: String::new(),
+                        snapshot_id: String::new(),
+                        query: pattern,
+                        intent: None,
+                        limit: optional_usize(&arguments, "limit")
+                            .unwrap_or(100)
+                            .clamp(1, 500),
+                        require_fresh: true,
+                        routes: vec![SearchRoute::Diff],
+                        filters: QueryFilters::default(),
+                    })
+                    .await
+                    .map_err(tool_error)?,
+            )
+            .map_err(|error| (-32603, error.to_string()))?
+        }
+        "cce_diff_architecture" => serde_json::to_value(
+            engine
+                .architecture_diff(
+                    optional_string(&arguments, "base").as_deref(),
+                    optional_string(&arguments, "head").as_deref(),
+                )
+                .map_err(tool_error)?,
+        )
+        .map_err(|error| (-32603, error.to_string()))?,
+        "cce_export" => {
+            let kind = required_string(&arguments, "kind")?;
+            let snapshot = optional_string(&arguments, "snapshot");
+            let cursor = optional_string(&arguments, "cursor");
+            let limit = optional_usize(&arguments, "limit")
+                .unwrap_or(500)
+                .clamp(1, 1_000);
+            let page = match kind.as_str() {
+                "entities" => serde_json::to_value(
+                    engine
+                        .export_entities(snapshot.as_deref(), cursor.as_deref(), limit)
+                        .map_err(tool_error)?,
+                ),
+                "relations" => serde_json::to_value(
+                    engine
+                        .export_relations(snapshot.as_deref(), cursor.as_deref(), limit)
+                        .map_err(tool_error)?,
+                ),
+                "regions" => serde_json::to_value(
+                    engine
+                        .export_regions(snapshot.as_deref(), cursor.as_deref(), limit)
+                        .map_err(tool_error)?,
+                ),
+                _ => {
+                    return Err((
+                        -32602,
+                        format!("kind must be entities|relations|regions, got {kind}"),
+                    ));
+                }
+            };
+            page.map_err(|error| (-32603, error.to_string()))?
+        }
+        "cce_files" => serde_json::to_value(engine.files().map_err(tool_error)?)
+            .map_err(|error| (-32603, error.to_string()))?,
+        "cce_file" => {
+            let path = required_string(&arguments, "path")?;
+            serde_json::to_value(engine.file(&path).map_err(tool_error)?)
+                .map_err(|error| (-32603, error.to_string()))?
+        }
         _ => return Err((-32602, format!("unknown tool: {name}"))),
     };
     let text = serde_json::to_string_pretty(&value).map_err(|error| (-32603, error.to_string()))?;
@@ -262,7 +386,29 @@ fn tools() -> Vec<Value> {
         tool(
             "cce_index",
             "Index or incrementally refresh the repository",
-            json!({"type": "object", "additionalProperties": false}),
+            json!({
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string", "minLength": 1,
+                        "description": "who is running this index — recorded on the snapshot"}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "cce_checkpoint",
+            "Commit a detached parse+relations snapshot of the worktree for \
+             diffing — no providers/dense/zoekt, never promoted to current. \
+             Feed its snapshot id to cce_diff_architecture as `head` to see \
+             what a session changed.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string", "minLength": 1,
+                        "description": "who is checkpointing — recorded on the snapshot"}
+                },
+                "additionalProperties": false
+            }),
         ),
         tool(
             "cce_status",
@@ -317,10 +463,91 @@ fn tools() -> Vec<Value> {
         tool(
             "cce_impact",
             "Blast radius of a symbol or package through persisted impact edges",
+            name_schema(),
+        ),
+        tool(
+            "cce_providers",
+            "Language intelligence providers and their last-run outcomes",
+            json!({"type": "object", "additionalProperties": false}),
+        ),
+        tool(
+            "cce_definitions",
+            "Compiler-truth definitions for a symbol (SCIP providers)",
+            name_schema(),
+        ),
+        tool(
+            "cce_references",
+            "Compiler-truth references for a symbol (SCIP providers)",
+            name_schema(),
+        ),
+        tool(
+            "cce_grep",
+            "Regex search over the worktree — always fresh, not index-bound",
             json!({
                 "type": "object",
-                "properties": {"name": {"type": "string", "minLength": 1}},
-                "required": ["name"],
+                "properties": {
+                    "pattern": {"type": "string", "minLength": 1},
+                    "pathPrefix": {"type": "string"},
+                    "language": {"type": "string"},
+                    "ignoreCase": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 5_000}
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "cce_diff",
+            "Regex over stored commit patches (type:diff) — bounded by indexed history",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "minLength": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500}
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "cce_diff_architecture",
+            "Entity/relation delta between two committed snapshots — what an edit session changed: files appeared, edges wired, edges cut",
+            json!({
+                "type": "object",
+                "properties": {
+                    "base": {"type": "string", "description": "base snapshot id; defaults to the snapshot committed before head"},
+                    "head": {"type": "string", "description": "head snapshot id; defaults to the current committed snapshot"}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "cce_export",
+            "One id-ordered page of a snapshot's entities, relations, or regions — bulk machine access, pass the cursor from the previous page",
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["entities", "relations", "regions"]},
+                    "snapshot": {"type": "string", "description": "snapshot id; defaults to the current committed snapshot"},
+                    "cursor": {"type": "string", "description": "last id of the previous page"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1_000}
+                },
+                "required": ["kind"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "cce_files",
+            "List indexed files of the current snapshot",
+            json!({"type": "object", "additionalProperties": false}),
+        ),
+        tool(
+            "cce_file",
+            "Read one file's content from the committed source view",
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string", "minLength": 1}},
+                "required": ["path"],
                 "additionalProperties": false
             }),
         ),
@@ -329,6 +556,15 @@ fn tools() -> Vec<Value> {
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({"name": name, "description": description, "inputSchema": input_schema})
+}
+
+fn name_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"name": {"type": "string", "minLength": 1}},
+        "required": ["name"],
+        "additionalProperties": false
+    })
 }
 
 fn query_schema(include_limit: bool) -> Value {
@@ -362,6 +598,13 @@ fn required_string(arguments: &Value, name: &str) -> Result<String, (i32, String
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
         .ok_or_else(|| (-32602, format!("{name} must be a non-empty string")))
+}
+
+fn optional_string(arguments: &Value, name: &str) -> Option<String> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn optional_usize(arguments: &Value, name: &str) -> Option<usize> {

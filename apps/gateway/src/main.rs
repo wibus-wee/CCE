@@ -1130,6 +1130,18 @@ async fn proxy(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    // SSE never terminates — buffering would hang the request forever.
+    // Chunked pass-through keeps `/v1/events` live end-to-end.
+    if content_type.as_deref() == Some("text/event-stream") {
+        state.breakers.on_success(&entry.id);
+        state.metrics.record_upstream_ms(elapsed_ms(started));
+        state.metrics.record_proxy("ok");
+        return Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from_stream(response.bytes_stream()))
+            .map_err(ApiError::from);
+    }
     // A worker that dies mid-response is an upstream failure too — same
     // classification as the send path above, and it counts against the
     // circuit even though the status line already arrived.

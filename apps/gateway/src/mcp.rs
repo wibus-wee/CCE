@@ -148,7 +148,32 @@ async fn call_tool(
         .unwrap_or_else(|| json!({}));
 
     let outcome = match name {
-        "cce_index" => post(state, entry, "index", json!({})).await,
+        "cce_index" => {
+            let origin = arguments
+                .get("origin")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp");
+            post(
+                state,
+                entry,
+                &format!("index?origin={}", urlencoded(origin)),
+                json!({}),
+            )
+            .await
+        }
+        "cce_checkpoint" => {
+            let origin = arguments
+                .get("origin")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp");
+            post(
+                state,
+                entry,
+                &format!("checkpoint?origin={}", urlencoded(origin)),
+                json!({}),
+            )
+            .await
+        }
         "cce_status" => get(state, entry, "status").await,
         "cce_providers" => get(state, entry, "providers").await,
         "cce_map" => get(state, entry, "map").await,
@@ -227,6 +252,44 @@ async fn call_tool(
                 set(&mut body, "limit", limit.clone());
             }
             post(state, entry, "diff", body).await
+        }
+        "cce_diff_architecture" => {
+            let mut pairs = Vec::new();
+            for key in ["base", "head"] {
+                if let Some(value) = arguments.get(key).and_then(Value::as_str) {
+                    pairs.push(format!("{key}={}", urlencoded(value)));
+                }
+            }
+            let path = if pairs.is_empty() {
+                "diff/architecture".to_owned()
+            } else {
+                format!("diff/architecture?{}", pairs.join("&"))
+            };
+            get(state, entry, &path).await
+        }
+        "cce_export" => {
+            let kind = required_string(&arguments, "kind")?;
+            if !matches!(kind.as_str(), "entities" | "relations" | "regions") {
+                return Err((
+                    -32602,
+                    format!("kind must be entities|relations|regions, got {kind}"),
+                ));
+            }
+            let mut pairs = Vec::new();
+            for key in ["snapshot", "cursor"] {
+                if let Some(value) = arguments.get(key).and_then(Value::as_str) {
+                    pairs.push(format!("{key}={}", urlencoded(value)));
+                }
+            }
+            if let Some(limit) = optional_usize(&arguments, "limit") {
+                pairs.push(format!("limit={}", limit.clamp(1, 1_000)));
+            }
+            let path = if pairs.is_empty() {
+                format!("export/{kind}")
+            } else {
+                format!("export/{kind}?{}", pairs.join("&"))
+            };
+            get(state, entry, &path).await
         }
         _ => return Err((-32602, format!("unknown tool: {name}"))),
     };
@@ -334,7 +397,29 @@ fn tools() -> Vec<Value> {
         tool(
             "cce_index",
             "Index or incrementally refresh the repository",
-            empty_schema(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string", "minLength": 1,
+                        "description": "who is running this index — recorded on the snapshot"}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "cce_checkpoint",
+            "Commit a detached parse+relations snapshot of the worktree for \
+             diffing — no providers/dense/zoekt, never promoted to current. \
+             Feed its snapshot id to cce_diff_architecture as `head` to see \
+             what a session changed.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string", "minLength": 1,
+                        "description": "who is checkpointing — recorded on the snapshot"}
+                },
+                "additionalProperties": false
+            }),
         ),
         tool(
             "cce_status",
@@ -431,6 +516,33 @@ fn tools() -> Vec<Value> {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500}
                 },
                 "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "cce_diff_architecture",
+            "Entity/relation delta between two committed snapshots — what an edit session changed: files appeared, edges wired, edges cut",
+            json!({
+                "type": "object",
+                "properties": {
+                    "base": {"type": "string", "description": "base snapshot id; defaults to the snapshot committed before head"},
+                    "head": {"type": "string", "description": "head snapshot id; defaults to the current committed snapshot"}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "cce_export",
+            "One id-ordered page of a snapshot's entities, relations, or regions — bulk machine access, pass the cursor from the previous page",
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["entities", "relations", "regions"]},
+                    "snapshot": {"type": "string", "description": "snapshot id; defaults to the current committed snapshot"},
+                    "cursor": {"type": "string", "description": "last id of the previous page"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1_000}
+                },
+                "required": ["kind"],
                 "additionalProperties": false
             }),
         ),
