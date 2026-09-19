@@ -266,6 +266,9 @@ fn render_item(
     seen_ranges: &mut HashSet<(String, u64, u64)>,
     ranges_per_file: &mut HashMap<String, usize>,
 ) -> Option<ContextItem> {
+    // Admission checks are read-only: a rejected candidate must not
+    // consume range, entity, or per-file quota, or later evidence that
+    // would fit gets starved by state from items that never shipped.
     // One item per source range: a symbol's summary, signature, and raw
     // chunks are the same evidence wearing different representations, so
     // whichever ranks highest wins the slot.
@@ -275,19 +278,16 @@ fn render_item(
         .map(|address| (address.path.clone(), address.start_byte, address.end_byte));
     if range_key
         .as_ref()
-        .is_some_and(|key| !seen_ranges.insert(key.clone()))
+        .is_some_and(|key| seen_ranges.contains(key))
     {
         return None;
     }
     if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
-        let count = ranges_per_file.entry(path.clone()).or_default();
-        if *count >= 4 {
+        if ranges_per_file.get(path).copied().unwrap_or(0) >= 4 {
             return None;
         }
-        *count += 1;
     }
-    let first_entity_occurrence = seen_entities.insert(hit.entity_id.clone());
-    if !first_entity_occurrence && hit.address.is_none() {
+    if hit.address.is_none() && seen_entities.contains(&hit.entity_id) {
         return None;
     }
     let body = render_hit(hit);
@@ -295,6 +295,14 @@ fn render_item(
     if tokens > budget_tokens.saturating_sub(used_tokens) {
         return None;
     }
+    // Admitted — commit all three quotas now that the item ships.
+    if let Some(key) = range_key {
+        seen_ranges.insert(key);
+    }
+    if let Some(path) = hit.address.as_ref().map(|address| &address.path) {
+        *ranges_per_file.entry(path.clone()).or_default() += 1;
+    }
+    seen_entities.insert(hit.entity_id.clone());
     let kind = match role {
         ContextRole::Test => ContextItemKind::Test,
         ContextRole::History => ContextItemKind::History,
@@ -402,9 +410,326 @@ fn capability_from_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cce_core::{
+        ClaimFrame, ClaimPredicate, EvidenceTiers, QueryFilters, SearchHit, SourceAddress,
+        VerdictState, WitnessReport, WitnessRequirement,
+    };
+
+    use crate::QueryPlan;
+    use cce_core::{QueryIntent, SearchVerdict, ViewManifest};
 
     #[test]
     fn token_estimate_penalizes_code_punctuation() {
         assert!(estimate_tokens("fn x() { y(); }") > estimate_tokens("plain prose text"));
+    }
+
+    fn hit(
+        document_id: &str,
+        entity_id: &str,
+        representation: cce_core::RetrievalRepresentation,
+        address: Option<SourceAddress>,
+        snippet_len: usize,
+    ) -> SearchHit {
+        SearchHit {
+            document_id: document_id.to_owned(),
+            entity_id: entity_id.to_owned(),
+            region_id: None,
+            symbol_name: Some(entity_id.to_owned()),
+            representation,
+            route: SearchRoute::Lexical,
+            rank: 0,
+            score: 1.0,
+            contributing_routes: vec![SearchRoute::Lexical],
+            address,
+            evidence: Vec::new(),
+            snippet: "x".repeat(snippet_len),
+            verified_current: true,
+            explanation: vec!["fixture".to_owned()],
+        }
+    }
+
+    fn address(path: &str, start: u64, end: u64) -> Option<SourceAddress> {
+        SourceAddress::new("repo_t", "snap_t", path, start..end, 1..=2).ok()
+    }
+
+    fn search_result(hits: Vec<SearchHit>) -> SearchResult {
+        SearchResult {
+            request: SearchRequest {
+                repository_id: "repo_t".to_owned(),
+                snapshot_id: "snap_t".to_owned(),
+                query: "fixture query".to_owned(),
+                intent: None,
+                limit: 50,
+                require_fresh: false,
+                routes: Vec::new(),
+                filters: QueryFilters::default(),
+            },
+            plan: QueryPlan {
+                intent: QueryIntent::NaturalLanguageBehavior,
+                routes: vec![SearchRoute::Lexical],
+                graph_policy: cce_core::GraphPolicy::Opportunistic,
+                required_views: Vec::new(),
+                reasons: Vec::new(),
+            },
+            manifest: ViewManifest {
+                repository_id: "repo_t".to_owned(),
+                snapshot_id: "snap_t".to_owned(),
+                views: std::collections::BTreeMap::new(),
+            },
+            hits,
+            missing_capabilities: Vec::new(),
+            verdict: SearchVerdict {
+                state: VerdictState::default(),
+                reasons: Vec::new(),
+                claim: ClaimFrame {
+                    intent: QueryIntent::NaturalLanguageBehavior,
+                    predicate: ClaimPredicate::Lookup,
+                    required_witness: WitnessRequirement::Any,
+                    subjects: Vec::new(),
+                    distinguishing_terms: Vec::new(),
+                },
+                witness: WitnessReport::default(),
+                evidence_tiers: EvidenceTiers::default(),
+                drill_downs: Vec::new(),
+            },
+            latency_ms: 0,
+        }
+    }
+
+    fn packed_ids(pack: &ContextPack) -> Vec<&str> {
+        pack.items.iter().map(|item| item.id.as_str()).collect()
+    }
+
+    /// Probe-pack with unlimited budget to learn the real token cost of a
+    /// hit set — budgets are derived from measured tokens, not magic numbers.
+    fn measured_tokens(search: &SearchResult, id: &str) -> usize {
+        let probe = ContextPacker::new().pack(search, usize::MAX / 2);
+        if id == "orientation" {
+            probe
+                .items
+                .iter()
+                .find(|item| item.kind == ContextItemKind::Orientation)
+                .map_or(0, |item| item.estimated_tokens)
+        } else {
+            probe
+                .items
+                .iter()
+                .find(|item| item.id == id)
+                .map_or(0, |item| item.estimated_tokens)
+        }
+    }
+
+    #[test]
+    fn rejected_long_candidates_do_not_starve_short_evidence() {
+        // Four oversized candidates in one file fail the budget check; a
+        // later short candidate in the same file must still pack — the
+        // rejections must not have consumed the four-slot file quota.
+        let mut hits: Vec<SearchHit> = (0..4)
+            .map(|index| {
+                hit(
+                    &format!("long_{index}"),
+                    &format!("entity_{index}"),
+                    cce_core::RetrievalRepresentation::RawCode,
+                    address("src/a.rs", index * 100, index * 100 + 50),
+                    200_000,
+                )
+            })
+            .collect();
+        hits.push(hit(
+            "short",
+            "entity_short",
+            cce_core::RetrievalRepresentation::RawCode,
+            address("src/a.rs", 900, 950),
+            40,
+        ));
+        let search = search_result(hits);
+        let pack = ContextPacker::new().pack(&search, 4_000);
+        let ids = packed_ids(&pack);
+        assert!(
+            ids.contains(&"short"),
+            "short evidence must pack after four rejected longs: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id.starts_with("long_")),
+            "rejected candidates must not appear: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn failed_long_representation_frees_the_range_for_a_short_one() {
+        // Same entity, same range: the long representation fails the budget,
+        // the short representation of the identical range must still pack.
+        let range = address("src/lib.rs", 0, 500);
+        let hits = vec![
+            hit(
+                "long_repr",
+                "entity_a",
+                cce_core::RetrievalRepresentation::RawCode,
+                range.clone(),
+                200_000,
+            ),
+            hit(
+                "short_repr",
+                "entity_a",
+                cce_core::RetrievalRepresentation::SymbolSummary,
+                range,
+                40,
+            ),
+        ];
+        let search = search_result(hits);
+        let pack = ContextPacker::new().pack(&search, 4_000);
+        let ids = packed_ids(&pack);
+        assert_eq!(
+            ids.iter().filter(|id| **id == "short_repr").count(),
+            1,
+            "short representation of the range must pack: {ids:?}"
+        );
+        assert!(!ids.contains(&"long_repr"));
+    }
+
+    #[test]
+    fn failed_addressless_candidate_does_not_consume_entity_dedup() {
+        // Entity dedup for addressless hits: a long addressless candidate
+        // fails on budget; a later short hit on the same entity must still
+        // be admitted — the entity key was never committed.
+        let hits = vec![
+            hit(
+                "long_addrless",
+                "entity_b",
+                cce_core::RetrievalRepresentation::KnowledgePage,
+                None,
+                200_000,
+            ),
+            hit(
+                "short_addrless",
+                "entity_b",
+                cce_core::RetrievalRepresentation::KnowledgePage,
+                None,
+                40,
+            ),
+        ];
+        let search = search_result(hits);
+        let pack = ContextPacker::new().pack(&search, 4_000);
+        let ids = packed_ids(&pack);
+        assert!(
+            ids.contains(&"short_addrless"),
+            "same-entity short hit must pack: {ids:?}"
+        );
+        assert!(!ids.contains(&"long_addrless"));
+    }
+
+    #[test]
+    fn admitted_quota_rules_still_hold() {
+        // Successful duplicate range stays excluded; the fifth distinct
+        // range in one file still hits the four-slot cap.
+        let mut hits: Vec<SearchHit> = (0..4)
+            .map(|index| {
+                hit(
+                    &format!("file_a_{index}"),
+                    &format!("entity_a_{index}"),
+                    cce_core::RetrievalRepresentation::RawCode,
+                    address("src/a.rs", index * 100, index * 100 + 50),
+                    40,
+                )
+            })
+            .collect();
+        hits.push(hit(
+            "dup_range",
+            "entity_dup",
+            cce_core::RetrievalRepresentation::RawCode,
+            address("src/a.rs", 0, 50),
+            40,
+        ));
+        hits.push(hit(
+            "fifth_range",
+            "entity_fifth",
+            cce_core::RetrievalRepresentation::RawCode,
+            address("src/a.rs", 500, 550),
+            40,
+        ));
+        let search = search_result(hits);
+        let pack = ContextPacker::new().pack(&search, usize::MAX / 2);
+        let ids = packed_ids(&pack);
+        for index in 0..4 {
+            assert!(ids.contains(&format!("file_a_{index}").as_str()));
+        }
+        assert!(!ids.contains(&"dup_range"), "duplicate range rejected");
+        assert!(!ids.contains(&"fifth_range"), "file cap still enforced");
+    }
+
+    #[test]
+    fn role_preselection_rejection_does_not_pollute_rank_fill() {
+        // A Test-role candidate that fails the budget during role
+        // preselection must not leave its range committed — the rank-order
+        // fill pass still sees the range as free for a shorter hit.
+        let hits = vec![
+            hit(
+                "long_test",
+                "entity_t",
+                cce_core::RetrievalRepresentation::TestBehavior,
+                address("tests/t.rs", 0, 400),
+                200_000,
+            ),
+            hit(
+                "target_hit",
+                "entity_u",
+                cce_core::RetrievalRepresentation::RawCode,
+                address("src/u.rs", 0, 100),
+                40,
+            ),
+        ];
+        let search = search_result(hits);
+        let pack = ContextPacker::new().pack(&search, 4_000);
+        let ids = packed_ids(&pack);
+        assert!(ids.contains(&"target_hit"), "rank fill unaffected: {ids:?}");
+        assert!(!ids.contains(&"long_test"));
+    }
+
+    #[test]
+    fn budget_edges_are_exact() {
+        let hits = vec![
+            hit(
+                "a",
+                "entity_a",
+                cce_core::RetrievalRepresentation::RawCode,
+                address("src/a.rs", 0, 50),
+                40,
+            ),
+            hit(
+                "b",
+                "entity_b",
+                cce_core::RetrievalRepresentation::RawCode,
+                address("src/b.rs", 0, 50),
+                40,
+            ),
+        ];
+        let search = search_result(hits);
+
+        // Zero budget: nothing packs, not even orientation.
+        let pack = ContextPacker::new().pack(&search, 0);
+        assert!(pack.items.is_empty() && pack.used_tokens == 0);
+
+        // Orientation alone consumes the budget exactly.
+        let orientation_tokens = measured_tokens(&search, "orientation");
+        let pack = ContextPacker::new().pack(&search, orientation_tokens);
+        assert_eq!(pack.items.len(), 1);
+        assert_eq!(pack.items[0].kind, ContextItemKind::Orientation);
+        assert_eq!(pack.used_tokens, orientation_tokens);
+
+        // Exact fill: orientation + first hit precisely exhausts the budget.
+        let a_tokens = measured_tokens(&search, "a");
+        let exact = orientation_tokens + a_tokens;
+        let pack = ContextPacker::new().pack(&search, exact);
+        let ids = packed_ids(&pack);
+        assert!(
+            ids.contains(&"a") && !ids.contains(&"b"),
+            "exact fill: {ids:?}"
+        );
+        assert_eq!(pack.used_tokens, exact);
+        assert!(pack.used_tokens <= pack.budget_tokens);
+
+        // used_tokens always equals the sum of item estimates.
+        let sum: usize = pack.items.iter().map(|item| item.estimated_tokens).sum();
+        assert_eq!(sum, pack.used_tokens);
     }
 }
