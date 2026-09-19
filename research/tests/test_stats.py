@@ -66,3 +66,51 @@ def test_compare_metrics_marks_holm_significance() -> None:
 def test_bootstrap_ci_orders() -> None:
     value, low, high = bootstrap_ci([0.0, 0.5, 1.0, 0.5])
     assert low <= value <= high
+
+
+def test_collapse_clusters_gives_families_equal_weight() -> None:
+    from cce_research.stats import collapse_clusters
+
+    # Family 'a' has three derived rows, 'b' one: the flat mean would
+    # weight 'a' 3x; cluster means weight them equally.
+    values = [1.0, 1.0, 1.0, 0.0]
+    clusters = ["a", "a", "a", "b"]
+    assert collapse_clusters(values, clusters) == [1.0, 0.0]
+
+
+def test_bootstrap_ci_with_clusters_uses_family_means() -> None:
+    # Same data, two framings: without clusters the mean is pulled toward
+    # the big family; with clusters each family counts once.
+    values = [1.0] * 6 + [0.0]
+    flat = bootstrap_ci(values)[0]
+    clustered = bootstrap_ci(values, clusters=["a"] * 6 + ["b"])[0]
+    assert flat == 6 / 7
+    assert clustered == 0.5
+
+
+def test_permutation_pvalue_collapses_within_family() -> None:
+    # One family flips entirely (a: 0->1, three rows) vs a second family
+    # unchanged: cluster means [1, 0] vs [0, 0] — a real but tiny signal.
+    baseline = [0.0, 0.0, 0.0, 0.0]
+    candidate = [1.0, 1.0, 1.0, 0.0]
+    clusters = ["a", "a", "a", "b"]
+    p = permutation_pvalue(baseline, candidate, clusters=clusters)
+    assert p is not None
+    # Only two clusters exist, so the p-value cannot drop below the
+    # two-cluster floor — unlike the iid reading which would look strong.
+    assert p > 0.05
+
+
+def test_compare_metrics_reports_cluster_sample_size() -> None:
+    baseline = {"m": [0.0, 0.0, 0.0, 0.0]}
+    candidate = {"m": [1.0, 1.0, 1.0, 1.0]}
+    report = compare_metrics(
+        baseline, candidate, clusters={"m": ["a", "a", "a", "b"]}
+    )
+    assert report["m"].samples == 2  # two families, not four rows
+
+
+def test_compare_metrics_without_clusters_unchanged() -> None:
+    baseline = {"m": [0.0, 0.0]}
+    candidate = {"m": [1.0, 1.0]}
+    assert compare_metrics(baseline, candidate)["m"].samples == 2

@@ -26,14 +26,16 @@ Additional optional fields:
 
 - `supply_intent` (default `true`): when `false`, the adapter must not pass `intent` to the system. The system's own classifier decides; the resolved intent is recorded as `predicted_intent` and scored against the case's gold `intent`.
 - `routes` (default `[]`): a non-empty list overrides the planner's route selection, passed through as repeated `--route` flags. Ablation rows reuse a query with a restricted route set.
-- `gold_facts` (default `[]`): atomic claims the evidence must support, each with `evidence` ranges and/or `symbols`. Scored as `claim_support` — separates "found the file" from "found the answer" without an LLM judge.
+- `gold_facts` (default `[]`): atomic claims the evidence must support, each with `evidence` ranges and/or `symbols`. Scored as `claim_support` — separates "found the file" from "found the answer" without an LLM judge. A `symbols` entry is scoped to the fact's `evidence` paths: a same-named symbol cited from an unrelated file does not count. Facts carrying only bare symbols (no evidence paths) are unscoped — excluded from the strict metric's denominator and reported under `claim_support_unscoped`.
 - `judged_files` (default `[]`): paths an adjudicator reviewed and marked *not* relevant. Retrieved paths outside gold ∪ supporting ∪ judged are **unjudged**, not false positives.
 - `derived_from` / `derivation`: lineage for generated cases (`ablate:<route>`, `variant:<transform>`).
 - `answer_key` (optional): the string a correct consumer must extract from the pack; reserved for downstream answer probes.
 
 ## Result schema
 
-Each result records the retrieved source-linked ranges plus the plan the system actually executed: `predicted_intent`, `plan_routes`, `graph_policy`, and `missing_capabilities`. Misrouted queries are attributable instead of silently averaged away. `abstained` means the system returned no source-linked evidence.
+Each result records two layers derived from one normalization: `items`, the ranked retrieval/packing units (each with an item id, original rank, token cost, a primary source address, and supporting addresses), and `retrieved`, the flat compat rows expanded from those items — one row per cited address, all sharing the item's rank. @K cutoffs and token budgets count **items**, never addresses: an item citing three addresses occupies one rank slot and spends its tokens once. Items without addresses (orientation) consume budget but produce no flat rows.
+
+Results also carry `result_kind` (`search`/`context`), the pack's own `used_tokens`, the engine's `verdict_state` (`answered`/`weak_witness`/`abstained`), and `metrics_version` — `compare` refuses to mix accounting versions. Plus the plan the system actually executed: `predicted_intent`, `plan_routes`, `graph_policy`, and `missing_capabilities`. Misrouted queries are attributable instead of silently averaged away. `abstained` means the system returned no source-linked evidence; a `weak_witness` verdict with candidates is a different event and is reported separately via the `verdict_*` metrics. Legacy results (no `items`) stay readable: metrics that need item identity or a packing budget mark themselves uncomputable rather than guessing from flat rows.
 
 Result `metadata` carries the executed `command` and `engine_latency_ms` — the engine's own reported timing (`latencyMs` on search results and context packs), distinct from `query_ms`, which is subprocess wall-clock including spawn and model-session init. Latency comparisons should cite `engine_latency_ms` for engine compute and `query_ms` for end-to-end cost.
 
@@ -45,11 +47,11 @@ Adapters default to `session: subprocess` — one engine process per case, so `q
 
 - ranked retrieval: Recall@5/10/20/50, MRR, nDCG@10, file success, symbol and line recall
 - judgment-aware: `unjudged_rate@k` (top-k share with no verdict), `bpref@20` (penalizes only judged-irrelevant items; Buckley–Voorhees)
-- claim-level: `claim_support` over `gold_facts`
-- selective retrieval: abstention accuracy, no-context precision, false-positive rate
+- claim-level: `claim_support` over `gold_facts` (strict: evidence overlap or path-scoped symbol), `claim_support_legacy` (pre-012 loose criterion, continuity only), `claim_support_unscoped` (count of undecidable bare-symbol facts)
+- selective retrieval: abstention accuracy, no-context precision, false-positive rate, plus `verdict_answered`/`verdict_weak_witness`/`verdict_abstained`/`verdict_flagged` shares when the system exports its evidence verdict
 - planner: `intent_accuracy`, `intent_recall/<intent>`, `intent_precision/<intent>` over `supply_intent: false` cases
 - architecture routing: `component_recall_at_5/20` and `component_mrr` — package-granularity Task→Component recall. `gold_components` annotates the packages a case's gold lives in; each run captures the system's `map` output once as `component_map` (package → rootDir) and resolves retrieved paths by longest-prefix match. Cases without `gold_components` are skipped, not zeroed. Annotation convention: a case's `gold_components` is the set of packages that own its `gold_files` — resolved by the same longest-prefix `rootDir` rule the metric applies (list names with `cce map`; e.g. `crates/cce-store/...` → `cce-store`, `apps/web/...` → `@cce/web`, top-level files → the workspace root package)
-- budgeted packs: coverage at 2K/4K/8K, relevant-line density, unique gold entities per token, redundancy, relation coverage, citation correctness
+- budgeted packs: `budget_compliant` (the pack's own `usedTokens` — or the item sum including address-less orientation — against the case budget; uncomputable on search results and legacy rows), `pack_sufficiency` (strict claim support over the items that actually fit the budget), coverage at 2K/4K/8K, relevant-line density, unique gold entities per token, redundancy, relation coverage, citation correctness
 - systems: cold index time, incremental p50/p95, stale window, query and rerank p50/p95, disk/LOC, peak memory, context tokens and model inference cost
 
 All per-case metrics are also reported under `by_intent/<intent>/` groups.

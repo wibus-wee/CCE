@@ -40,10 +40,35 @@ class Comparison:
     significant: bool = field(default=False)
 
 
+def collapse_clusters(values: list[float], clusters: list[str]) -> list[float]:
+    """Collapse per-case values to per-cluster means. Derived cases
+    (variants, budget curves, pinned ablations) replicate their parent —
+    they are not independent evidence, so a family contributes exactly
+    one observation (its mean). This is the unit-level fix for
+    pseudo-replication: without it, variant-heavy families inflate both
+    the effective sample size and the weight of one underlying case."""
+    groups: dict[str, list[float]] = {}
+    order: list[str] = []
+    for value, cluster in zip(values, clusters, strict=True):
+        if cluster not in groups:
+            groups[cluster] = []
+            order.append(cluster)
+        groups[cluster].append(value)
+    return [mean(groups[cluster]) for cluster in order]
+
+
 def bootstrap_ci(
-    values: list[float], samples: int = BOOTSTRAP_SAMPLES, seed: int = SEED
+    values: list[float],
+    samples: int = BOOTSTRAP_SAMPLES,
+    seed: int = SEED,
+    clusters: list[str] | None = None,
 ) -> tuple[float, float, float]:
-    """Mean, and percentile bootstrap 95% CI of the mean."""
+    """Mean, and percentile bootstrap 95% CI of the mean. When `clusters`
+    is given (aligned with `values`), the analysis unit is the cluster
+    mean — families are resampled as indivisible blocks, so CIs reflect
+    the number of *independent* cases, not the inflated row count."""
+    if clusters is not None:
+        values = collapse_clusters(values, clusters)
     if not values:
         return (0.0, 0.0, 0.0)
     generator = random.Random(seed)
@@ -60,14 +85,27 @@ def permutation_pvalue(
     candidate: list[float],
     samples: int = PERMUTATION_SAMPLES,
     seed: int = SEED,
+    clusters: list[str] | None = None,
 ) -> float | None:
     """Two-sided paired permutation p-value for mean(candidate - baseline).
 
     Under the null, swapping each pair's labels is equally likely; the
     p-value is the share of relabelings whose |mean delta| is at least the
-    observed one. Returns None when fewer than two pairs exist.
+    observed one. Returns None when fewer than two pairs exist. When
+    `clusters` is given, pairs collapse to cluster means first — swapping
+    within a family is not a valid randomization unit.
     """
-    pairs = [(left, right) for left, right in zip(baseline, candidate, strict=True)]
+    if clusters is not None:
+        pairs = [
+            (left, right)
+            for left, right in zip(
+                collapse_clusters(baseline, clusters),
+                collapse_clusters(candidate, clusters),
+                strict=True,
+            )
+        ]
+    else:
+        pairs = [(left, right) for left, right in zip(baseline, candidate, strict=True)]
     if len(pairs) < 2:
         return None
     observed = abs(mean(right - left for left, right in pairs))
@@ -128,27 +166,42 @@ def compare_metrics(
     candidate: dict[str, list[float]],
     alpha: float = 0.05,
     seed: int = SEED,
+    clusters: dict[str, list[str]] | None = None,
 ) -> dict[str, Comparison]:
     """Full paired comparison for every metric present in both systems'
     per-case observation lists. `baseline`/`candidate` map metric name to a
-    list of per-case values aligned by case order."""
+    list of per-case values aligned by case order. `clusters` maps metric
+    name to cluster labels aligned with that metric's values — metrics
+    skipped per case (claim_support, component_*, budget_compliant) have
+    shorter value lists, so one global label list would misalign."""
     shared = sorted(set(baseline) & set(candidate))
     raw: dict[str, Comparison] = {}
     pvalues: dict[str, float] = {}
     for name in shared:
         left, right = baseline[name], candidate[name]
+        metric_clusters = clusters.get(name) if clusters else None
         deltas = [right_v - left_v for left_v, right_v in zip(left, right, strict=True)]
-        value, low, high = bootstrap_ci(deltas, seed=seed)
-        p = permutation_pvalue(left, right, seed=seed)
+        value, low, high = bootstrap_ci(deltas, seed=seed, clusters=metric_clusters)
+        p = permutation_pvalue(left, right, seed=seed, clusters=metric_clusters)
+        effective = (
+            len(collapse_clusters(deltas, metric_clusters))
+            if metric_clusters
+            else len(deltas)
+        )
         raw[name] = Comparison(
             metric=name,
             delta=value,
             ci_low=low,
             ci_high=high,
-            samples=len(deltas),
+            samples=effective,
             p_value=p,
-            effect_size=effect_size(deltas),
-            mde=minimum_detectable_effect(deltas, alpha=alpha),
+            effect_size=effect_size(
+                collapse_clusters(deltas, metric_clusters) if metric_clusters else deltas
+            ),
+            mde=minimum_detectable_effect(
+                collapse_clusters(deltas, metric_clusters) if metric_clusters else deltas,
+                alpha=alpha,
+            ),
         )
         if p is not None:
             pvalues[name] = p

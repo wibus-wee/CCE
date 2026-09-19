@@ -124,12 +124,76 @@ class BenchmarkCase(BaseModel):
         return self
 
 
+VerdictState = Literal["answered", "weak_witness", "abstained"]
+
+
 class RetrievedRange(LineRange):
     route: str
     rank: int = Field(ge=1)
     score: float
     estimated_tokens: int = Field(ge=0)
     citation_verified: bool = False
+    # Item this flat row was expanded from. None on legacy results that
+    # never recorded item identity — a row without it cannot be joined
+    # back to an item for budget or rank accounting.
+    item_id: str | None = None
+
+
+class RetrievedItem(BaseModel):
+    """One retrieval/packing item — the unit rank positions and token
+    budgets are counted on. An item cites a primary source address plus
+    optional supporting addresses; the addresses are attributes of the
+    item and never consume ranking slots of their own. Items without a
+    primary address (orientation, synthesized guidance) consume budget
+    but produce no flat rows."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Stable item/document id as emitted by the system.
+    item_id: str | None = None
+    # 1-based position in the system's own item ordering.
+    rank: int = Field(ge=1)
+    score: float = 0.0
+    route: str = "unknown"
+    # Item-level symbol (the hit's declared subject). Bound to the
+    # primary citation only — supporting addresses keep their own
+    # symbolId so a name cannot drift to an address it does not label.
+    symbol: str | None = None
+    estimated_tokens: int = Field(default=0, ge=0)
+    snapshot_id: str | None = None
+    region_id: str | None = None
+    citation_verified: bool = False
+    # Context item kind (orientation/entry_point/source/…); None on raw
+    # search hits.
+    kind: str | None = None
+    primary: LineRange | None = None
+    supporting: list[LineRange] = Field(default_factory=list)
+
+    def citations(self) -> list[LineRange]:
+        out = [self.primary] if self.primary else []
+        out.extend(self.supporting)
+        return out
+
+    def to_ranges(self) -> list[RetrievedRange]:
+        """The flat compat rows: one per cited address, all sharing the
+        item's rank, score, and token cost. This is the single derivation
+        both the adapter and the metrics consume — the two layers can
+        never disagree about address expansion."""
+        return [
+            RetrievedRange(
+                path=citation.path,
+                start_line=citation.start_line,
+                end_line=citation.end_line,
+                symbol=citation.symbol,
+                route=self.route,
+                rank=self.rank,
+                score=self.score,
+                estimated_tokens=self.estimated_tokens,
+                citation_verified=self.citation_verified,
+                item_id=self.item_id,
+            )
+            for citation in self.citations()
+        ]
 
 
 class CaseResult(BaseModel):
@@ -140,6 +204,20 @@ class CaseResult(BaseModel):
     system_revision: str
     dataset_revision: str
     retrieved: list[RetrievedRange]
+    # Item layer: the unit @K cutoffs and token budgets are counted on.
+    # Empty on legacy results — metrics that need item identity mark
+    # themselves uncomputable instead of guessing from flat rows.
+    items: list[RetrievedItem] = Field(default_factory=list)
+    # Which payload shape produced this result; None on legacy files.
+    result_kind: Literal["search", "context"] | None = None
+    # Top-level tokens the pack reported consuming (context only).
+    used_tokens: int | None = Field(default=None, ge=0)
+    # The engine's own evidence verdict, when the payload carried one.
+    # Distinct from `abstained`: weak_witness retains candidates.
+    verdict_state: VerdictState | None = None
+    # Metric-accounting semantics this result was written under.
+    # 1 = legacy flat rows; 2 = item-aware accounting.
+    metrics_version: int = 1
     abstained: bool = False
     # Plan actually executed, as reported by the system. `predicted_intent` is
     # what the planner resolved (supplied or classified); `plan_routes` and
@@ -162,6 +240,10 @@ class ResultBundleManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: int = 1
+    # Metric-accounting semantics the results were recorded under —
+    # mirrors CaseResult.metrics_version so a bundle's accounting mode
+    # is inspectable without reading every row.
+    metrics_version: int = 1
     system: str
     system_revision: str
     dataset_revision: str

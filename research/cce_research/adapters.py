@@ -11,12 +11,18 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Literal, TextIO
 
 import httpx
 import yaml
 
-from .schema import BenchmarkCase, CaseResult, RetrievedRange
+from .schema import (
+    BenchmarkCase,
+    CaseResult,
+    LineRange,
+    RetrievedItem,
+    RetrievedRange,
+)
 
 SESSION_MODES = ("subprocess", "daemon")
 _DAEMON_ENDPOINTS = {"search": "/v1/search", "context": "/v1/context"}
@@ -304,7 +310,16 @@ class Adapter:
             session.close()
         self._daemons.clear()
 
-    def run(self, case: BenchmarkCase, repository_root: Path, system_revision: str) -> CaseResult:
+    def run(
+        self,
+        case: BenchmarkCase,
+        repository_root: Path,
+        system_revision: str,
+        raw_sink: TextIO | None = None,
+    ) -> CaseResult:
+        """Run one case. `raw_sink`, when given, receives a JSONL line with
+        the case id and the verbatim payload — the raw record metrics are
+        recomputed from after accounting changes."""
         if self.session == "daemon":
             try:
                 endpoint, body = self.daemon_request(case, repository_root)
@@ -316,11 +331,15 @@ class Adapter:
                     f"[daemon] {case.case_id}: {error} — falling back to subprocess",
                     file=sys.stderr,
                 )
-                result = self._run_subprocess(case, repository_root, system_revision)
+                result = self._run_subprocess(
+                    case, repository_root, system_revision, raw_sink
+                )
                 result.metadata["session"] = "subprocess-fallback"
                 return result
-            return self._run_daemon(case, repository_root, system_revision, endpoint, body)
-        return self._run_subprocess(case, repository_root, system_revision)
+            return self._run_daemon(
+                case, repository_root, system_revision, endpoint, body, raw_sink
+            )
+        return self._run_subprocess(case, repository_root, system_revision, raw_sink)
 
     def daemon_request(
         self, case: BenchmarkCase, repository_root: Path
@@ -386,6 +405,7 @@ class Adapter:
         system_revision: str,
         endpoint: str,
         body: dict[str, Any],
+        raw_sink: TextIO | None = None,
     ) -> CaseResult:
         session = self._daemon_session(repository_root)
         started = time.perf_counter()
@@ -403,10 +423,15 @@ class Adapter:
                 "engine_latency_ms": payload.get("latencyMs"),
                 "session": "daemon",
             },
+            raw_sink=raw_sink,
         )
 
     def _run_subprocess(
-        self, case: BenchmarkCase, repository_root: Path, system_revision: str
+        self,
+        case: BenchmarkCase,
+        repository_root: Path,
+        system_revision: str,
+        raw_sink: TextIO | None = None,
     ) -> CaseResult:
         command = self.build_command(case, repository_root)
         environment = os.environ.copy()
@@ -437,6 +462,7 @@ class Adapter:
                 "command": shlex.join(command),
                 "engine_latency_ms": payload.get("latencyMs"),
             },
+            raw_sink=raw_sink,
         )
 
     def _result(
@@ -446,15 +472,25 @@ class Adapter:
         payload: dict[str, Any],
         elapsed_ms: float,
         metadata: dict[str, str | int | float | bool | None],
+        raw_sink: TextIO | None = None,
     ) -> CaseResult:
-        retrieved = normalize_payload(payload)
+        if raw_sink is not None:
+            raw_sink.write(
+                json.dumps({"case_id": case.case_id, "payload": payload}) + "\n"
+            )
+        normalized = normalize_payload(payload)
         return CaseResult(
             case_id=case.case_id,
             system=self.name,
             system_revision=system_revision,
             dataset_revision=case.provenance.dataset_revision,
-            retrieved=retrieved,
-            abstained=not retrieved,
+            retrieved=normalized.retrieved,
+            items=normalized.items,
+            result_kind=normalized.result_kind,
+            used_tokens=normalized.used_tokens,
+            verdict_state=normalized.verdict_state,
+            metrics_version=METRICS_VERSION,
+            abstained=not normalized.retrieved,
             predicted_intent=predicted_intent(payload),
             plan_routes=plan_routes(payload),
             graph_policy=graph_policy(payload),
@@ -495,7 +531,26 @@ class Adapter:
         }
 
 
-def normalize_payload(payload: dict[str, Any]) -> list[RetrievedRange]:
+# Metric-accounting semantics emitted by this adapter version.
+# 1 = legacy flat rows (pre-item accounting); 2 = item-aware accounting.
+METRICS_VERSION = 2
+
+
+@dataclass(frozen=True)
+class NormalizedPayload:
+    """Both result layers derived from one payload. `retrieved` is the
+    flat compat view expanded from `items` via `RetrievedItem.to_ranges`
+    — there is exactly one address-expansion path, so the layers cannot
+    disagree."""
+
+    items: list[RetrievedItem]
+    retrieved: list[RetrievedRange]
+    result_kind: Literal["search", "context"]
+    verdict_state: str | None
+    used_tokens: int | None
+
+
+def normalize_payload(payload: dict[str, Any]) -> NormalizedPayload:
     """Normalize either output shape: a context pack (`items`) or a raw
     search result (`hits`). Both carry source-linked provenance."""
     if "hits" in payload:
@@ -503,51 +558,95 @@ def normalize_payload(payload: dict[str, Any]) -> list[RetrievedRange]:
     return normalize_context_pack(payload)
 
 
-def normalize_search_result(payload: dict[str, Any]) -> list[RetrievedRange]:
-    output: list[RetrievedRange] = []
+def _citation(address: dict[str, Any], symbol: str | None) -> LineRange:
+    return LineRange(
+        path=address["path"],
+        start_line=address["startLine"],
+        end_line=address["endLine"],
+        symbol=symbol or address.get("symbolId"),
+    )
+
+
+def _verdict_state(payload: dict[str, Any]) -> str | None:
+    # Search results carry `verdict`; context packs carry `searchVerdict`
+    # once the delivery layer exports it. Both use `state`.
+    for key in ("verdict", "searchVerdict"):
+        verdict = payload.get(key)
+        if isinstance(verdict, dict) and verdict.get("state"):
+            return str(verdict["state"])
+    return None
+
+
+def normalize_search_result(payload: dict[str, Any]) -> NormalizedPayload:
+    items: list[RetrievedItem] = []
+    request = payload.get("request") or {}
     for hit in payload.get("hits", []):
-        addresses = list(hit.get("evidence", []))
-        if address := hit.get("address"):
-            addresses.insert(0, address)
-        for address in addresses:
-            output.append(
-                RetrievedRange(
-                    path=address["path"],
-                    start_line=address["startLine"],
-                    end_line=address["endLine"],
-                    symbol=hit.get("symbolName") or address.get("symbolId"),
-                    route=str(hit.get("route", "unknown")),
-                    rank=max(1, int(hit.get("rank", len(output) + 1))),
-                    score=float(hit.get("score", 0.0)),
-                    estimated_tokens=0,
-                    citation_verified=bool(hit.get("verifiedCurrent", False)),
-                )
+        symbol = hit.get("symbolName")
+        primary = (
+            _citation(hit["address"], symbol) if hit.get("address") else None
+        )
+        supporting = [
+            _citation(address, None) for address in hit.get("evidence", [])
+        ]
+        items.append(
+            RetrievedItem(
+                item_id=hit.get("documentId") or hit.get("entityId"),
+                rank=max(1, int(hit.get("rank", len(items) + 1))),
+                score=float(hit.get("score", 0.0)),
+                route=str(hit.get("route", "unknown")),
+                symbol=symbol,
+                estimated_tokens=0,
+                snapshot_id=request.get("snapshotId"),
+                region_id=hit.get("regionId"),
+                citation_verified=bool(hit.get("verifiedCurrent", False)),
+                primary=primary,
+                supporting=supporting,
             )
-    return output
+        )
+    return NormalizedPayload(
+        items=items,
+        retrieved=[row for item in items for row in item.to_ranges()],
+        result_kind="search",
+        verdict_state=_verdict_state(payload),
+        used_tokens=None,
+    )
 
 
-def normalize_context_pack(payload: dict[str, Any]) -> list[RetrievedRange]:
-    output: list[RetrievedRange] = []
+def normalize_context_pack(payload: dict[str, Any]) -> NormalizedPayload:
+    items: list[RetrievedItem] = []
     for item in payload.get("items", []):
         provenance = item.get("provenance", {})
-        addresses = list(provenance.get("evidenceAddresses", []))
-        if source := provenance.get("sourceAddress"):
-            addresses.insert(0, source)
-        for address in addresses:
-            output.append(
-                RetrievedRange(
-                    path=address["path"],
-                    start_line=address["startLine"],
-                    end_line=address["endLine"],
-                    symbol=provenance.get("symbolName") or address.get("symbolId"),
-                    route=provenance.get("route", "unknown"),
-                    rank=max(1, provenance.get("rank", len(output) + 1)),
-                    score=float(provenance.get("score", 0.0)),
-                    estimated_tokens=int(item.get("estimatedTokens", 0)),
-                    citation_verified=bool(provenance.get("verifiedCurrent", False)),
-                )
+        symbol = provenance.get("symbolName")
+        source = provenance.get("sourceAddress")
+        primary = _citation(source, symbol) if source else None
+        supporting = [
+            _citation(address, None)
+            for address in provenance.get("evidenceAddresses", [])
+        ]
+        items.append(
+            RetrievedItem(
+                item_id=item.get("id"),
+                rank=max(1, int(provenance.get("rank", len(items) + 1))),
+                score=float(provenance.get("score", 0.0)),
+                route=str(provenance.get("route", "unknown")),
+                symbol=symbol,
+                estimated_tokens=int(item.get("estimatedTokens", 0)),
+                snapshot_id=provenance.get("snapshotId") or payload.get("snapshotId"),
+                citation_verified=bool(provenance.get("verifiedCurrent", False)),
+                kind=item.get("kind"),
+                primary=primary,
+                supporting=supporting,
             )
-    return output
+        )
+    return NormalizedPayload(
+        items=items,
+        retrieved=[row for item in items for row in item.to_ranges()],
+        result_kind="context",
+        verdict_state=_verdict_state(payload),
+        used_tokens=(
+            int(payload["usedTokens"]) if payload.get("usedTokens") is not None else None
+        ),
+    )
 
 
 def predicted_intent(payload: dict[str, Any]) -> str | None:
