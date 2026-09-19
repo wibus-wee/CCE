@@ -51,7 +51,11 @@ impl QueryPlanner {
         match intent {
             QueryIntent::ExactEntity => QueryPlan {
                 intent,
-                routes: vec![SearchRoute::ExactSymbol, SearchRoute::Lexical],
+                routes: vec![
+                    SearchRoute::ExactSymbol,
+                    SearchRoute::Lexical,
+                    SearchRoute::Zoekt,
+                ],
                 graph_policy: GraphPolicy::None,
                 required_views: vec![ViewKind::Symbols, ViewKind::Lexical],
                 reasons: vec!["identifier-shaped or definition/reference query".to_owned()],
@@ -61,6 +65,7 @@ impl QueryPlanner {
                     intent,
                     routes: vec![
                         SearchRoute::Lexical,
+                        SearchRoute::Zoekt,
                         SearchRoute::DenseRaw,
                         SearchRoute::DenseSummary,
                         SearchRoute::Hybrid,
@@ -81,6 +86,7 @@ impl QueryPlanner {
                 routes: vec![
                     SearchRoute::ExactSymbol,
                     SearchRoute::Lexical,
+                    SearchRoute::Zoekt,
                     SearchRoute::DenseRaw,
                     SearchRoute::Structural,
                 ],
@@ -95,6 +101,7 @@ impl QueryPlanner {
                 routes: vec![
                     SearchRoute::ExactSymbol,
                     SearchRoute::Lexical,
+                    SearchRoute::Zoekt,
                     SearchRoute::DenseRaw,
                     SearchRoute::Structural,
                 ],
@@ -111,6 +118,7 @@ impl QueryPlanner {
                     SearchRoute::DenseSummary,
                     SearchRoute::Structural,
                     SearchRoute::Lexical,
+                    SearchRoute::Zoekt,
                 ],
                 graph_policy: GraphPolicy::ArchitectureBoundary,
                 required_views: vec![ViewKind::Knowledge, ViewKind::Graph, ViewKind::Lexical],
@@ -124,6 +132,7 @@ impl QueryPlanner {
                 routes: vec![
                     SearchRoute::History,
                     SearchRoute::Lexical,
+                    SearchRoute::Zoekt,
                     SearchRoute::DenseSummary,
                 ],
                 graph_policy: GraphPolicy::None,
@@ -166,6 +175,7 @@ fn union_plan(intent: QueryIntent, reasons: Vec<String>) -> QueryPlan {
         routes: vec![
             SearchRoute::ExactSymbol,
             SearchRoute::Lexical,
+            SearchRoute::Zoekt,
             SearchRoute::DenseRaw,
             SearchRoute::DenseSummary,
             SearchRoute::Hybrid,

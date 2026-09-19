@@ -595,6 +595,51 @@ impl CceEngine {
                     .store
                     .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
             }
+            // Zoekt shards are derived content outside the snapshot
+            // commit; a reused snapshot may predate the toolchain or
+            // carry a stale marker. Rebuild once per mismatch — this
+            // branch skips `ingest_providers` entirely.
+            let mut providers = Vec::new();
+            let zoekt_fresh =
+                crate::zoekt::indexed_snapshot(&crate::zoekt::index_dir(&self.config.data_root))
+                    == Some(scanned.snapshot.id.clone());
+            if !zoekt_fresh || !manifest.views.contains_key(&ViewKind::Zoekt) {
+                // A concurrent writer owns freshness — its fresh-index
+                // pass rebuilds the shards anyway, so busy means skip.
+                match crate::lock::IndexLease::acquire(&self.config.data_root) {
+                    Ok(_lease) => {
+                        let repo_root = self.config.repository_root.clone();
+                        let data_root = self.config.data_root.clone();
+                        let snapshot_id = scanned.snapshot.id.clone();
+                        let timeout =
+                            std::time::Duration::from_secs(self.config.providers.timeout_secs);
+                        let report = tokio::task::spawn_blocking(move || {
+                            crate::zoekt::ensure_report(
+                                &repo_root,
+                                &data_root,
+                                &snapshot_id,
+                                timeout,
+                            )
+                        })
+                        .await
+                        .map_err(|error| {
+                            CceError::Configuration(format!("provider runner failed: {error}"))
+                        })?;
+                        self.store.set_view_status(
+                            &scanned.identity.id,
+                            &scanned.snapshot.id,
+                            ViewKind::Zoekt,
+                            &zoekt_view_status(&scanned.snapshot, std::slice::from_ref(&report)),
+                        )?;
+                        providers.push(report);
+                        manifest = self
+                            .store
+                            .view_manifest(&scanned.identity.id, &scanned.snapshot.id)?;
+                    }
+                    Err(CceError::IndexBusy(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
             return Ok(IndexReport {
                 repository_id: scanned.identity.id,
                 snapshot: scanned.snapshot,
@@ -613,7 +658,7 @@ impl CceEngine {
                     .into_iter()
                     .map(|(path, reason)| (path, reason.to_owned()))
                     .collect(),
-                providers: Vec::new(),
+                providers,
                 manifest,
             });
         }
@@ -1313,6 +1358,12 @@ impl CceEngine {
             ViewKind::Dataflow,
             &dataflow_view_status(&scanned.snapshot, scip_edges),
         )?;
+        self.store.set_view_status(
+            &scanned.identity.id,
+            &scanned.snapshot.id,
+            ViewKind::Zoekt,
+            &zoekt_view_status(&scanned.snapshot, &provider_reports),
+        )?;
         if let Err(error) = self
             .store
             .prune_snapshots(&scanned.identity.id, self.config.index.snapshot_retention)
@@ -1372,12 +1423,21 @@ impl CceEngine {
         };
         let repo_root = self.config.repository_root.clone();
         let work_root = self.config.data_root.join("providers");
+        let data_root = self.config.data_root.clone();
+        let snapshot_id = scanned.snapshot.id.clone();
         let timeout = std::time::Duration::from_secs(self.config.providers.timeout_secs);
         let produced = tokio::task::spawn_blocking(move || {
-            crate::providers::produce(&repo_root, &work_root, timeout)
+            let produced = crate::providers::produce(&repo_root, &work_root, timeout);
+            // Zoekt is a provider in lifecycle only: its shard directory
+            // stays on disk under the data root and serves query-time
+            // candidates, so there is no artifact to ingest.
+            let zoekt_report =
+                crate::zoekt::ensure_report(&repo_root, &data_root, &snapshot_id, timeout);
+            (produced, zoekt_report)
         })
         .await
         .map_err(|error| CceError::Configuration(format!("provider runner failed: {error}")))?;
+        let (produced, zoekt_report) = produced;
         let mut reports = Vec::with_capacity(produced.len());
         for (mut report, artifact) in produced {
             let Some(crate::providers::ProviderArtifact::ScipIndex { bytes }) = artifact else {
@@ -1415,6 +1475,7 @@ impl CceEngine {
             }
             reports.push(report);
         }
+        reports.push(zoekt_report);
         Ok(reports)
     }
 
@@ -1656,6 +1717,11 @@ fn graph_view_status(
     let mut scip_edges = 0_usize;
     let mut digest = None;
     for report in reports {
+        // Only SCIP providers feed graph coverage — non-artifact
+        // providers (zoekt:index) report on their own view instead.
+        if !report.provider_id.starts_with("scip:") {
+            continue;
+        }
         match report.state {
             ProviderState::NotApplicable => {}
             ProviderState::Ready => {
@@ -1679,9 +1745,9 @@ fn graph_view_status(
             }
         }
     }
-    let any_applicable = reports
-        .iter()
-        .any(|report| report.state != ProviderState::NotApplicable);
+    let any_applicable = reports.iter().any(|report| {
+        report.provider_id.starts_with("scip:") && report.state != ProviderState::NotApplicable
+    });
     let (state, message) = graph_state(any_applicable, &uncovered);
     let mut status = status(snapshot, state, capabilities, message);
     status.artifact_digest = digest;
@@ -1700,6 +1766,9 @@ fn repaired_graph_status(
     let mut capabilities = base_graph_capabilities();
     let mut uncovered = Vec::new();
     for report in reports {
+        if !report.provider_id.starts_with("scip:") {
+            continue;
+        }
         match report.state {
             ProviderState::NotApplicable => {}
             ProviderState::Ready => capabilities.push(Capability {
@@ -1725,9 +1794,9 @@ fn repaired_graph_status(
             )),
         });
     }
-    let any_applicable = reports
-        .iter()
-        .any(|report| report.state != ProviderState::NotApplicable);
+    let any_applicable = reports.iter().any(|report| {
+        report.provider_id.starts_with("scip:") && report.state != ProviderState::NotApplicable
+    });
     let (state, message) = graph_state(any_applicable, &uncovered);
     status(snapshot, state, capabilities, message)
 }
@@ -1858,6 +1927,49 @@ fn dataflow_view_status(snapshot: &SnapshotIdentity, scip_edges: usize) -> ViewS
                     .to_owned(),
             ),
         )
+    }
+}
+
+/// Zoekt view status derives straight from its provider report: Ready
+/// when the shard set was (re)built for this snapshot, Unavailable with
+/// remediation when the toolchain is absent, Failed with diagnostics
+/// otherwise. The capability level marks it `external_index` — candidate
+/// evidence, not ingested truth.
+fn zoekt_view_status(
+    snapshot: &SnapshotIdentity,
+    reports: &[crate::providers::ProviderReport],
+) -> ViewStatus {
+    use crate::providers::ProviderState;
+    let report = reports
+        .iter()
+        .find(|report| report.provider_id == "zoekt:index");
+    match report.map(|report| &report.state) {
+        Some(ProviderState::Ready) => status(
+            snapshot,
+            ViewState::Ready,
+            vec![Capability {
+                name: "zoekt_trigram".to_owned(),
+                level: "external_index".to_owned(),
+                reason: report
+                    .and_then(|report| report.tool.clone())
+                    .map(|tool| format!("shards via {tool}")),
+            }],
+            None,
+        ),
+        Some(ProviderState::Missing | ProviderState::NotApplicable) => status(
+            snapshot,
+            ViewState::Unavailable,
+            Vec::new(),
+            report.and_then(|report| report.message.clone()),
+        ),
+        Some(ProviderState::Failed) | None => status(
+            snapshot,
+            ViewState::Failed,
+            Vec::new(),
+            report
+                .and_then(|report| report.message.clone())
+                .or_else(|| Some("zoekt index build did not report".to_owned())),
+        ),
     }
 }
 

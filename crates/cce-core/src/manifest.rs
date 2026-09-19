@@ -38,6 +38,9 @@ pub enum ViewKind {
     Knowledge,
     /// Dataflow/taint evidence graph.
     Dataflow,
+    /// Zoekt trigram index (external provider index living under the data
+    /// root, not an ingested artifact).
+    Zoekt,
 }
 
 impl std::fmt::Display for ViewKind {

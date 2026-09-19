@@ -134,7 +134,7 @@ pub(crate) fn registry() -> Vec<Box<dyn Provider>> {
 /// Detect every provider against a repository without running anything.
 /// Powers `cce providers` and `GET /v1/providers`.
 pub(crate) fn detect_all(repo_root: &Path) -> Vec<ProviderReport> {
-    registry()
+    let mut reports: Vec<ProviderReport> = registry()
         .iter()
         .map(|provider| {
             let mut report = ProviderReport::new(provider.id());
@@ -155,7 +155,11 @@ pub(crate) fn detect_all(repo_root: &Path) -> Vec<ProviderReport> {
             }
             report
         })
-        .collect()
+        .collect();
+    // Zoekt lives outside the SCIP registry — it produces no artifact —
+    // but its toolchain presence is still provider-surface information.
+    reports.push(crate::zoekt::detect_report());
+    reports
 }
 
 /// Run every applicable provider. Blocking (spawns subprocesses); callers
@@ -745,7 +749,7 @@ pub(crate) struct CommandOutput {
 }
 
 impl CommandOutput {
-    fn stderr_tail(&self) -> String {
+    pub(crate) fn stderr_tail(&self) -> String {
         const TAIL: usize = 2_048;
         let trimmed = self.stderr.trim();
         if trimmed.len() <= TAIL {
@@ -762,7 +766,7 @@ impl CommandOutput {
 
 /// Spawn a subprocess with a scrubbed environment (secret-shaped variables
 /// removed), piped output drained on threads, and a hard timeout. Blocking.
-fn run_command(
+pub(crate) fn run_command(
     program: &Path,
     args: &[&str],
     cwd: &Path,
@@ -848,7 +852,7 @@ fn is_secret_env(name: &OsStr) -> bool {
 }
 
 /// PATH lookup without executing anything.
-fn on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for directory in std::env::split_paths(&path_var) {
         let candidate = directory.join(name);

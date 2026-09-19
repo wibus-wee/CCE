@@ -212,6 +212,8 @@ enum RouteArgument {
     History,
     #[value(name = "diff")]
     Diff,
+    #[value(name = "zoekt")]
+    Zoekt,
     #[value(name = "reranked")]
     Reranked,
 }
@@ -229,6 +231,7 @@ impl From<RouteArgument> for SearchRoute {
             RouteArgument::Knowledge => Self::Knowledge,
             RouteArgument::History => Self::History,
             RouteArgument::Diff => Self::Diff,
+            RouteArgument::Zoekt => Self::Zoekt,
             RouteArgument::Reranked => Self::Reranked,
         }
     }

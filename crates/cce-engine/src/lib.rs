@@ -23,6 +23,7 @@ mod repository;
 mod rerank;
 mod retrieval;
 mod scip;
+mod zoekt;
 
 pub use atlas::{
     CodebaseMap, ComponentExplanation, DefinitionHit, DefinitionsReport, ImpactReport,

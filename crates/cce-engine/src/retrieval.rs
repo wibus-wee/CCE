@@ -25,13 +25,22 @@ const RERANK_POOL: usize = 50;
 /// (structural/knowledge/history) answer "what is connected", not "what
 /// matches the query text" — judging them on topical relevance punishes
 /// blast-radius evidence.
-const TOPICAL: [SearchRoute; 5] = [
+const TOPICAL: [SearchRoute; 6] = [
     SearchRoute::Lexical,
+    SearchRoute::Zoekt,
     SearchRoute::DenseRaw,
     SearchRoute::DenseSummary,
     SearchRoute::ExactSymbol,
     SearchRoute::Hybrid,
 ];
+
+/// Zoekt route bounds: files per query (candidate pool depth), regions
+/// resolved per file, and the subprocess deadline. The trigram CLI
+/// answers in ~75 ms at django scale, so the timeout is generous slack,
+/// not an expected cost.
+const ZOEKT_FILE_LIMIT_FACTOR: usize = 2;
+const ZOEKT_REGIONS_PER_FILE: usize = 4;
+const ZOEKT_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How many head topical hits the feedback pass mines for expansion terms.
 /// Beyond ~5 the fused ranking is already thin and noise starts to dominate
@@ -532,6 +541,110 @@ impl CceEngine {
                     1.0 / (RRF_K + rank as f64),
                     true,
                 );
+            }
+        }
+
+        // Zoekt: file-ranked trigram candidates resolve back to snapshot
+        // documents — matched line numbers pick the containing regions
+        // (entity precision), and each file's `FileDescriptor` joins as
+        // file-level evidence. A hit that resolves to nothing simply
+        // contributes no candidate (the path is not in this snapshot).
+        if plan.routes.contains(&SearchRoute::Zoekt) {
+            match self
+                .zoekt_file_hits(&request.snapshot_id, &manifest, &request)
+                .await
+            {
+                Ok(Some(file_hits)) => {
+                    let mut path_rank = HashMap::new();
+                    for (offset, file_hit) in file_hits.iter().enumerate() {
+                        let rank = offset + 1;
+                        path_rank.insert(file_hit.path.clone(), rank);
+                        let regions = self
+                            .store()
+                            .regions_for_path(&request.snapshot_id, &file_hit.path)?;
+                        let region_ids = crate::zoekt::smallest_regions_for_lines(
+                            &regions,
+                            &file_hit.lines,
+                            ZOEKT_REGIONS_PER_FILE,
+                        );
+                        for hit in self
+                            .store()
+                            .documents_for_regions(&request.snapshot_id, &region_ids)?
+                        {
+                            let mut hit = hit;
+                            hit.score = 1.0 / (1.0 + rank as f64);
+                            if hit.snippet.is_empty() {
+                                hit.snippet.clone_from(&file_hit.matched_text);
+                            }
+                            add_candidate(
+                                &mut candidates,
+                                SearchHit {
+                                    document_id: hit.document_id,
+                                    entity_id: hit.entity_id,
+                                    region_id: hit.region_id,
+                                    symbol_name: Some(hit.symbol_name),
+                                    representation: hit.representation,
+                                    route: SearchRoute::Zoekt,
+                                    rank,
+                                    score: hit.score,
+                                    contributing_routes: vec![SearchRoute::Zoekt],
+                                    address: hit.address,
+                                    evidence: hit.evidence,
+                                    snippet: hit.snippet,
+                                    verified_current: verified_fresh,
+                                    explanation: vec![format!(
+                                        "zoekt trigram candidate in {} ({} line match(es))",
+                                        file_hit.path,
+                                        file_hit.lines.len()
+                                    )],
+                                },
+                                1.0 / (RRF_K + rank as f64),
+                                true,
+                            );
+                        }
+                    }
+                    let paths: Vec<String> = file_hits.iter().map(|hit| hit.path.clone()).collect();
+                    for hit in self
+                        .store()
+                        .file_descriptors_for_paths(&request.snapshot_id, &paths)?
+                    {
+                        let path = hit
+                            .address
+                            .as_ref()
+                            .map(|address| address.path.clone())
+                            .unwrap_or_default();
+                        let rank = path_rank.get(&path).copied().unwrap_or(paths.len());
+                        let mut hit = hit;
+                        hit.score = 1.0 / (1.0 + rank as f64);
+                        add_candidate(
+                            &mut candidates,
+                            SearchHit {
+                                document_id: hit.document_id,
+                                entity_id: hit.entity_id,
+                                region_id: hit.region_id,
+                                symbol_name: Some(hit.symbol_name),
+                                representation: hit.representation,
+                                route: SearchRoute::Zoekt,
+                                rank,
+                                score: hit.score,
+                                contributing_routes: vec![SearchRoute::Zoekt],
+                                address: hit.address,
+                                evidence: hit.evidence,
+                                snippet: hit.snippet,
+                                verified_current: verified_fresh,
+                                explanation: vec![format!(
+                                    "zoekt trigram file-level candidate: {path}"
+                                )],
+                            },
+                            1.0 / (RRF_K + rank as f64),
+                            true,
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "zoekt route failed; continuing without its candidates");
+                }
             }
         }
 
@@ -1510,6 +1623,48 @@ impl CceEngine {
         }
         Ok(true)
     }
+
+    /// Opportunistic zoekt candidates: only run when the view reports
+    /// Ready for this snapshot AND the on-disk marker agrees (a stale or
+    /// absent shard must never serve — freshness is checked, not assumed).
+    /// `None` means "silently skip the route"; errors mean the index was
+    /// present but the query failed, which the caller logs and degrades.
+    async fn zoekt_file_hits(
+        &self,
+        snapshot_id: &str,
+        manifest: &ViewManifest,
+        request: &SearchRequest,
+    ) -> Result<Option<Vec<crate::zoekt::ZoektFileHit>>> {
+        let usable = manifest
+            .views
+            .get(&ViewKind::Zoekt)
+            .is_some_and(|status| matches!(status.state, ViewState::Ready | ViewState::Partial));
+        if !usable {
+            return Ok(None);
+        }
+        let Some(tools) = crate::zoekt::detect() else {
+            return Ok(None);
+        };
+        let index_dir = crate::zoekt::index_dir(&self.config().data_root);
+        if crate::zoekt::indexed_snapshot(&index_dir).as_deref() != Some(snapshot_id) {
+            return Ok(None);
+        }
+        let Some(query) = crate::zoekt::build_query(&request.query) else {
+            return Ok(None);
+        };
+        let limit = request
+            .limit
+            .saturating_mul(ZOEKT_FILE_LIMIT_FACTOR)
+            .max(20);
+        let hits = tokio::task::spawn_blocking(move || {
+            crate::zoekt::search(&tools, &index_dir, &query, limit, ZOEKT_QUERY_TIMEOUT)
+        })
+        .await
+        .map_err(|error| {
+            cce_core::CceError::Configuration(format!("zoekt query task failed: {error}"))
+        })??;
+        Ok(Some(hits))
+    }
 }
 
 /// Which edges count as evidence for each graph policy. The intent chooses
@@ -2440,6 +2595,11 @@ fn required_views_for_routes(routes: &[SearchRoute]) -> Vec<ViewKind> {
             SearchRoute::Structural => &[ViewKind::Graph],
             SearchRoute::Knowledge => &[ViewKind::Knowledge],
             SearchRoute::History | SearchRoute::Diff => &[ViewKind::History],
+            // Zoekt is opportunistic: it contributes candidates when its
+            // shard exists and is current, but no query should abstain
+            // because an external index is absent — the FTS channel
+            // already covers the same vocabulary.
+            SearchRoute::Zoekt => &[],
             SearchRoute::Reranked => &[],
         };
         for view in candidates {

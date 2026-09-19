@@ -1152,6 +1152,109 @@ impl MetadataStore {
         Ok(hits)
     }
 
+    /// Documents belonging to the given regions — used to resolve an
+    /// external index's file hit (plus matched line numbers) back to the
+    /// entity-level documents of this snapshot. Position score mirrors the
+    /// lexical cascade: `1/(1+position)` over `region_ids` order.
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn documents_for_regions(
+        &self,
+        snapshot_id: &str,
+        region_ids: &[String],
+    ) -> Result<Vec<LexicalHit>> {
+        if region_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = region_ids
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT d.id, d.entity_id, d.region_id, e.name, d.representation,
+                    d.address_json, d.evidence_json
+             FROM retrieval_documents d
+             JOIN entities e ON e.snapshot_id=d.snapshot_id AND e.id=d.entity_id
+             WHERE d.snapshot_id=?1 AND d.region_id IN ({placeholders})"
+        );
+        let connection = self.connection.read();
+        let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+        let mut bound: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(snapshot_id.to_owned())];
+        bound.extend(
+            region_ids
+                .iter()
+                .map(|value| -> Box<dyn rusqlite::types::ToSql> { Box::new(value.clone()) }),
+        );
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(bound.iter()), |row| {
+                lexical_hit_row(row)
+            })
+            .map_err(storage_error)?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row.map_err(storage_error)?);
+        }
+        Ok(hits)
+    }
+
+    /// `FileDescriptor` documents for the given file paths — the file-level
+    /// evidence record for external index hits that carry no resolvable
+    /// line-level match (e.g. a filename match).
+    ///
+    /// # Errors
+    /// Storage error on query failure.
+    pub fn file_descriptors_for_paths(
+        &self,
+        snapshot_id: &str,
+        paths: &[String],
+    ) -> Result<Vec<LexicalHit>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = paths
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let representation = json(&RetrievalRepresentation::FileDescriptor)?;
+        let sql = format!(
+            "SELECT d.id, d.entity_id, d.region_id, e.name, d.representation,
+                    d.address_json, d.evidence_json
+             FROM retrieval_documents d
+             JOIN documents_fts f ON f.snapshot_id=d.snapshot_id AND f.document_id=d.id
+             JOIN entities e ON e.snapshot_id=d.snapshot_id AND e.id=d.entity_id
+             WHERE d.snapshot_id=?1 AND f.path IN ({placeholders})
+                   AND d.representation=?{}
+             GROUP BY d.id",
+            paths.len() + 2
+        );
+        let connection = self.connection.read();
+        let mut statement = connection.prepare(&sql).map_err(storage_error)?;
+        let mut bound: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(snapshot_id.to_owned())];
+        bound.extend(
+            paths
+                .iter()
+                .map(|value| -> Box<dyn rusqlite::types::ToSql> { Box::new(value.clone()) }),
+        );
+        bound.push(Box::new(representation));
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(bound.iter()), |row| {
+                lexical_hit_row(row)
+            })
+            .map_err(storage_error)?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row.map_err(storage_error)?);
+        }
+        Ok(hits)
+    }
+
     /// Cost-budgeted pair clauses for the evidence floor, measured by
     /// per-term document frequency (one indexed count each — ~1 ms per
     /// term even on large indexes).
@@ -2201,6 +2304,30 @@ fn insert_artifact(transaction: &Transaction<'_>, artifact: &ArtifactRecord) -> 
 
 fn json(value: &impl Serialize) -> Result<String> {
     serde_json::to_string(value).map_err(Into::into)
+}
+
+/// Shared row shape for document lookups that bypass FTS ranking
+/// (region/path resolution for external index hits): `id, entity_id,
+/// region_id, entity name, representation, address_json, evidence_json`.
+/// Score/snippet start neutral — the caller assigns them per channel.
+fn lexical_hit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LexicalHit> {
+    Ok(LexicalHit {
+        document_id: row.get::<_, String>(0)?,
+        entity_id: row.get::<_, String>(1)?,
+        region_id: row.get::<_, Option<String>>(2)?,
+        symbol_name: row.get::<_, String>(3)?,
+        representation: parse_json(&row.get::<_, String>(4)?)
+            .unwrap_or(RetrievalRepresentation::RawCode),
+        address: row
+            .get::<_, Option<String>>(5)?
+            .as_deref()
+            .map(parse_json)
+            .transpose()
+            .unwrap_or(None),
+        evidence: parse_json(&row.get::<_, String>(6)?).unwrap_or_default(),
+        score: 0.0,
+        snippet: String::new(),
+    })
 }
 
 fn optional_json<T: Serialize>(value: Option<&T>) -> Result<Option<String>> {

@@ -73,6 +73,9 @@ pub enum SearchRoute {
     History,
     /// Query-time regex over stored commit patches (`type:diff`).
     Diff,
+    /// Zoekt trigram index candidates (external sidecar index; file hits
+    /// resolve back to snapshot documents through matched line numbers).
+    Zoekt,
     /// Result ordering produced by the reranker stage.
     Reranked,
 }
