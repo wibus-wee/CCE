@@ -1053,15 +1053,25 @@ impl CceEngine {
     ) -> Result<Vec<SearchHit>> {
         // Claim coverage: documents carrying distinguishing terms get a
         // selection bonus — the claim vocabulary a hit carries is
-        // evidence, not an afterthought. One batch query per term keeps
-        // the probe bounded; `entity:` pseudo-documents are not in FTS
-        // and cannot carry terms.
+        // evidence, not an afterthought. Prose corroborates but does not
+        // witness (document class contract), so only code-class
+        // candidates earn the bonus; coverage is capped since carrying a
+        // fourth term adds nothing a third did not already attest. One
+        // batch query per term keeps the probe bounded; `entity:`
+        // pseudo-documents are not in FTS and cannot carry terms.
         let candidate_docs: Vec<String> = candidates
             .values()
+            .filter(|candidate| {
+                candidate
+                    .hit
+                    .address
+                    .as_ref()
+                    .is_some_and(|address| document_class(&address.path) == DocumentClass::Code)
+            })
             .map(|candidate| candidate.hit.document_id.clone())
             .filter(|id| !id.starts_with("entity:"))
             .collect();
-        let mut claim_bonus = HashMap::<String, f64>::new();
+        let mut claim_terms = HashMap::<String, u32>::new();
         if !candidate_docs.is_empty() {
             for term in &frame.distinguishing_terms {
                 for chunk in candidate_docs.chunks(500) {
@@ -1069,11 +1079,20 @@ impl CceEngine {
                         self.store()
                             .documents_matching_term(&request.snapshot_id, term, chunk)?
                     {
-                        *claim_bonus.entry(document_id).or_default() += CLAIM_TERM_BONUS / RRF_K;
+                        *claim_terms.entry(document_id).or_default() += 1;
                     }
                 }
             }
         }
+        let claim_bonus: HashMap<String, f64> = claim_terms
+            .iter()
+            .map(|(document_id, terms)| {
+                (
+                    document_id.clone(),
+                    f64::from((*terms).min(CLAIM_TERM_CAP)) * CLAIM_TERM_BONUS / RRF_K,
+                )
+            })
+            .collect();
         let mut hits: Vec<SearchHit> = Vec::new();
         let mut per_file = HashMap::<String, usize>::new();
         let mut seen_regions = HashMap::<String, usize>::new();
@@ -1093,11 +1112,11 @@ impl CceEngine {
                     .get(&candidate.hit.document_id)
                     .copied()
                     .unwrap_or(0.0);
-            if let Some(coverage) = claim_bonus.get(&candidate.hit.document_id) {
-                if *coverage > 0.0 {
+            if let Some(terms) = claim_terms.get(&candidate.hit.document_id) {
+                if *terms > 0 {
                     hit.explanation.push(format!(
                         "claim-term coverage: {} distinguishing term(s)",
-                        (*coverage * RRF_K / CLAIM_TERM_BONUS).round() as usize
+                        *terms
                     ));
                 }
             }
@@ -1697,9 +1716,12 @@ const FLOW_HOP_DECAY: f64 = 0.5;
 const FLOW_BONUS: f64 = 0.25;
 /// Selection bonus per distinguishing term a document carries — same
 /// magnitude as `FLOW_BONUS`/`PACKAGE_BONUS`, scaled by `/ RRF_K` at the
-/// application site. A document carrying all four terms earns four
-/// bonuses: carrying the claim's whole vocabulary is real evidence.
+/// application site.
 const CLAIM_TERM_BONUS: f64 = 0.2;
+/// Coverage beyond this many distinguishing terms earns no further
+/// bonus — the third co-occurring term already attests the document is
+/// on-claim; extra matches are diminishing returns, not new evidence.
+const CLAIM_TERM_CAP: u32 = 3;
 const FLOW_EMIT_MAX: usize = 12;
 const FLOW_FRONTIER: usize = 16;
 /// `Contains` forward conductance for FILE-KIND SEED nodes only.
@@ -6106,8 +6128,19 @@ mod tests {
                     "plain",
                     "fn plain() { filler words }",
                 ),
+                (
+                    "doc:notes",
+                    "file:docs/notes.md",
+                    "docs/notes.md",
+                    "notes",
+                    "bearer validation notes",
+                ),
             ],
-            &[file("src/carrier.rs"), file("src/plain.rs")],
+            &[
+                file("src/carrier.rs"),
+                file("src/plain.rs"),
+                file("docs/notes.md"),
+            ],
         );
 
         let mut candidates = HashMap::new();
@@ -6118,6 +6151,10 @@ mod tests {
         candidates.insert(
             "doc:plain".to_owned(),
             candidate_at("doc:plain", "src/plain.rs", 0, 0.6),
+        );
+        candidates.insert(
+            "doc:notes".to_owned(),
+            candidate_at("doc:notes", "docs/notes.md", 0, 0.6),
         );
         let mut request = request("bearer validation", 5);
         request.snapshot_id = "snap_test".to_owned();
@@ -6152,6 +6189,23 @@ mod tests {
         assert!(
             carrier.score > 0.594,
             "the coverage bonus lands in the reported score"
+        );
+        let notes = hits
+            .iter()
+            .find(|hit| hit.document_id == "doc:notes")
+            .expect("prose hit still returned");
+        assert!(
+            (notes.score - 0.6).abs() < f64::EPSILON,
+            "prose corroborates but does not witness — no claim bonus: {:?}",
+            notes.explanation
+        );
+        assert!(
+            !notes
+                .explanation
+                .iter()
+                .any(|line| line.contains("claim-term coverage")),
+            "no coverage line on prose: {:?}",
+            notes.explanation
         );
     }
 }
