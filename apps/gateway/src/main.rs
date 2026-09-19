@@ -35,6 +35,9 @@ mod metrics;
 /// requests beyond it queue for at most `UPSTREAM_QUEUE_WAIT` before a
 /// 503 shed — bounded work instead of unbounded piling onto workers.
 const UPSTREAM_CONCURRENCY: usize = 64;
+/// Per-worker in-flight bound: one slow or popular worker queues its own
+/// callers but cannot consume every global slot and starve other repos.
+const WORKER_CONCURRENCY: usize = 16;
 const UPSTREAM_QUEUE_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Parser)]
@@ -161,7 +164,12 @@ struct GatewayState {
     /// fan-out branch must hold a permit before calling a worker. A
     /// request that cannot queue within `UPSTREAM_QUEUE_WAIT` is shed
     /// with 503 rather than piling unbounded work onto the workers.
-    upstream_permits: tokio::sync::Semaphore,
+    upstream_permits: Arc<tokio::sync::Semaphore>,
+    /// Per-worker semaphores (`WORKER_CONCURRENCY` each) created lazily
+    /// by repo id — noisy-neighbor isolation ahead of the global bound.
+    /// Entries live as long as the process; the map is bounded by the
+    /// registry's repo count.
+    worker_permits: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Per-worker circuits: repeated reachability failures fast-fail
     /// upstream calls instead of burning a timeout per request. Cache
     /// hits bypass the circuit — a dead worker still serves stale-but-
@@ -281,7 +289,8 @@ async fn main() -> anyhow::Result<()> {
         registry: parking_lot::Mutex::new(registry),
         push_locks: parking_lot::Mutex::new(HashMap::new()),
         search_cache: cache::SearchCache::new(Duration::from_mins(5), 512),
-        upstream_permits: tokio::sync::Semaphore::new(UPSTREAM_CONCURRENCY),
+        upstream_permits: Arc::new(tokio::sync::Semaphore::new(UPSTREAM_CONCURRENCY)),
+        worker_permits: parking_lot::Mutex::new(HashMap::new()),
         // Three consecutive reachability failures open a worker's circuit
         // for 30s; a single half-open probe then decides reopen-or-close.
         breakers: breaker::Breakers::new(3, Duration::from_secs(30)),
@@ -345,29 +354,56 @@ impl Drop for FlightDone<'_> {
     }
 }
 
-/// Wait up to `UPSTREAM_QUEUE_WAIT` for an upstream permit. On timeout
-/// the request is shed with 503 + `Retry-After` so callers can tell
-/// gateway overload apart from worker failure.
-async fn acquire_upstream(
-    state: &GatewayState,
-) -> Result<tokio::sync::SemaphorePermit<'_>, Response> {
-    if let Ok(Ok(permit)) =
-        tokio::time::timeout(UPSTREAM_QUEUE_WAIT, state.upstream_permits.acquire()).await
-    {
-        return Ok(permit);
-    }
-    state.metrics.record_proxy("shed");
-    Err(Response::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
-        .header("retry-after", "2")
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .body(axum::body::Body::from(
-            serde_json::to_vec(&ErrorBody {
-                error: "gateway saturated: too many upstream calls".to_owned(),
-            })
-            .unwrap_or_default(),
-        ))
-        .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response()))
+/// Guard holding both admission permits; drops release in reverse order
+/// (global first, then the worker slot).
+struct UpstreamPermits {
+    _worker: tokio::sync::OwnedSemaphorePermit,
+    _global: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Wait up to `UPSTREAM_QUEUE_WAIT` for an upstream permit — first the
+/// target worker's own bound, then the global one. On timeout the
+/// request is shed with 503 + `Retry-After` so callers can tell gateway
+/// overload apart from worker failure. Worker-first ordering keeps one
+/// saturated worker from holding global slots while its callers queue.
+async fn acquire_upstream(state: &GatewayState, worker: &str) -> Result<UpstreamPermits, Response> {
+    let shed = |error: &str| {
+        state.metrics.record_proxy("shed");
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("retry-after", "2")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&ErrorBody {
+                    error: error.to_owned(),
+                })
+                .unwrap_or_default(),
+            ))
+            .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())
+    };
+    let worker_semaphore = {
+        let mut map = state.worker_permits.lock();
+        map.entry(worker.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(WORKER_CONCURRENCY)))
+            .clone()
+    };
+    let Ok(Ok(worker)) =
+        tokio::time::timeout(UPSTREAM_QUEUE_WAIT, worker_semaphore.acquire_owned()).await
+    else {
+        return Err(shed("worker busy: too many in-flight calls for this repo"));
+    };
+    let Ok(Ok(global)) = tokio::time::timeout(
+        UPSTREAM_QUEUE_WAIT,
+        state.upstream_permits.clone().acquire_owned(),
+    )
+    .await
+    else {
+        return Err(shed("gateway saturated: too many upstream calls"));
+    };
+    Ok(UpstreamPermits {
+        _worker: worker,
+        _global: global,
+    })
 }
 
 #[utoipa::path(get, path = "/healthz", tag = "meta",
@@ -1006,7 +1042,7 @@ async fn proxy(
     // The permit comes BEFORE the circuit check: an admit obligates an
     // outcome report, so shedding first keeps a queued-out request from
     // stranding a half-open probe permit.
-    let _permit = match acquire_upstream(&state).await {
+    let _permits = match acquire_upstream(&state, &entry.id).await {
         Ok(permit) => permit,
         Err(shed) => return Ok(shed),
     };
