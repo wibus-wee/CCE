@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use crate::{GatewayState, require_repo};
+use crate::{GatewayState, RepoEntry, require_repo};
 
 const LATEST_PROTOCOL: &str = "2025-11-25";
 const MAX_BATCH: usize = 16;
@@ -60,7 +60,7 @@ pub(crate) async fn endpoint(
     let mut responses = Vec::new();
     let mut session_header: Option<HeaderValue> = None;
     for request in requests {
-        match dispatch(&state, &entry.worker_url, request).await {
+        match dispatch(&state, &entry, request).await {
             Dispatch::Response(response) => responses.push(response),
             Dispatch::Initialized(response) => {
                 session_header = HeaderValue::from_str(&uuid::Uuid::now_v7().to_string()).ok();
@@ -94,7 +94,7 @@ enum Dispatch {
     Notification,
 }
 
-async fn dispatch(state: &GatewayState, worker_url: &str, request: Value) -> Dispatch {
+async fn dispatch(state: &GatewayState, entry: &RepoEntry, request: Value) -> Dispatch {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let Some(id) = id else {
@@ -114,7 +114,7 @@ async fn dispatch(state: &GatewayState, worker_url: &str, request: Value) -> Dis
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
-        "tools/call" => call_tool(state, worker_url, request.get("params")).await,
+        "tools/call" => call_tool(state, entry, request.get("params")).await,
         method => Err((-32601, format!("method not found: {method}"))),
     };
     let response = match result {
@@ -135,7 +135,7 @@ async fn dispatch(state: &GatewayState, worker_url: &str, request: Value) -> Dis
 /// argument and routing problems stay JSON-RPC errors.
 async fn call_tool(
     state: &GatewayState,
-    worker_url: &str,
+    entry: &RepoEntry,
     params: Option<&Value>,
 ) -> Result<Value, (i32, String)> {
     let name = params
@@ -148,35 +148,30 @@ async fn call_tool(
         .unwrap_or_else(|| json!({}));
 
     let outcome = match name {
-        "cce_index" => post(state, worker_url, "index", json!({})).await,
-        "cce_status" => get(state, worker_url, "status").await,
-        "cce_providers" => get(state, worker_url, "providers").await,
-        "cce_map" => get(state, worker_url, "map").await,
-        "cce_files" => get(state, worker_url, "files").await,
+        "cce_index" => post(state, entry, "index", json!({})).await,
+        "cce_status" => get(state, entry, "status").await,
+        "cce_providers" => get(state, entry, "providers").await,
+        "cce_map" => get(state, entry, "map").await,
+        "cce_files" => get(state, entry, "files").await,
         "cce_file" => {
             let path = required_string(&arguments, "path")?;
-            get(
-                state,
-                worker_url,
-                &format!("file?path={}", urlencoded(&path)),
-            )
-            .await
+            get(state, entry, &format!("file?path={}", urlencoded(&path))).await
         }
         "cce_explain" => {
             let name = required_string(&arguments, "name")?;
-            get(state, worker_url, &format!("explain/{}", urlencoded(&name))).await
+            get(state, entry, &format!("explain/{}", urlencoded(&name))).await
         }
         "cce_impact" => {
             let name = required_string(&arguments, "name")?;
-            get(state, worker_url, &format!("impact/{}", urlencoded(&name))).await
+            get(state, entry, &format!("impact/{}", urlencoded(&name))).await
         }
         "cce_definitions" => {
             let name = required_string(&arguments, "name")?;
-            get(state, worker_url, &format!("def/{}", urlencoded(&name))).await
+            get(state, entry, &format!("def/{}", urlencoded(&name))).await
         }
         "cce_references" => {
             let name = required_string(&arguments, "name")?;
-            get(state, worker_url, &format!("refs/{}", urlencoded(&name))).await
+            get(state, entry, &format!("refs/{}", urlencoded(&name))).await
         }
         "cce_search" | "cce_symbol" => {
             let query = required_string(
@@ -196,7 +191,7 @@ async fn call_tool(
             } else if let Some(intent) = arguments.get("intent") {
                 set(&mut body, "intent", intent.clone());
             }
-            post(state, worker_url, "search", body).await
+            post(state, entry, "search", body).await
         }
         "cce_context" => {
             let query = required_string(&arguments, "query")?;
@@ -213,7 +208,7 @@ async fn call_tool(
             if let Some(intent) = arguments.get("intent") {
                 set(&mut body, "intent", intent.clone());
             }
-            post(state, worker_url, "context", body).await
+            post(state, entry, "context", body).await
         }
         "cce_grep" => {
             let pattern = required_string(&arguments, "pattern")?;
@@ -223,7 +218,7 @@ async fn call_tool(
                     set(&mut body, key, value.clone());
                 }
             }
-            post(state, worker_url, "grep", body).await
+            post(state, entry, "grep", body).await
         }
         "cce_diff" => {
             let pattern = required_string(&arguments, "pattern")?;
@@ -231,7 +226,7 @@ async fn call_tool(
             if let Some(limit) = arguments.get("limit") {
                 set(&mut body, "limit", limit.clone());
             }
-            post(state, worker_url, "diff", body).await
+            post(state, entry, "diff", body).await
         }
         _ => return Err((-32602, format!("unknown tool: {name}"))),
     };
@@ -253,26 +248,68 @@ async fn call_tool(
     }
 }
 
-async fn get(state: &GatewayState, worker_url: &str, path: &str) -> Result<Value, String> {
-    send(state.client.get(format!("{worker_url}/v1/{path}"))).await
+async fn get(state: &GatewayState, entry: &RepoEntry, path: &str) -> Result<Value, String> {
+    send(
+        state,
+        entry,
+        state.client.get(format!("{}/v1/{path}", entry.worker_url)),
+    )
+    .await
 }
 
 async fn post(
     state: &GatewayState,
-    worker_url: &str,
+    entry: &RepoEntry,
     path: &str,
     body: Value,
 ) -> Result<Value, String> {
     send(
+        state,
+        entry,
         state
             .client
-            .post(format!("{worker_url}/v1/{path}"))
+            .post(format!("{}/v1/{path}", entry.worker_url))
             .json(&body),
     )
     .await
 }
 
-async fn send(request: reqwest::RequestBuilder) -> Result<Value, String> {
+/// Same admission contract as the proxy path: per-worker + global
+/// permits first (shed degrades to a tool `isError`, never a hang), then
+/// the circuit gate — an MCP flood against a dead worker must not burn
+/// a connect timeout per call.
+async fn send(
+    state: &GatewayState,
+    entry: &RepoEntry,
+    request: reqwest::RequestBuilder,
+) -> Result<Value, String> {
+    let _permits = crate::acquire_upstream(state, &entry.id)
+        .await
+        .map_err(|_| "gateway saturated: too many upstream calls".to_owned())?;
+    if !state.breakers.admit(&entry.id) {
+        state.metrics.record_proxy("breaker");
+        return Err(format!(
+            "worker {} circuit open — fast-failing",
+            entry.worker_url
+        ));
+    }
+    let started = std::time::Instant::now();
+    let outcome = send_inner(request).await;
+    state.metrics.record_upstream_ms(crate::elapsed_ms(started));
+    match &outcome {
+        Ok(_) => state.breakers.on_success(&entry.id),
+        // A reached 5xx is a worker failure; transport errors likewise.
+        // Reached 4xx errors still prove the worker is alive.
+        Err(message) if !message.starts_with("worker returned") => {
+            state.breakers.on_failure(&entry.id);
+        }
+        Err(_) => state.breakers.on_success(&entry.id),
+    }
+    state.metrics.record_proxy("ok");
+    outcome
+}
+
+async fn send_inner(request: reqwest::RequestBuilder) -> Result<Value, String> {
     let response = request
         .send()
         .await

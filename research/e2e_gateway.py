@@ -249,6 +249,29 @@ def main() -> int:
             )
             check.expect(elapsed < 0.5, "fast-fail is fast", f"{elapsed:.3f}s")
 
+            print("mcp gated the same way:")
+            started = time.time()
+            status, _, body = http(
+                "POST",
+                f"{base}/beta/mcp",
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "cce_status", "arguments": {}},
+                },
+            )
+            elapsed = time.time() - started
+            # The MCP surface degrades to tool isError content, not a hung
+            # request or a bare 5xx — the breaker is shared with the proxy.
+            content = json.dumps(body or {})
+            check.expect(
+                status == 200 and ("isError" in content or "error" in content),
+                "mcp call fast-fails as tool error on open circuit",
+                f"status {status} body {str(body)[:120]}",
+            )
+            check.expect(elapsed < 0.5, "mcp fast-fail is fast", f"{elapsed:.3f}s")
+
             print("metrics:")
             status, headers, raw_metrics = (
                 *http("GET", f"{base}/metrics")[:2],
