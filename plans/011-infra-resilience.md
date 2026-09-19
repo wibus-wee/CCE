@@ -41,3 +41,7 @@ DONE — `45a748f` (breaker + bounded upstream + singleflight), `7bcb83c`
 (metrics). Live-verified: circuit opens after 3 failures and fast-fails
 in <1ms; 8 concurrent identical queries coalesce to 1 upstream call;
 `/metrics` and `/v1/metrics` serve typed series incl. breaker states.
+Follow-on wave: `68f8fb0` per-worker concurrency isolation, `e6375ff`
+MCP gated through the same permits+breaker, `84a7021` SIGTERM drain,
+`c201f5f` stub e2e + CI job + multi-worker compose topology, and
+x-request-id correlation across the proxy→worker hop.
