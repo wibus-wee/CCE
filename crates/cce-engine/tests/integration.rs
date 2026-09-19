@@ -2356,7 +2356,10 @@ async fn pattern_route_maps_matches_to_regions() {
     );
     for hit in &result.hits {
         assert_eq!(hit.route, cce_core::SearchRoute::Pattern);
-        assert_eq!(hit.contributing_routes, vec![cce_core::SearchRoute::Pattern]);
+        assert_eq!(
+            hit.contributing_routes,
+            vec![cce_core::SearchRoute::Pattern]
+        );
         assert!(hit.verified_current);
         let address = hit
             .address
